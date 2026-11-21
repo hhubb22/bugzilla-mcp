@@ -10,6 +10,7 @@ export interface HttpServerConfig {
   readonly headerRoutedParams?: Readonly<Record<string, readonly string[]>>;
   readonly core: CoreDependencies;
   readonly publicBaseUrl?: string;
+  readonly bindingSecret?: string;
   readonly authenticateBearerToken?: (token: string) => Promise<PrincipalContext | null>;
   readonly verifyBindingOpenerSession?: (
     req: DualEraHttpRequest,

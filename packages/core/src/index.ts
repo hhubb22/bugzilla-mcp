@@ -51,6 +51,39 @@ export interface CloudApprovalExpected {
   readonly bugId: BugId;
   readonly baseVersion: IsoTimestamp;
   readonly diff: ProposalDiff;
+  readonly visibility: "public" | "private";
+  readonly nowMs: number;
+}
+
+export type CloudApprovalVerificationResult =
+  | { readonly valid: true }
+  | {
+      readonly valid: false;
+      readonly reason:
+        | "invalid_signature"
+        | "expired"
+        | "replayed"
+        | "binding_mismatch"
+        | "visibility_mismatch";
+    };
+
+export interface CloudApprovalTokenService {
+  issue(params: {
+    readonly approverPrincipalId: string;
+    readonly instanceUrl: string;
+    readonly proposalId: string;
+    readonly revision: number;
+    readonly bugId: BugId;
+    readonly baseVersion: IsoTimestamp;
+    readonly diff: ProposalDiff;
+    readonly visibility: "public" | "private";
+    readonly ttlMs: number;
+    readonly nowMs: number;
+  }): Promise<{ readonly token: string; readonly expiresAt: IsoTimestamp }>;
+  verifyAndConsume(
+    token: string,
+    expected: CloudApprovalExpected,
+  ): Promise<CloudApprovalVerificationResult>;
 }
 
 export interface CoreDependencies {
@@ -62,11 +95,14 @@ export interface CoreDependencies {
   readonly causalBudgetWindowMs?: number;
   readonly lagWindowMs: number;
   readonly maxReplayWindowMs?: number;
+  readonly maxWebhookRetries?: number;
+  readonly secretRotationGraceMs?: number;
   readonly clock?: () => number;
   readonly webhookTransport?: WebhookOutboundTransport;
-  readonly verifyCloudApprovalToken?: (
-    token: string,
-    expected: CloudApprovalExpected,
+  readonly cloudApprovalService?: CloudApprovalTokenService;
+  readonly isPolicyGranted?: (
+    ctx: PrincipalContext,
+    input: BugzillaProposeUpdateInput,
   ) => Promise<boolean>;
 }
 
@@ -146,5 +182,9 @@ export function createWriteGuardService(_deps: CoreDependencies): WriteGuardServ
 }
 
 export function createSyntheticEventsService(_deps: CoreDependencies): SyntheticEventsService {
+  throw new Error("C0_CONTRACT_STUB");
+}
+
+export function createCloudApprovalTokenService(_signingSecret: string): CloudApprovalTokenService {
   throw new Error("C0_CONTRACT_STUB");
 }
