@@ -1,0 +1,21 @@
+{
+  "name": "bugzilla-mcp",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "engines": {
+    "node": ">=22.0.0"
+  },
+  "scripts": {
+    "typecheck": "pnpm -r typecheck",
+    "test": "vitest run",
+    "test:watch": "vitest",
+    "verify:quint": "npx -y @informalsystems/quint run specs/write_guard.qnt --invariant=allSafetyInvariants --max-samples=2000 --max-steps=25 --verbosity=1 && npx -y @informalsystems/quint run specs/events_ingestion.qnt --invariant=allSafetyInvariants --max-samples=2000 --max-steps=25 --verbosity=1"
+  },
+  "devDependencies": {
+    "@types/node": "^22.15.0",
+    "fast-check": "^4.1.1",
+    "typescript": "^5.8.3",
+    "vitest": "^3.1.3"
+  }
+}
