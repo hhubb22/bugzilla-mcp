@@ -1,5 +1,5 @@
 import { randomBytes, timingSafeEqual } from "node:crypto";
-import type { PrincipalContext } from "@bugzilla-mcp/contracts";
+import { RESERVED_LEGACY_ISSUER, type PrincipalContext } from "@bugzilla-mcp/contracts";
 import type { StoredApprovalTicket, StoredProposal } from "@bugzilla-mcp/storage";
 import type { DualEraHttpRequest, DualEraHttpResponse, HttpServerConfig } from "./index.js";
 
@@ -106,6 +106,7 @@ export function createApprovalPageManager(config: HttpServerConfig) {
       const opener = await config.verifyBindingOpenerSession(req);
       if (
         !opener ||
+        opener.issuer === RESERVED_LEGACY_ISSUER ||
         opener.issuer !== ticket.issuer ||
         opener.principalId !== ticket.approverPrincipalId
       ) {
@@ -133,6 +134,7 @@ export function createApprovalPageManager(config: HttpServerConfig) {
         };
       }
       const proposal = await config.core.storage.getProposal(
+        ticket.issuer,
         ticket.approverPrincipalId,
         ticket.instanceUrl,
         ticket.proposalId,
@@ -221,6 +223,7 @@ export function createApprovalPageManager(config: HttpServerConfig) {
       const opener = await config.verifyBindingOpenerSession(req);
       if (
         !opener ||
+        opener.issuer === RESERVED_LEGACY_ISSUER ||
         opener.issuer !== ticket.issuer ||
         opener.principalId !== ticket.approverPrincipalId
       ) {
@@ -231,6 +234,7 @@ export function createApprovalPageManager(config: HttpServerConfig) {
         };
       }
       const proposal = await config.core.storage.getProposal(
+        ticket.issuer,
         ticket.approverPrincipalId,
         ticket.instanceUrl,
         ticket.proposalId,
@@ -261,6 +265,7 @@ export function createApprovalPageManager(config: HttpServerConfig) {
         local.consumed = true;
       }
       const issued = await config.core.cloudApprovalService.issue({
+        approverIssuer: ticket.issuer,
         approverPrincipalId: ticket.approverPrincipalId,
         instanceUrl: ticket.instanceUrl,
         proposalId: proposal.proposalId,

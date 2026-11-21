@@ -62,8 +62,17 @@ export const ModernRequestMetaSchema = z
   .passthrough();
 export type ModernRequestMeta = z.infer<typeof ModernRequestMetaSchema>;
 
+/** Reserved issuer namespace for quarantined pre-v3 migrated SQLite rows (never valid for live OAuth principals). */
+export const RESERVED_LEGACY_ISSUER = "legacy://migrated";
+
 export const PrincipalContextSchema = z.object({
-  issuer: z.string().url(),
+  issuer: z
+    .string()
+    .url()
+    .refine(
+      (value) => value !== RESERVED_LEGACY_ISSUER,
+      "Reserved legacy issuer cannot be used for live principals",
+    ),
   principalId: z.string().min(1),
   clientId: z.string().min(1),
   instanceUrl: z.string().url(),

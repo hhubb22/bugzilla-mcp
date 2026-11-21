@@ -38,6 +38,7 @@ const proposal: BugzillaProposeUpdateInput = {
 };
 
 const approvalTarget: CloudApprovalExpected = {
+  approverIssuer: principal.issuer,
   approverPrincipalId: principal.principalId,
   instanceUrl: principal.instanceUrl,
   proposalId: "proposal-fixture",
@@ -252,7 +253,12 @@ test("an external edit makes a signed proposal stale and only a newly authorized
   });
   expect(upstream.mutations).toEqual([]);
   expect(
-    await storage.listWriteAudits(principal.principalId, principal.instanceUrl, bugId),
+    await storage.listWriteAudits(
+      principal.issuer,
+      principal.principalId,
+      principal.instanceUrl,
+      bugId,
+    ),
   ).toEqual([]);
   const rebased = await authorize({
     ...proposal,
@@ -265,6 +271,7 @@ test("an external edit makes a signed proposal stale and only a newly authorized
   ]);
   expect(
     await storage.getProposal(
+      principal.issuer,
       principal.principalId,
       principal.instanceUrl,
       original.proposalId,
@@ -280,9 +287,15 @@ test("an external edit makes a signed proposal stale and only a newly authorized
   });
   expect(upstream.mutations).toEqual([{ kind: "update", bugId, diff: proposal.diff }]);
   expect(
-    await storage.listWriteAudits(principal.principalId, principal.instanceUrl, bugId),
+    await storage.listWriteAudits(
+      principal.issuer,
+      principal.principalId,
+      principal.instanceUrl,
+      bugId,
+    ),
   ).toEqual([
     expect.objectContaining({
+      issuer: principal.issuer,
       principalId: principal.principalId,
       instanceUrl: principal.instanceUrl,
       bugId,
@@ -482,6 +495,7 @@ test("a definitely failed receipt can be reserved and executed again without sha
   const upstream = bugzilla();
   const storage = memoryStorage();
   const scope = {
+    issuer: principal.issuer,
     principalId: principal.principalId,
     instanceUrl: principal.instanceUrl,
     operation: "bugzilla_post_analysis",
@@ -561,7 +575,12 @@ test.each(["non_insider", "private_rejected"] as const)(
     const result = await service.postAnalysis(principal, analysis);
     expect(result).toMatchObject({ outcome: "SavedAsInternalNote", bugId, reason });
     expect(
-      await storage.listInternalNotes(principal.principalId, principal.instanceUrl, bugId),
+      await storage.listInternalNotes(
+        principal.issuer,
+        principal.principalId,
+        principal.instanceUrl,
+        bugId,
+      ),
     ).toEqual([
       expect.objectContaining({
         id: "noteId" in result ? result.noteId : undefined,

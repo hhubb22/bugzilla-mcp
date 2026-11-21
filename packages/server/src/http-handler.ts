@@ -6,6 +6,7 @@ import {
   MCP_PROTOCOL_MODERN,
   McpErrorCode,
   PollEventsParamsSchema,
+  RESERVED_LEGACY_ISSUER,
   WebhookSubscribeParamsSchema,
   type ClientCapabilities,
   type PrincipalContext,
@@ -117,7 +118,14 @@ export function buildDualEraHttpHandler(config: HttpServerConfig): DualEraMcpHan
   const eventsService = createSyntheticEventsService(config.core);
   const binding = createBindingManager(config);
   const approvalPage = createApprovalPageManager(config);
-  const legacySessions = new Map<string, { protocolVersion: string; initialized: boolean }>();
+  const legacySessions = new Map<
+    string,
+    {
+      protocolVersion: string;
+      initialized: boolean;
+      owner?: { issuer: string; principalId: string; instanceUrl: string };
+    }
+  >();
   const publicBaseUrl = (config.publicBaseUrl ?? "https://mcp.example").replace(/\/+$/, "");
 
   function insufficientScopeResponse(requiredScope: string): DualEraHttpResponse {
@@ -155,30 +163,32 @@ export function buildDualEraHttpHandler(config: HttpServerConfig): DualEraMcpHan
   async function authenticate(req: DualEraHttpRequest): Promise<PrincipalContext | null> {
     const auth = getHeader(req.headers, "authorization");
     if (config.mode === "local-trusted-ide" && !config.authenticateBearerToken) {
-      if (config.localAuthToken) {
-        if (!auth || !auth.startsWith("Bearer ")) return null;
-        const provided = Buffer.from(auth.slice("Bearer ".length).trim(), "utf8");
-        const expected = Buffer.from(config.localAuthToken, "utf8");
-        if (provided.length !== expected.length || !timingSafeEqual(provided, expected)) {
-          return null;
-        }
+      // Fail closed in local HTTP mode unless a non-empty localAuthToken is configured (ISO-09, AUTH-07)
+      if (!config.localAuthToken || config.localAuthToken.length === 0) return null;
+      if (!auth || !auth.startsWith("Bearer ")) return null;
+      const provided = Buffer.from(auth.slice("Bearer ".length).trim(), "utf8");
+      const expected = Buffer.from(config.localAuthToken, "utf8");
+      if (provided.length !== expected.length || !timingSafeEqual(provided, expected)) {
+        return null;
       }
-      return (
-        config.localPrincipal ?? {
-          issuer: "local://ide",
-          principalId: "local-user",
-          clientId: "local-ide",
-          instanceUrl: "https://bugzilla.local",
-          credentialGeneration: 1,
-          scopes: ["bz:read", "bz:write:safe", "bz:write:guarded", "bz:events"],
-          deploymentMode: "local-trusted-ide",
-        }
-      );
+      const localCtx = config.localPrincipal ?? {
+        issuer: "local://ide",
+        principalId: "local-user",
+        clientId: "local-ide",
+        instanceUrl: "https://bugzilla.local",
+        credentialGeneration: 1,
+        scopes: ["bz:read", "bz:write:safe", "bz:write:guarded", "bz:events"],
+        deploymentMode: "local-trusted-ide",
+      };
+      if (localCtx.issuer === RESERVED_LEGACY_ISSUER) return null;
+      return localCtx;
     }
     if (!auth || !auth.startsWith("Bearer ")) return null;
     const token = auth.slice("Bearer ".length).trim();
     if (!token || !config.authenticateBearerToken) return null;
-    return config.authenticateBearerToken(token);
+    const ctx = await config.authenticateBearerToken(token);
+    if (!ctx || ctx.issuer === RESERVED_LEGACY_ISSUER) return null;
+    return ctx;
   }
 
   function validateMirrorHeaders(
@@ -308,10 +318,26 @@ export function buildDualEraHttpHandler(config: HttpServerConfig): DualEraMcpHan
 
       // Legacy 2025-11-25 initialize & session routing (never absorbs modern requests!)
       if (rpc.method === "initialize" && params.protocolVersion === MCP_PROTOCOL_LEGACY) {
+        // Require valid tenant authentication before allocating a stateful session (ISO-09)
+        const initCtx = await authenticate(req);
+        if (!initCtx) {
+          return {
+            status: 401,
+            headers: {
+              "www-authenticate": `Bearer resource_metadata="${config.publicBaseUrl ?? "https://mcp.example"}/.well-known/oauth-protected-resource"`,
+            },
+            body: "",
+          };
+        }
         const sessionId = randomUUID();
         legacySessions.set(sessionId, {
           protocolVersion: MCP_PROTOCOL_LEGACY,
           initialized: false,
+          owner: {
+            issuer: initCtx.issuer,
+            principalId: initCtx.principalId,
+            instanceUrl: initCtx.instanceUrl,
+          },
         });
         return jsonResponse(
           200,
@@ -339,10 +365,6 @@ export function buildDualEraHttpHandler(config: HttpServerConfig): DualEraMcpHan
 
       if (isExplicitLegacySessionCall) {
         const session = legacySessions.get(hSession)!;
-        if (rpc.method === "notifications/initialized") {
-          session.initialized = true;
-          return { status: 202, headers: {}, body: "" };
-        }
         const ctx = await authenticate(req);
         if (!ctx) {
           return {
@@ -352,6 +374,29 @@ export function buildDualEraHttpHandler(config: HttpServerConfig): DualEraMcpHan
             },
             body: "",
           };
+        }
+        // Bind anonymous-init sessions on first authenticated use and enforce tenant ownership (ISO-09)
+        if (!session.owner) {
+          session.owner = {
+            issuer: ctx.issuer,
+            principalId: ctx.principalId,
+            instanceUrl: ctx.instanceUrl,
+          };
+        } else if (
+          session.owner.issuer !== ctx.issuer ||
+          session.owner.principalId !== ctx.principalId ||
+          session.owner.instanceUrl !== ctx.instanceUrl
+        ) {
+          return rpcErrorResponse(
+            403,
+            rpc.id,
+            McpErrorCode.INVALID_REQUEST,
+            "Session does not belong to authenticated tenant",
+          );
+        }
+        if (rpc.method === "notifications/initialized") {
+          session.initialized = true;
+          return { status: 202, headers: {}, body: "" };
         }
         const neededLegacyScope = requiredScopeForRpc(rpc.method, params);
         if (neededLegacyScope && !ctx.scopes.includes(neededLegacyScope)) {

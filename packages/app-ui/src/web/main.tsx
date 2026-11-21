@@ -2,6 +2,7 @@ import { App, applyDocumentTheme, applyHostStyleVariables } from "@modelcontextp
 import { StrictMode, useEffect, useMemo, useState } from "react";
 import { createRoot } from "react-dom/client";
 import { createController } from "../controller.js";
+import { normalizeBoardTenantKey } from "../tenant-key.js";
 import type { McpAppHostCapabilities, McpAppHostPort } from "../types.js";
 import { createRpcGate } from "./concurrency.js";
 import { type TriageBoardPayload, TriageWorkbench } from "./TriageWorkbench.js";
@@ -48,6 +49,7 @@ function McpAppRoot() {
 
   useEffect(() => {
     let active = true;
+    let anonymousViewSeq = 0;
 
     // Register ALL lifecycle handlers BEFORE app.connect() so no initial notification is missed
     app.ontoolinput = () => {
@@ -60,24 +62,31 @@ function McpAppRoot() {
       const sc = result.structuredContent as Record<string, unknown> | undefined;
       if (!sc || typeof sc !== "object") return;
       if (Array.isArray(sc.bugs)) {
-        setPayload(sc as unknown as TriageBoardPayload);
+        const incoming = sc as unknown as TriageBoardPayload;
+        setPayload(normalizeBoardTenantKey(incoming, () => `anon-board-${++anonymousViewSeq}`));
         return;
       }
-      // Inline dossier card tool (`bugzilla_get_dossier`) returns a bare BugDossier (UI-05)
+      // Inline dossier card tool (`bugzilla_get_dossier`) returns a BugDossier + server tenantKey (UI-05, ISO-04-B)
       if (sc.bug && typeof sc.bug === "object") {
         const dossier = sc as unknown as NonNullable<TriageBoardPayload["initialDossier"]>;
-        setPayload({
-          instanceUrl: "",
-          instanceLabel: "Bug Dossier",
-          principalId: "",
-          deploymentMode: "local-trusted-ide",
-          fetchedAt: new Date().toISOString(),
-          activeTab: "untriaged",
-          focusBugId: dossier.bug.id,
-          bugs: [dossier.bug],
-          proposals: [],
-          initialDossier: dossier,
-        });
+        setPayload(
+          normalizeBoardTenantKey(
+            {
+              ...(typeof sc.tenantKey === "string" ? { tenantKey: sc.tenantKey } : {}),
+              instanceUrl: "",
+              instanceLabel: "Bug Dossier",
+              principalId: "",
+              deploymentMode: "local-trusted-ide" as const,
+              fetchedAt: new Date().toISOString(),
+              activeTab: "untriaged" as const,
+              focusBugId: dossier.bug.id,
+              bugs: [dossier.bug],
+              proposals: [],
+              initialDossier: dossier,
+            },
+            () => `anon-dossier-${++anonymousViewSeq}`,
+          ),
+        );
       }
     };
 

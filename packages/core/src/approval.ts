@@ -9,6 +9,7 @@ import type {
 
 interface SignedApprovalPayload {
   readonly jti: string;
+  readonly approverIssuer: string;
   readonly approverPrincipalId: string;
   readonly instanceUrl: string;
   readonly proposalId: string;
@@ -35,6 +36,7 @@ export function buildCloudApprovalTokenService(
       const expiresAtMs = params.nowMs + params.ttlMs;
       const payload: SignedApprovalPayload = {
         jti: randomBytes(16).toString("base64url"),
+        approverIssuer: params.approverIssuer,
         approverPrincipalId: params.approverPrincipalId,
         instanceUrl: params.instanceUrl,
         proposalId: params.proposalId,
@@ -91,6 +93,7 @@ export function buildCloudApprovalTokenService(
 
       const expectedDiffHash = sha256Hex(canonicalJson(expected.diff));
       const bindingMatches =
+        payload.approverIssuer === expected.approverIssuer &&
         payload.approverPrincipalId === expected.approverPrincipalId &&
         payload.instanceUrl === expected.instanceUrl &&
         payload.proposalId === expected.proposalId &&

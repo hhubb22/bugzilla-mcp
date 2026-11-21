@@ -50,4 +50,9 @@ export function createTriageAppController(host: McpAppHostPort): TriageAppContro
   return createController(host);
 }
 
+export {
+  normalizeBoardTenantKey,
+  resolveBoardTenantKey,
+  resolveVerifiedTenantKey,
+} from "./tenant-key.js";
 export { loadTriageAppHtml };

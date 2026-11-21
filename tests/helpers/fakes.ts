@@ -46,11 +46,18 @@ export function memoryStorage(now = () => epoch): StoragePorts {
   const audits: WriteAuditEntry[] = [];
   const notes = new Map<string, Awaited<ReturnType<StoragePorts["listInternalNotes"]>>>();
   const receiptKey = (scope: IdempotencyScope) =>
-    key(scope.principalId, scope.instanceUrl, scope.operation, scope.key);
+    key(scope.issuer, scope.principalId, scope.instanceUrl, scope.operation, scope.key);
   const draftKey = (scope: Parameters<StoragePorts["getDraft"]>[0]) =>
-    key(scope.principalId, scope.instanceUrl, scope.bugId, scope.draftKind);
+    key(scope.issuer, scope.principalId, scope.instanceUrl, scope.bugId, scope.draftKind);
   const subscriptionKey = (scope: Parameters<StoragePorts["getWebhookSubscription"]>[0]) =>
-    key(scope.principalId, scope.url, scope.name, scope.canonicalArgsJson);
+    key(
+      scope.issuer,
+      scope.principalId,
+      scope.instanceUrl,
+      scope.url,
+      scope.name,
+      scope.canonicalArgsJson,
+    );
 
   return {
     async getReceipt(scope) {
@@ -78,12 +85,22 @@ export function memoryStorage(now = () => epoch): StoragePorts {
       );
     },
     async recordWriteAudit(entry) {
-      audits.push(structuredClone(entry));
+      const exists = audits.some(
+        (existing) =>
+          existing.issuer === entry.issuer &&
+          existing.principalId === entry.principalId &&
+          existing.instanceUrl === entry.instanceUrl &&
+          existing.auditId === entry.auditId,
+      );
+      if (!exists) {
+        audits.push(structuredClone(entry));
+      }
     },
-    async listWriteAudits(principalId, instanceUrl, bugId) {
+    async listWriteAudits(issuer, principalId, instanceUrl, bugId) {
       return structuredClone(
         audits.filter(
           (entry) =>
+            entry.issuer === issuer &&
             entry.principalId === principalId &&
             entry.instanceUrl === instanceUrl &&
             entry.bugId === bugId,
@@ -100,22 +117,25 @@ export function memoryStorage(now = () => epoch): StoragePorts {
       budgets.set(scope, [...active, nowMs]);
       return { allowed: true };
     },
-    async saveInternalNote(principalId, instanceUrl, bugId, text) {
-      const scope = key(principalId, instanceUrl, bugId);
+    async saveInternalNote(issuer, principalId, instanceUrl, bugId, text) {
+      const scope = key(issuer, principalId, instanceUrl, bugId);
       const note = { id: String(nextNote++), bugId, text, createdAt: iso(now()) };
       notes.set(scope, [...(notes.get(scope) ?? []), note]);
       return structuredClone(note);
     },
-    async listInternalNotes(principalId, instanceUrl, bugId) {
-      return structuredClone(notes.get(key(principalId, instanceUrl, bugId)) ?? []);
+    async listInternalNotes(issuer, principalId, instanceUrl, bugId) {
+      return structuredClone(notes.get(key(issuer, principalId, instanceUrl, bugId)) ?? []);
     },
     async saveProposal(proposal) {
-      const { principalId, instanceUrl, proposalId, revision } = proposal;
-      proposals.set(key(principalId, instanceUrl, proposalId, revision), structuredClone(proposal));
+      const { issuer, principalId, instanceUrl, proposalId, revision } = proposal;
+      proposals.set(
+        key(issuer, principalId, instanceUrl, proposalId, revision),
+        structuredClone(proposal),
+      );
     },
-    async getProposal(principalId, instanceUrl, proposalId, revision) {
+    async getProposal(issuer, principalId, instanceUrl, proposalId, revision) {
       return structuredClone(
-        proposals.get(key(principalId, instanceUrl, proposalId, revision)) ?? null,
+        proposals.get(key(issuer, principalId, instanceUrl, proposalId, revision)) ?? null,
       );
     },
     async saveDraft(input) {
@@ -137,10 +157,13 @@ export function memoryStorage(now = () => epoch): StoragePorts {
     async getWebhookSubscription(input) {
       return structuredClone(subscriptions.get(subscriptionKey(input)) ?? null);
     },
-    async listWebhookSubscriptions(principalId) {
+    async listWebhookSubscriptions(scope) {
       return structuredClone(
         [...subscriptions.values()].filter(
-          (sub) => principalId === undefined || sub.principalId === principalId,
+          (sub) =>
+            sub.issuer === scope.issuer &&
+            sub.principalId === scope.principalId &&
+            sub.instanceUrl === scope.instanceUrl,
         ),
       );
     },

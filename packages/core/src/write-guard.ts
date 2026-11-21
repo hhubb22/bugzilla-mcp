@@ -95,6 +95,7 @@ export function buildWriteGuardService(deps: CoreDependencies): WriteGuardServic
       const client = await requireClient(ctx);
 
       const scope: IdempotencyScope = {
+        issuer: ctx.issuer,
         principalId: ctx.principalId,
         instanceUrl: ctx.instanceUrl,
         operation: "bugzilla_post_analysis",
@@ -147,6 +148,7 @@ export function buildWriteGuardService(deps: CoreDependencies): WriteGuardServic
       }
       if (!caps.isInsider) {
         const note = await deps.storage.saveInternalNote(
+          ctx.issuer,
           ctx.principalId,
           ctx.instanceUrl,
           validInput.bugId,
@@ -169,6 +171,7 @@ export function buildWriteGuardService(deps: CoreDependencies): WriteGuardServic
         const res = await client.postPrivateComment(validInput.bugId, validInput.analysisMarkdown);
         if (res.kind === "private_rejected") {
           const note = await deps.storage.saveInternalNote(
+            ctx.issuer,
             ctx.principalId,
             ctx.instanceUrl,
             validInput.bugId,
@@ -244,6 +247,7 @@ export function buildWriteGuardService(deps: CoreDependencies): WriteGuardServic
     ): Promise<WriteGuardOutcome> {
       const client = await requireClient(ctx);
       const scope: IdempotencyScope = {
+        issuer: ctx.issuer,
         principalId: ctx.principalId,
         instanceUrl: ctx.instanceUrl,
         operation: "bugzilla_propose_update",
@@ -270,6 +274,7 @@ export function buildWriteGuardService(deps: CoreDependencies): WriteGuardServic
         const stored: StoredProposal = {
           proposalId,
           revision,
+          issuer: ctx.issuer,
           principalId: ctx.principalId,
           instanceUrl: ctx.instanceUrl,
           bugId: input.bugId,
@@ -322,6 +327,7 @@ export function buildWriteGuardService(deps: CoreDependencies): WriteGuardServic
         const artifactId = `update:${input.bugId}:${updated.updatedLastChangeTime}`;
         await deps.storage.recordWriteAudit({
           auditId: randomUUID(),
+          issuer: ctx.issuer,
           principalId: ctx.principalId,
           instanceUrl: ctx.instanceUrl,
           bugId: input.bugId,
@@ -368,6 +374,7 @@ export function buildWriteGuardService(deps: CoreDependencies): WriteGuardServic
       const client = await requireClient(ctx);
       const { idempotencyKey, ...payload } = input;
       const scope: IdempotencyScope = {
+        issuer: ctx.issuer,
         principalId: ctx.principalId,
         instanceUrl: ctx.instanceUrl,
         operation: "bugzilla_create_bug",
@@ -419,6 +426,7 @@ export function buildWriteGuardService(deps: CoreDependencies): WriteGuardServic
     ): Promise<WriteGuardOutcome> {
       const client = await requireClient(ctx);
       const scope: IdempotencyScope = {
+        issuer: ctx.issuer,
         principalId: ctx.principalId,
         instanceUrl: ctx.instanceUrl,
         operation: "app_resolve_proposal",
@@ -437,8 +445,14 @@ export function buildWriteGuardService(deps: CoreDependencies): WriteGuardServic
         return handleExistingReceipt(ctx, scope, reservation, intentHash);
       }
 
-      // Synchronous atomic proposal claim prevents concurrent approve/reject races across keys (WRITE-01)
-      const claimKey = `${ctx.issuer}|${ctx.principalId}|${ctx.instanceUrl}|${input.proposalId}|${input.revision}`;
+      // Synchronous atomic proposal claim prevents concurrent approve/reject races across keys (WRITE-01, ISO-10)
+      const claimKey = JSON.stringify([
+        ctx.issuer,
+        ctx.principalId,
+        ctx.instanceUrl,
+        input.proposalId,
+        input.revision,
+      ]);
       if (claimingProposals.has(claimKey)) {
         await deps.storage.finalizeReceipt(scope, {
           status: "failed",
@@ -454,6 +468,7 @@ export function buildWriteGuardService(deps: CoreDependencies): WriteGuardServic
 
       try {
         const proposal = await deps.storage.getProposal(
+          ctx.issuer,
           ctx.principalId,
           ctx.instanceUrl,
           input.proposalId,
@@ -474,6 +489,7 @@ export function buildWriteGuardService(deps: CoreDependencies): WriteGuardServic
         if (input.decision === "reject") {
           if (deps.storage.claimProposalTransition) {
             const won = await deps.storage.claimProposalTransition({
+              issuer: ctx.issuer,
               principalId: ctx.principalId,
               instanceUrl: ctx.instanceUrl,
               proposalId: proposal.proposalId,
@@ -538,6 +554,7 @@ export function buildWriteGuardService(deps: CoreDependencies): WriteGuardServic
             const verification = await deps.cloudApprovalService.verifyAndConsume(
               input.approval.token,
               {
+                approverIssuer: ctx.issuer,
                 approverPrincipalId: ctx.principalId,
                 instanceUrl: ctx.instanceUrl,
                 proposalId: proposal.proposalId,
@@ -604,6 +621,7 @@ export function buildWriteGuardService(deps: CoreDependencies): WriteGuardServic
         // Atomically claim pending -> approved across workers before upstream dispatch (AUTH-10)
         if (deps.storage.claimProposalTransition) {
           const won = await deps.storage.claimProposalTransition({
+            issuer: ctx.issuer,
             principalId: ctx.principalId,
             instanceUrl: ctx.instanceUrl,
             proposalId: proposal.proposalId,
@@ -660,6 +678,7 @@ export function buildWriteGuardService(deps: CoreDependencies): WriteGuardServic
           await deps.storage.saveProposal({ ...proposal, state: "applied" });
           await deps.storage.recordWriteAudit({
             auditId: randomUUID(),
+            issuer: ctx.issuer,
             principalId: ctx.principalId,
             instanceUrl: ctx.instanceUrl,
             bugId: proposal.bugId,
@@ -707,6 +726,7 @@ export function buildWriteGuardService(deps: CoreDependencies): WriteGuardServic
 
     async saveDraft(ctx: PrincipalContext, input: AppSaveDraftInput) {
       return deps.storage.saveDraft({
+        issuer: ctx.issuer,
         principalId: ctx.principalId,
         instanceUrl: ctx.instanceUrl,
         bugId: input.bugId,
@@ -718,6 +738,7 @@ export function buildWriteGuardService(deps: CoreDependencies): WriteGuardServic
 
     async getDraft(ctx: PrincipalContext, params) {
       return deps.storage.getDraft({
+        issuer: ctx.issuer,
         principalId: ctx.principalId,
         instanceUrl: ctx.instanceUrl,
         bugId: params.bugId,

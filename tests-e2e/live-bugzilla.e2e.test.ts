@@ -483,6 +483,7 @@ describe("Live OrbStack Bugzilla 5.2 Zero-Mock E2E", () => {
     const restartedStorage = createSqliteStorage(dbPath);
     const restartedApproval = createCloudApprovalTokenService(SIGNING_SECRET, restartedStorage);
     const replayCheck = await restartedApproval.verifyAndConsume(approvalToken, {
+      approverIssuer: adminPrincipal.issuer,
       approverPrincipalId: adminPrincipal.principalId,
       instanceUrl: BZ_URL,
       proposalId: propOut.proposalId,
@@ -591,7 +592,7 @@ describe("Live OrbStack Bugzilla 5.2 Zero-Mock E2E", () => {
     // Positive control: prove scanner detects plaintext stored in a disposable SQLite DB
     const controlPath = join(tmpDir, "control.sqlite");
     const controlStorage = createSqliteStorage(controlPath);
-    await controlStorage.saveInternalNote("u", BZ_URL, 1, secretKey);
+    await controlStorage.saveInternalNote(adminPrincipal.issuer, "u", BZ_URL, 1, secretKey);
     expect(scanDbAndWal(controlPath, secretKey)).toBe(true);
 
     // Decrypt across fresh storage instance

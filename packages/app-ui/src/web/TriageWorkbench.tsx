@@ -1,5 +1,6 @@
 import type { BugDossier, BugSummary, ProposalDiff } from "@bugzilla-mcp/contracts";
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
+import { normalizeBoardTenantKey, resolveBoardTenantKey } from "../tenant-key.js";
 import type { McpAppHostCapabilities, TriageAppController } from "../types.js";
 import type { RpcGate } from "./concurrency.js";
 
@@ -17,6 +18,8 @@ export interface UiProposalSummary {
 }
 
 export interface TriageBoardPayload {
+  readonly tenantKey?: string;
+  readonly issuer?: string;
   readonly instanceUrl: string;
   readonly instanceLabel?: string;
   readonly principalId: string;
@@ -82,7 +85,16 @@ export function TriageWorkbench({
   callServerTool,
   openExternalLink,
 }: WorkbenchProps) {
-  const [board, setBoard] = useState<TriageBoardPayload | null>(initialPayload);
+  const anonBoardSeqRef = useRef(0);
+  const boardSeqRef = useRef(0);
+  const normalizeIncomingBoard = useCallback(
+    (payload: TriageBoardPayload): TriageBoardPayload & { readonly tenantKey: string } =>
+      normalizeBoardTenantKey(payload, () => `anon-wb-${++anonBoardSeqRef.current}`),
+    [],
+  );
+  const [board, setBoard] = useState<TriageBoardPayload | null>(() =>
+    initialPayload ? normalizeIncomingBoard(initialPayload) : null,
+  );
   const [activeTab, setActiveTab] = useState<QueueTab>(
     initialPayload?.activeTab ?? "pending_proposals",
   );
@@ -105,6 +117,8 @@ export function TriageWorkbench({
   );
   const [drafts, setDrafts] = useState<Map<string, DraftEntry>>(() => new Map());
   const dialogRef = useRef<HTMLDialogElement | null>(null);
+  const currentTenantKey = resolveBoardTenantKey(board);
+  const lastTenantKeyRef = useRef<string>(currentTenantKey);
 
   const [isStaleBoard, setIsStaleBoard] = useState(false);
 
@@ -114,14 +128,45 @@ export function TriageWorkbench({
     return Number.isFinite(ageMs) && ageMs > 5 * 60_000;
   }, []);
 
+  const resetTenantScopedUiState = useCallback(
+    (nextDossier: BugDossier | null = null) => {
+      gate.bumpGeneration();
+      setDrafts(new Map());
+      setDossier(nextDossier);
+      setDossierLoading(false);
+      setSearchQuery("");
+      setProductFilter("ALL");
+      setSelectedIds(new Set());
+      setFocusedIndex(0);
+      setToast(null);
+      setConflict(null);
+      setConfirmProposal(null);
+      setIndeterminateProposals(new Set());
+      setInlineError(null);
+      setPartialError(null);
+    },
+    [gate],
+  );
+
   useEffect(() => {
     if (!initialPayload) return;
-    setBoard(initialPayload);
-    if (initialPayload.activeTab) setActiveTab(initialPayload.activeTab);
-    if (initialPayload.focusBugId !== undefined) setActiveBugId(initialPayload.focusBugId);
-    // Clear stale dossier whenever a replacement board arrives without one (UI-03)
-    setDossier(initialPayload.initialDossier ?? null);
-  }, [initialPayload]);
+    const normalized = normalizeIncomingBoard(initialPayload);
+    const nextTenantKey = normalized.tenantKey;
+    const tenantChanged = lastTenantKeyRef.current !== nextTenantKey;
+    lastTenantKeyRef.current = nextTenantKey;
+    boardSeqRef.current += 1;
+    setBoard(normalized);
+    if (tenantChanged) {
+      setActiveTab(normalized.activeTab ?? "pending_proposals");
+      setActiveBugId(normalized.focusBugId ?? normalized.initialDossier?.bug.id ?? null);
+      resetTenantScopedUiState(normalized.initialDossier ?? null);
+    } else {
+      if (normalized.activeTab) setActiveTab(normalized.activeTab);
+      if (normalized.focusBugId !== undefined) setActiveBugId(normalized.focusBugId);
+      // Clear stale dossier whenever a replacement board arrives without one (UI-03)
+      setDossier(normalized.initialDossier ?? null);
+    }
+  }, [initialPayload, normalizeIncomingBoard, resetTenantScopedUiState]);
 
   // Schedule live 5-minute staleness expiry so open boards lock writes automatically (UI-06)
   useEffect(() => {
@@ -220,9 +265,8 @@ export function TriageWorkbench({
   ]);
 
   const draftKey = useCallback(
-    (bugId: number) =>
-      `${board?.principalId ?? "anon"}::${board?.instanceUrl ?? ""}::${bugId}::private_comment`,
-    [board?.principalId, board?.instanceUrl],
+    (bugId: number) => `${currentTenantKey}::${bugId}::private_comment`,
+    [currentTenantKey],
   );
 
   const openBugDetail = useCallback(
@@ -243,7 +287,7 @@ export function TriageWorkbench({
         const payload = res.value as {
           structuredContent?: {
             dossier?: BugDossier;
-            draft?: { content: string; draftRevision: number };
+            draft?: { content: string; draftRevision: number } | null;
           };
         } | null;
         if (
@@ -252,21 +296,27 @@ export function TriageWorkbench({
         ) {
           setDossier(payload.structuredContent.dossier);
         }
-        if (payload?.structuredContent?.draft) {
+        if (payload?.structuredContent && "draft" in payload.structuredContent) {
           const d = payload.structuredContent.draft;
           setDrafts((prev) => {
-            const existing = prev.get(draftKey(bugId));
+            const key = draftKey(bugId);
+            const existing = prev.get(key);
             // Do not clobber dirty local edits with a delayed hydration response (UI-02)
             if (existing && (existing.status === "dirty" || existing.status === "saving")) {
               return prev;
             }
             const next = new Map(prev);
-            next.set(draftKey(bugId), {
-              content: d.content,
-              revision: d.draftRevision,
-              editSeq: existing?.editSeq ?? 0,
-              status: "saved",
-            });
+            if (d) {
+              next.set(key, {
+                content: d.content,
+                revision: d.draftRevision,
+                editSeq: existing?.editSeq ?? 0,
+                status: "saved",
+              });
+            } else {
+              // Explicitly clear stale cached draft when server reports null (ISO-04)
+              next.delete(key);
+            }
             return next;
           });
         }
@@ -283,7 +333,8 @@ export function TriageWorkbench({
     [callServerTool, draftKey, gate],
   );
 
-  const refreshBoard = useCallback(async () => {
+  const refreshBoard = useCallback(async (): Promise<boolean> => {
+    const originTenantKey = lastTenantKeyRef.current;
     const gen = gate.bumpGeneration();
     setInlineError(null);
     try {
@@ -293,14 +344,37 @@ export function TriageWorkbench({
           ...(productFilter !== "ALL" ? { product: productFilter } : {}),
         }),
       );
-      if (res.stale) return;
+      if (res.stale) return false;
       const payload = (res.value as { structuredContent?: TriageBoardPayload } | null)
         ?.structuredContent;
-      if (payload) setBoard(payload);
+      if (payload) {
+        const normalized = normalizeIncomingBoard(payload);
+        const nextTenantKey = normalized.tenantKey;
+        boardSeqRef.current += 1;
+        if (lastTenantKeyRef.current !== nextTenantKey) {
+          lastTenantKeyRef.current = nextTenantKey;
+          setActiveTab(normalized.activeTab ?? "pending_proposals");
+          setActiveBugId(normalized.focusBugId ?? normalized.initialDossier?.bug.id ?? null);
+          resetTenantScopedUiState(normalized.initialDossier ?? null);
+        }
+        setBoard(normalized);
+        return true;
+      }
+      return false;
     } catch {
-      setInlineError("Could not refresh queue from Bugzilla.");
+      if (lastTenantKeyRef.current === originTenantKey && gate.currentGeneration() === gen) {
+        setInlineError("Could not refresh queue from Bugzilla.");
+      }
+      return false;
     }
-  }, [activeTab, callServerTool, gate, productFilter]);
+  }, [
+    activeTab,
+    callServerTool,
+    gate,
+    normalizeIncomingBoard,
+    productFilter,
+    resetTenantScopedUiState,
+  ]);
 
   // Keyboard navigation (j/k/x/Enter/Escape/r) per Krug accessibility checklist
   useEffect(() => {
@@ -364,19 +438,24 @@ export function TriageWorkbench({
         return;
       }
       // Cloud multi-user approval MUST go through the authenticated HTTPS /approve page (UI-04)
+      const originTenantKey = lastTenantKeyRef.current;
+      const originBoardSeq = boardSeqRef.current;
+      const gen = gate.currentGeneration();
       if (decision === "approve" && board.deploymentMode === "cloud-multi-user") {
         if (proposal.approvalUrl && capabilities.openLinks) {
           await openExternalLink(proposal.approvalUrl);
-          setToast("Opened secure HTTPS approval page. Refresh after completing approval.");
+          if (lastTenantKeyRef.current === originTenantKey && gate.currentGeneration() === gen) {
+            setToast("Opened secure HTTPS approval page. Refresh after completing approval.");
+          }
         } else {
           setInlineError("Cloud approval requires an authenticated HTTPS approval link.");
         }
         return;
       }
       const key = `${proposal.proposalId}@${proposal.revision}`;
-      const previousProposals = board.proposals;
+      const previousState = proposal.state;
 
-      // Optimistic update for reject (with rollback on error)
+      // Optimistic update for reject (with board-seq & tenant-guarded per-proposal rollback on error: ISO-04-A)
       if (decision === "reject") {
         setBoard((prev) =>
           prev
@@ -392,7 +471,6 @@ export function TriageWorkbench({
         );
       }
 
-      const gen = gate.currentGeneration();
       try {
         const res = await gate.runWrite(gen, () =>
           callServerTool("app_resolve_proposal", {
@@ -410,7 +488,7 @@ export function TriageWorkbench({
               : {}),
           }),
         );
-        if (res.stale) return;
+        if (res.stale || lastTenantKeyRef.current !== originTenantKey) return;
         const outcome = (res.value as { structuredContent?: Record<string, unknown> } | null)
           ?.structuredContent;
         if (!outcome) return;
@@ -433,15 +511,34 @@ export function TriageWorkbench({
               ? `Applied proposal to Bug #${proposal.bugId}.`
               : `Rejected proposal for Bug #${proposal.bugId}.`,
           );
-          await refreshBoard();
+          const refreshed = await refreshBoard();
+          if (!refreshed || lastTenantKeyRef.current !== originTenantKey) return;
           await openBugDetail(proposal.bugId);
         } else {
           setInlineError(`Proposal action returned: ${String(outcome.outcome)}`);
         }
       } catch {
-        // Optimistic rollback on failure (UI state #6)
+        // Ignore stale rejections after a tenant switch, board replacement, or generation bump (ISO-04-A)
+        if (
+          lastTenantKeyRef.current !== originTenantKey ||
+          boardSeqRef.current !== originBoardSeq ||
+          gate.currentGeneration() !== gen
+        ) {
+          return;
+        }
         if (decision === "reject") {
-          setBoard((prev) => (prev ? { ...prev, proposals: previousProposals } : prev));
+          setBoard((prev) =>
+            prev && resolveBoardTenantKey(prev) === originTenantKey
+              ? {
+                  ...prev,
+                  proposals: prev.proposals.map((p) =>
+                    p.proposalId === proposal.proposalId && p.revision === proposal.revision
+                      ? { ...p, state: previousState }
+                      : p,
+                  ),
+                }
+              : prev,
+          );
           setToast("Reject failed; restored proposal to pending.");
         } else {
           setInlineError("Failed to execute proposal write.");
@@ -483,6 +580,7 @@ export function TriageWorkbench({
         });
         return copy;
       });
+      const originTenantKey = lastTenantKeyRef.current;
       const gen = gate.currentGeneration();
       try {
         const res = await gate.runWrite(gen, () =>
@@ -493,7 +591,7 @@ export function TriageWorkbench({
             content: nextContent,
           }),
         );
-        if (res.stale) return;
+        if (res.stale || lastTenantKeyRef.current !== originTenantKey) return;
         const result = (
           res.value as { structuredContent?: { status: string; draftRevision?: number } } | null
         )?.structuredContent;
@@ -515,6 +613,9 @@ export function TriageWorkbench({
           return copy;
         });
       } catch {
+        if (lastTenantKeyRef.current !== originTenantKey || gate.currentGeneration() !== gen) {
+          return;
+        }
         setDrafts((prev) => {
           const copy = new Map(prev);
           const latest = prev.get(k);
@@ -769,11 +870,18 @@ export function TriageWorkbench({
                       type="button"
                       className="btn"
                       onClick={() => {
+                        const originTenantKey = lastTenantKeyRef.current;
+                        const gen = gate.currentGeneration();
                         const selected = (board?.bugs ?? [])
                           .filter((b) => selectedIds.has(b.id))
                           .map((b) => ({ bugId: b.id, title: b.summary }));
                         void controller.attachSelectionToModelContext(selected).then(() => {
-                          setToast(`Attached ${selected.length} bug link(s) to next turn.`);
+                          if (
+                            lastTenantKeyRef.current === originTenantKey &&
+                            gate.currentGeneration() === gen
+                          ) {
+                            setToast(`Attached ${selected.length} bug link(s) to next turn.`);
+                          }
                         });
                       }}
                     >
@@ -783,9 +891,16 @@ export function TriageWorkbench({
                       type="button"
                       className="btn btn-ghost"
                       onClick={() => {
-                        void controller
-                          .clearModelContext()
-                          .then(() => setToast("Cleared context."));
+                        const originTenantKey = lastTenantKeyRef.current;
+                        const gen = gate.currentGeneration();
+                        void controller.clearModelContext().then(() => {
+                          if (
+                            lastTenantKeyRef.current === originTenantKey &&
+                            gate.currentGeneration() === gen
+                          ) {
+                            setToast("Cleared context.");
+                          }
+                        });
                       }}
                     >
                       Clear

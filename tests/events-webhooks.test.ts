@@ -569,7 +569,11 @@ test.each([410, 413])(
     const restarted = env.create();
     await restarted.deliverPendingWebhooks(principal);
     expect(receiver.events()).toHaveLength(1);
-    const persisted = await env.deps.storage.listWebhookSubscriptions(principal.principalId);
+    const persisted = await env.deps.storage.listWebhookSubscriptions({
+      issuer: principal.issuer,
+      principalId: principal.principalId,
+      instanceUrl: principal.instanceUrl,
+    });
     const gap = receiver.requests.find((request) => request.rawBody.includes('"gap"'));
     if (gap) expectSignature(gap, secret);
     if (status === 413) expect(persisted).toHaveLength(1);
@@ -729,9 +733,13 @@ test("canonical refresh preserves identity and no-expiry verification and dual-s
     }),
   );
   expect(refresh).toMatchObject({ id: sub.id, refreshBefore: null });
-  expect(await env.deps.storage.listWebhookSubscriptions(principal.principalId)).toEqual([
-    expect.objectContaining({ id: sub.id, verified: true, refreshBefore: null }),
-  ]);
+  expect(
+    await env.deps.storage.listWebhookSubscriptions({
+      issuer: principal.issuer,
+      principalId: principal.principalId,
+      instanceUrl: principal.instanceUrl,
+    }),
+  ).toEqual([expect.objectContaining({ id: sub.id, verified: true, refreshBefore: null })]);
   env.add(comment(70, iso(epoch + 1_000)));
   env.clock.advance(5_000);
   await restarted.deliverPendingWebhooks(principal);

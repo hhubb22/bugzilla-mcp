@@ -48,6 +48,7 @@ export interface WebhookOutboundTransport {
 }
 
 export interface CloudApprovalExpected {
+  readonly approverIssuer: string;
   readonly approverPrincipalId: string;
   readonly instanceUrl: string;
   readonly proposalId: string;
@@ -73,6 +74,7 @@ export type CloudApprovalVerificationResult =
 
 export interface CloudApprovalTokenService {
   issue(params: {
+    readonly approverIssuer: string;
     readonly approverPrincipalId: string;
     readonly instanceUrl: string;
     readonly proposalId: string;
@@ -214,7 +216,11 @@ export function startWebhookDeliveryLoop(params: {
         const principals = await params.listPrincipals();
         for (const ctx of principals) {
           if (stopped) break;
-          await params.events.deliverPendingWebhooks(ctx);
+          try {
+            await params.events.deliverPendingWebhooks(ctx);
+          } catch (err) {
+            params.onError?.(err);
+          }
         }
       } catch (err) {
         params.onError?.(err);

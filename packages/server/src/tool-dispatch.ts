@@ -15,7 +15,12 @@ import {
   McpErrorCode,
   type PrincipalContext,
 } from "@bugzilla-mcp/contracts";
-import type { CoreDependencies, WriteGuardService } from "@bugzilla-mcp/core";
+import {
+  canonicalJson,
+  sha256Hex,
+  type CoreDependencies,
+  type WriteGuardService,
+} from "@bugzilla-mcp/core";
 import type { createApprovalPageManager } from "./approval-page.js";
 
 export const TRIAGE_APP_URI = "ui://bugzilla/triage-app.html";
@@ -316,11 +321,19 @@ export async function dispatchToolCall(params: {
       };
     }
     const internalNotes = await core.storage.listInternalNotes(
+      ctx.issuer,
       ctx.principalId,
       ctx.instanceUrl,
       parsed.data.bugId,
     );
-    const dossier = { ...raw, internalNotes };
+    const tenantKey = sha256Hex(
+      canonicalJson({
+        issuer: ctx.issuer,
+        principalId: ctx.principalId,
+        instanceUrl: ctx.instanceUrl,
+      }),
+    );
+    const dossier = { ...raw, internalNotes, tenantKey };
     return {
       kind: "ok",
       content: [{ type: "text", text: JSON.stringify(dossier) }],
@@ -369,7 +382,7 @@ export async function dispatchToolCall(params: {
       offset: 0,
     });
     const rawProposals =
-      (await core.storage.listProposals?.(ctx.principalId, ctx.instanceUrl)) ?? [];
+      (await core.storage.listProposals?.(ctx.issuer, ctx.principalId, ctx.instanceUrl)) ?? [];
     // Re-authorize every proposal's bug against current Bugzilla visibility (AUTH-05)
     const visCache = new Map<number, boolean>();
     for (const b of search.items) visCache.set(b.id, true);
@@ -398,7 +411,15 @@ export async function dispatchToolCall(params: {
       ...b,
       pendingProposalCount: pendingCounts.get(b.id) ?? 0,
     }));
+    const tenantKey = sha256Hex(
+      canonicalJson({
+        issuer: ctx.issuer,
+        principalId: ctx.principalId,
+        instanceUrl: ctx.instanceUrl,
+      }),
+    );
     const boardPayload = {
+      tenantKey,
       instanceUrl: ctx.instanceUrl,
       principalId: ctx.principalId,
       deploymentMode: ctx.deploymentMode,
@@ -435,6 +456,7 @@ export async function dispatchToolCall(params: {
     const outcome = await writeGuard.proposeUpdate(ctx, parsed.data);
     if (outcome.outcome === "ProposalPending" && ctx.deploymentMode === "cloud-multi-user") {
       const stored = await core.storage.getProposal(
+        ctx.issuer,
         ctx.principalId,
         ctx.instanceUrl,
         outcome.proposalId,
@@ -601,9 +623,14 @@ export async function dispatchToolCall(params: {
       };
     }
     const [internalNotes, draft, proposals] = await Promise.all([
-      core.storage.listInternalNotes(ctx.principalId, ctx.instanceUrl, parsed.data.bugId),
+      core.storage.listInternalNotes(
+        ctx.issuer,
+        ctx.principalId,
+        ctx.instanceUrl,
+        parsed.data.bugId,
+      ),
       writeGuard.getDraft(ctx, { bugId: parsed.data.bugId, draftKind: "private_comment" }),
-      core.storage.listProposals?.(ctx.principalId, ctx.instanceUrl, {
+      core.storage.listProposals?.(ctx.issuer, ctx.principalId, ctx.instanceUrl, {
         bugId: parsed.data.bugId,
       }) ?? Promise.resolve([]),
     ]);
@@ -711,6 +738,7 @@ export async function readMcpResource(params: {
     };
   }
   const internalNotes = await core.storage.listInternalNotes(
+    ctx.issuer,
     ctx.principalId,
     ctx.instanceUrl,
     bugId,

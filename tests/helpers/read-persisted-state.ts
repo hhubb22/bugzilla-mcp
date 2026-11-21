@@ -22,6 +22,7 @@ if (import.meta.main) {
       console.log(
         JSON.stringify(
           await storage.getDraft({
+            issuer: principal.issuer,
             principalId: principal.principalId,
             instanceUrl: principal.instanceUrl,
             bugId: 41,
@@ -31,7 +32,15 @@ if (import.meta.main) {
       );
       break;
     case "webhooks":
-      console.log(JSON.stringify(await storage.listWebhookSubscriptions(principal.principalId)));
+      console.log(
+        JSON.stringify(
+          await storage.listWebhookSubscriptions({
+            issuer: principal.issuer,
+            principalId: principal.principalId,
+            instanceUrl: principal.instanceUrl,
+          }),
+        ),
+      );
       break;
     default:
       throw new Error("Expected a persistence fixture kind");

@@ -11,6 +11,7 @@ import type {
 } from "@bugzilla-mcp/contracts";
 
 export interface IdempotencyScope {
+  readonly issuer: string;
   readonly principalId: string;
   readonly instanceUrl: string;
   readonly operation: string;
@@ -30,6 +31,7 @@ export type StoredReceipt =
 export interface StoredProposal {
   readonly proposalId: string;
   readonly revision: number;
+  readonly issuer: string;
   readonly principalId: string;
   readonly instanceUrl: string;
   readonly bugId: BugId;
@@ -56,6 +58,7 @@ export interface SelfWriteProvenance {
 
 export interface WriteAuditEntry {
   readonly auditId: string;
+  readonly issuer: string;
   readonly principalId: string;
   readonly instanceUrl: string;
   readonly bugId: BugId;
@@ -69,6 +72,7 @@ export interface WriteAuditEntry {
 
 export interface StoredWebhookSubscription {
   readonly id: string;
+  readonly issuer: string;
   readonly principalId: string;
   readonly instanceUrl: string;
   readonly name: EventName;
@@ -140,6 +144,7 @@ export interface StoragePorts {
   hasSelfWrite(entry: SelfWriteProvenance): Promise<boolean>;
   recordWriteAudit(entry: WriteAuditEntry): Promise<void>;
   listWriteAudits(
+    issuer: string,
     principalId: string,
     instanceUrl: string,
     bugId: BugId,
@@ -152,24 +157,28 @@ export interface StoragePorts {
     nowMs: number;
   }): Promise<{ allowed: boolean; retryAfterMs?: number }>;
   saveInternalNote(
+    issuer: string,
     principalId: string,
     instanceUrl: string,
     bugId: BugId,
     text: string,
   ): Promise<InternalNote>;
   listInternalNotes(
+    issuer: string,
     principalId: string,
     instanceUrl: string,
     bugId: BugId,
   ): Promise<InternalNote[]>;
   saveProposal(proposal: StoredProposal): Promise<void>;
   getProposal(
+    issuer: string,
     principalId: string,
     instanceUrl: string,
     proposalId: string,
     revision: number,
   ): Promise<StoredProposal | null>;
   saveDraft(params: {
+    issuer: string;
     principalId: string;
     instanceUrl: string;
     bugId: BugId;
@@ -178,6 +187,7 @@ export interface StoragePorts {
     content: string;
   }): Promise<DraftSaveResult>;
   getDraft(params: {
+    issuer: string;
     principalId: string;
     instanceUrl: string;
     bugId: BugId;
@@ -185,14 +195,22 @@ export interface StoragePorts {
   }): Promise<StoredDraft | null>;
   upsertWebhookSubscription(sub: StoredWebhookSubscription): Promise<void>;
   getWebhookSubscription(params: {
+    issuer: string;
     principalId: string;
+    instanceUrl: string;
     url: string;
     name: EventName;
     canonicalArgsJson: string;
   }): Promise<StoredWebhookSubscription | null>;
-  listWebhookSubscriptions(principalId?: string): Promise<StoredWebhookSubscription[]>;
+  listWebhookSubscriptions(scope: {
+    readonly issuer: string;
+    readonly principalId: string;
+    readonly instanceUrl: string;
+  }): Promise<StoredWebhookSubscription[]>;
   deleteWebhookSubscription(params: {
+    issuer: string;
     principalId: string;
+    instanceUrl: string;
     url: string;
     name: EventName;
     canonicalArgsJson: string;
@@ -200,11 +218,13 @@ export interface StoragePorts {
 
   // Additive Slice-2 durable persistence hooks (optional for minimal in-memory test doubles)
   listProposals?(
+    issuer: string,
     principalId: string,
     instanceUrl: string,
     filter?: { bugId?: BugId; state?: StoredProposal["state"] },
   ): Promise<StoredProposal[]>;
   claimProposalTransition?(params: {
+    issuer: string;
     principalId: string;
     instanceUrl: string;
     proposalId: string;

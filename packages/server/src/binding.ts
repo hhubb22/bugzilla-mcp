@@ -1,5 +1,5 @@
 import { createHmac, randomBytes, timingSafeEqual } from "node:crypto";
-import type { PrincipalContext } from "@bugzilla-mcp/contracts";
+import { RESERVED_LEGACY_ISSUER, type PrincipalContext } from "@bugzilla-mcp/contracts";
 import type { DualEraHttpRequest, DualEraHttpResponse, HttpServerConfig } from "./index.js";
 
 const TICKET_TTL_MS = 10 * 60 * 1000;
@@ -154,7 +154,12 @@ export function createBindingManager(config: HttpServerConfig) {
         };
       }
       const opener = await config.verifyBindingOpenerSession(req);
-      if (!opener || opener.issuer !== ticket.issuer || opener.principalId !== ticket.principalId) {
+      if (
+        !opener ||
+        opener.issuer === RESERVED_LEGACY_ISSUER ||
+        opener.issuer !== ticket.issuer ||
+        opener.principalId !== ticket.principalId
+      ) {
         return {
           status: 403,
           headers: { "content-type": "text/plain" },
@@ -239,7 +244,12 @@ export function createBindingManager(config: HttpServerConfig) {
         };
       }
       const opener = await config.verifyBindingOpenerSession(req);
-      if (!opener || opener.issuer !== ticket.issuer || opener.principalId !== ticket.principalId) {
+      if (
+        !opener ||
+        opener.issuer === RESERVED_LEGACY_ISSUER ||
+        opener.issuer !== ticket.issuer ||
+        opener.principalId !== ticket.principalId
+      ) {
         return {
           status: 403,
           headers: { "content-type": "text/plain" },

@@ -74,6 +74,7 @@ function buildScopeHash(
 ): string {
   return sha256Hex(
     canonicalJson({
+      issuer: ctx.issuer,
       principalId: ctx.principalId,
       instanceUrl: ctx.instanceUrl,
       name,
@@ -85,6 +86,8 @@ function buildScopeHash(
 function encodeCursor(cursor: DecodedCursor): string {
   return Buffer.from(JSON.stringify(cursor), "utf8").toString("base64url");
 }
+
+const MAX_JS_DATE_MS = 8_640_000_000_000_000;
 
 function decodeCursor(raw: string, expectedScope: string, currentEpoch: number): DecodedCursor {
   let parsed: unknown;
@@ -100,6 +103,8 @@ function decodeCursor(raw: string, expectedScope: string, currentEpoch: number):
     typeof (parsed as DecodedCursor).scope !== "string" ||
     typeof (parsed as DecodedCursor).ts !== "number" ||
     !Number.isFinite((parsed as DecodedCursor).ts) ||
+    Math.abs((parsed as DecodedCursor).ts) > MAX_JS_DATE_MS ||
+    Number.isNaN(new Date((parsed as DecodedCursor).ts).getTime()) ||
     typeof (parsed as DecodedCursor).tie !== "string"
   ) {
     throw new McpDomainError(McpErrorCode.INVALID_PARAMS, "Malformed cursor fields");
@@ -634,7 +639,9 @@ export function buildSyntheticEventsService(deps: CoreDependencies): SyntheticEv
       const scopeHash = buildScopeHash(ctx, params.name, params.arguments);
 
       const existing = await deps.storage.getWebhookSubscription({
+        issuer: ctx.issuer,
         principalId: ctx.principalId,
+        instanceUrl: ctx.instanceUrl,
         url: params.delivery.url,
         name: params.name,
         canonicalArgsJson,
@@ -718,6 +725,7 @@ export function buildSyntheticEventsService(deps: CoreDependencies): SyntheticEv
         truncated || (deps.eventsProfile === "chatgpt-events" && Boolean(existing?.gapPending));
       const updatedSub: StoredWebhookSubscription = {
         id: subId,
+        issuer: ctx.issuer,
         principalId: ctx.principalId,
         instanceUrl: ctx.instanceUrl,
         name: params.name,
@@ -759,7 +767,9 @@ export function buildSyntheticEventsService(deps: CoreDependencies): SyntheticEv
     async unsubscribeWebhook(ctx, params) {
       const canonicalArgsJson = canonicalJson(normalizeArgsForCanonical(params.arguments));
       const deleted = await deps.storage.deleteWebhookSubscription({
+        issuer: ctx.issuer,
         principalId: ctx.principalId,
+        instanceUrl: ctx.instanceUrl,
         url: params.delivery.url,
         name: params.name,
         canonicalArgsJson,
@@ -775,7 +785,11 @@ export function buildSyntheticEventsService(deps: CoreDependencies): SyntheticEv
     async deliverPendingWebhooks(ctx) {
       const nowMs = clock();
       const safePrefixMs = nowMs - deps.lagWindowMs;
-      const subs = await deps.storage.listWebhookSubscriptions(ctx.principalId);
+      const subs = await deps.storage.listWebhookSubscriptions({
+        issuer: ctx.issuer,
+        principalId: ctx.principalId,
+        instanceUrl: ctx.instanceUrl,
+      });
       const client = await deps.resolveClient(ctx);
 
       let delivered = 0;
@@ -792,6 +806,17 @@ export function buildSyntheticEventsService(deps: CoreDependencies): SyntheticEv
         }
         const secrets = activeSecrets(sub, nowMs);
         const scopeHash = buildScopeHash(ctx, sub.name, sub.args);
+        // Validate stored watermark BEFORE emitting any gap envelope or scanning so one invalid
+        // subscription can never emit corrupt cursors or starve healthy subscriptions (ISO-03)
+        let wm: DecodedCursor;
+        try {
+          wm =
+            sub.safeWatermark !== null
+              ? decodeCursor(sub.safeWatermark, scopeHash, schemaEpoch)
+              : { v: schemaEpoch, scope: scopeHash, ts: safePrefixMs, tie: "" };
+        } catch {
+          continue;
+        }
         let liveGapPending = sub.gapPending;
 
         // Emit pending SEP-3415 gap control envelope before event delivery (EVENT-11)
@@ -816,7 +841,9 @@ export function buildSyntheticEventsService(deps: CoreDependencies): SyntheticEv
           if (gapResp && gapResp.status >= 200 && gapResp.status < 300) {
             liveGapPending = false;
             const freshSub = await deps.storage.getWebhookSubscription({
+              issuer: sub.issuer,
               principalId: sub.principalId,
+              instanceUrl: sub.instanceUrl,
               url: sub.url,
               name: sub.name,
               canonicalArgsJson: sub.canonicalArgsJson,
@@ -858,10 +885,6 @@ export function buildSyntheticEventsService(deps: CoreDependencies): SyntheticEv
         }
 
         // Scan newly available occurrences since safeWatermark (propagating revocation -> terminate: REST-03)
-        const wm = sub.safeWatermark
-          ? decodeCursor(sub.safeWatermark, scopeHash, schemaEpoch)
-          : { v: schemaEpoch, scope: scopeHash, ts: safePrefixMs, tie: "" };
-
         let scan: Awaited<ReturnType<typeof scanRange>>;
         try {
           scan = await scanRange(ctx, sub.name, sub.args, wm.ts, safePrefixMs);
@@ -888,7 +911,9 @@ export function buildSyntheticEventsService(deps: CoreDependencies): SyntheticEv
               }
             }
             await deps.storage.deleteWebhookSubscription({
+              issuer: sub.issuer,
               principalId: sub.principalId,
+              instanceUrl: sub.instanceUrl,
               url: sub.url,
               name: sub.name,
               canonicalArgsJson: sub.canonicalArgsJson,
@@ -977,7 +1002,9 @@ export function buildSyntheticEventsService(deps: CoreDependencies): SyntheticEv
               }
             }
             await deps.storage.deleteWebhookSubscription({
+              issuer: sub.issuer,
               principalId: sub.principalId,
+              instanceUrl: sub.instanceUrl,
               url: sub.url,
               name: sub.name,
               canonicalArgsJson: sub.canonicalArgsJson,
@@ -1060,7 +1087,9 @@ export function buildSyntheticEventsService(deps: CoreDependencies): SyntheticEv
               highestProcessed = { ts: item.tsMs, tie: item.tieKey };
             }
             const freshSub = await deps.storage.getWebhookSubscription({
+              issuer: sub.issuer,
               principalId: sub.principalId,
+              instanceUrl: sub.instanceUrl,
               url: sub.url,
               name: sub.name,
               canonicalArgsJson: sub.canonicalArgsJson,
@@ -1085,7 +1114,9 @@ export function buildSyntheticEventsService(deps: CoreDependencies): SyntheticEv
                 highestProcessed = { ts: item.tsMs, tie: item.tieKey };
               }
               const freshSub = await deps.storage.getWebhookSubscription({
+                issuer: sub.issuer,
                 principalId: sub.principalId,
+                instanceUrl: sub.instanceUrl,
                 url: sub.url,
                 name: sub.name,
                 canonicalArgsJson: sub.canonicalArgsJson,
@@ -1121,7 +1152,9 @@ export function buildSyntheticEventsService(deps: CoreDependencies): SyntheticEv
           highestProcessed
         ) {
           const freshSub = await deps.storage.getWebhookSubscription({
+            issuer: sub.issuer,
             principalId: sub.principalId,
+            instanceUrl: sub.instanceUrl,
             url: sub.url,
             name: sub.name,
             canonicalArgsJson: sub.canonicalArgsJson,

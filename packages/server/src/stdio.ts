@@ -4,6 +4,7 @@ import {
   MCP_PROTOCOL_LEGACY,
   MCP_PROTOCOL_MODERN,
   McpErrorCode,
+  RESERVED_LEGACY_ISSUER,
   type PrincipalContext,
 } from "@bugzilla-mcp/contracts";
 import { createWriteGuardService, McpDomainError } from "@bugzilla-mcp/core";
@@ -52,6 +53,9 @@ export function createStdioRpcProcessor(params: {
   principal: PrincipalContext;
 }) {
   const { config, principal } = params;
+  if (principal.issuer === RESERVED_LEGACY_ISSUER) {
+    throw new Error("Reserved legacy issuer cannot be used for live stdio principals");
+  }
   const writeGuard = createWriteGuardService(config.core);
   const approvalPage = createApprovalPageManager(config);
 
