@@ -151,6 +151,8 @@ export interface StoragePorts {
   }): Promise<boolean>;
 }
 
-export function createSqliteStorage(_dbPath: string): StoragePorts {
-  throw new Error("C0_CONTRACT_STUB");
+import { openSqliteStorage } from "./sqlite.js";
+
+export function createSqliteStorage(dbPath: string): StoragePorts {
+  return openSqliteStorage(dbPath);
 }

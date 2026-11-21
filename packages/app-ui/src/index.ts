@@ -1,4 +1,10 @@
 import type { BugId } from "@bugzilla-mcp/contracts";
+import { createController } from "./controller.js";
+import {
+  buildSafeResourceLinks,
+  formatSafeUserIntentMessage,
+  renderSafeBugView,
+} from "./sanitize.js";
 
 export type HostSurface = "aux_pane" | "global" | "inline";
 
@@ -53,22 +59,20 @@ export interface TriageAppController {
  * - buildSafeModelContext attaches only authorized bugzilla://bug/{id} resource links.
  * - createTriageAppController drives host sendMessage/updateModelContext strictly through safe boundaries.
  */
-export function buildSafeUserIntentMessage(_intent: SafeUserIntentMessage): string {
-  throw new Error("C0_CONTRACT_STUB");
+export function buildSafeUserIntentMessage(intent: SafeUserIntentMessage): string {
+  return formatSafeUserIntentMessage(intent);
 }
 
-export function renderInertBugzillaView(
-  _input: UntrustedBugzillaDisplayInput,
-): SafeRenderedBugView {
-  throw new Error("C0_CONTRACT_STUB");
+export function renderInertBugzillaView(input: UntrustedBugzillaDisplayInput): SafeRenderedBugView {
+  return renderSafeBugView(input);
 }
 
-export function buildSafeModelContext(_bugIds: readonly BugId[]): {
+export function buildSafeModelContext(bugIds: readonly BugId[]): {
   readonly resourceLinks: readonly { readonly type: "resource_link"; readonly uri: string }[];
 } {
-  throw new Error("C0_CONTRACT_STUB");
+  return buildSafeResourceLinks(bugIds);
 }
 
-export function createTriageAppController(_host: McpAppHostPort): TriageAppController {
-  throw new Error("C0_CONTRACT_STUB");
+export function createTriageAppController(host: McpAppHostPort): TriageAppController {
+  return createController(host);
 }

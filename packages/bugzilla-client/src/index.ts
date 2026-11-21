@@ -73,6 +73,8 @@ export interface BugzillaClient {
   ): Promise<"visible" | "restricted_or_missing" | "credential_revoked">;
 }
 
-export function createBugzillaClient(_config: BugzillaClientConfig): BugzillaClient {
-  throw new Error("C0_CONTRACT_STUB");
+import { createRestBugzillaClient } from "./rest-client.js";
+
+export function createBugzillaClient(config: BugzillaClientConfig): BugzillaClient {
+  return createRestBugzillaClient(config);
 }

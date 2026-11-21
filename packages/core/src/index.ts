@@ -1,4 +1,8 @@
 import type { BugzillaClient } from "@bugzilla-mcp/bugzilla-client";
+import { buildCloudApprovalTokenService } from "./approval.js";
+import { buildSyntheticEventsService } from "./events.js";
+import { buildWriteGuardService } from "./write-guard.js";
+export { McpDomainError, canonicalJson, sha256Hex } from "./canonical.js";
 import type {
   AppResolveProposalInput,
   AppSaveDraftInput,
@@ -177,14 +181,14 @@ export interface SyntheticEventsService {
   ): Promise<{ delivered: number; abandoned: number; terminated: number }>;
 }
 
-export function createWriteGuardService(_deps: CoreDependencies): WriteGuardService {
-  throw new Error("C0_CONTRACT_STUB");
+export function createWriteGuardService(deps: CoreDependencies): WriteGuardService {
+  return buildWriteGuardService(deps);
 }
 
-export function createSyntheticEventsService(_deps: CoreDependencies): SyntheticEventsService {
-  throw new Error("C0_CONTRACT_STUB");
+export function createSyntheticEventsService(deps: CoreDependencies): SyntheticEventsService {
+  return buildSyntheticEventsService(deps);
 }
 
-export function createCloudApprovalTokenService(_signingSecret: string): CloudApprovalTokenService {
-  throw new Error("C0_CONTRACT_STUB");
+export function createCloudApprovalTokenService(signingSecret: string): CloudApprovalTokenService {
+  return buildCloudApprovalTokenService(signingSecret);
 }

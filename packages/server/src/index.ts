@@ -38,6 +38,8 @@ export interface DualEraMcpHandler {
   handleHttp(req: DualEraHttpRequest): Promise<DualEraHttpResponse>;
 }
 
-export function createDualEraHttpHandler(_config: HttpServerConfig): DualEraMcpHandler {
-  throw new Error("C0_CONTRACT_STUB");
+import { buildDualEraHttpHandler } from "./http-handler.js";
+
+export function createDualEraHttpHandler(config: HttpServerConfig): DualEraMcpHandler {
+  return buildDualEraHttpHandler(config);
 }
