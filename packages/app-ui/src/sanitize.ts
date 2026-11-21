@@ -59,9 +59,14 @@ export function buildSafeResourceLinks(bugIds: readonly BugId[]): {
   readonly resourceLinks: readonly { readonly type: "resource_link"; readonly uri: string }[];
 } {
   return {
-    resourceLinks: bugIds.map((id) => ({
-      type: "resource_link" as const,
-      uri: `bugzilla://bug/${id}`,
-    })),
+    resourceLinks: bugIds.map((id) => {
+      if (!Number.isSafeInteger(id) || id <= 0) {
+        throw new Error(`Invalid bug ID: ${String(id)}`);
+      }
+      return {
+        type: "resource_link" as const,
+        uri: `bugzilla://bug/${id}`,
+      };
+    }),
   };
 }

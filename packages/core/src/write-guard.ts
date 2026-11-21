@@ -25,6 +25,14 @@ function nowIso(clock: () => number): string {
 export function buildWriteGuardService(deps: CoreDependencies): WriteGuardService {
   const clock = deps.clock ?? (() => Date.now());
   const causalWindowMs = deps.causalBudgetWindowMs ?? 60_000;
+  // Synchronous in-flight proposal claim lock prevents concurrent resolution with different keys (WRITE-01)
+  const claimingProposals = new Set<string>();
+
+  function parseTargetBugFromArtifact(artifactId: string): BugId | undefined {
+    const bugMatch = /^(?:bug|update):(\d+)/.exec(artifactId);
+    if (bugMatch?.[1]) return Number(bugMatch[1]);
+    return undefined;
+  }
 
   async function requireClient(ctx: PrincipalContext) {
     const client = await deps.resolveClient(ctx);
@@ -55,9 +63,10 @@ export function buildWriteGuardService(deps: CoreDependencies): WriteGuardServic
       };
     }
     if (existing.status === "applied") {
-      if (targetBugId !== undefined) {
+      const checkBugId = targetBugId ?? parseTargetBugFromArtifact(existing.artifactId);
+      if (checkBugId !== undefined) {
         const client = await requireClient(ctx);
-        const vis = await client.checkVisibility(targetBugId);
+        const vis = await client.checkVisibility(checkBugId);
         if (vis !== "visible") {
           throw new McpDomainError(
             McpErrorCode.INVALID_PARAMS,
@@ -124,7 +133,18 @@ export function buildWriteGuardService(deps: CoreDependencies): WriteGuardServic
         };
       }
 
-      const caps = await client.probeCapabilities();
+      let caps: Awaited<ReturnType<typeof client.probeCapabilities>>;
+      try {
+        caps = await client.probeCapabilities();
+      } catch (err) {
+        // Pre-dispatch failure: release pending receipt so retries are not stranded (WRITE-05)
+        await deps.storage.finalizeReceipt(scope, {
+          status: "failed",
+          intentHash,
+          errorCode: "preflight_probe_failed",
+        });
+        throw err;
+      }
       if (!caps.isInsider) {
         const note = await deps.storage.saveInternalNote(
           ctx.principalId,
@@ -397,203 +417,227 @@ export function buildWriteGuardService(deps: CoreDependencies): WriteGuardServic
         return handleExistingReceipt(ctx, scope, reservation, intentHash);
       }
 
-      const proposal = await deps.storage.getProposal(
-        ctx.principalId,
-        ctx.instanceUrl,
-        input.proposalId,
-        input.revision,
-      );
-      if (!proposal || proposal.state !== "pending") {
+      // Synchronous atomic proposal claim prevents concurrent approve/reject races across keys (WRITE-01)
+      const claimKey = `${ctx.issuer}|${ctx.principalId}|${ctx.instanceUrl}|${input.proposalId}|${input.revision}`;
+      if (claimingProposals.has(claimKey)) {
         await deps.storage.finalizeReceipt(scope, {
           status: "failed",
           intentHash,
-          errorCode: "proposal_not_pending",
+          errorCode: "proposal_claim_in_flight",
         });
         throw new McpDomainError(
           McpErrorCode.INVALID_PARAMS,
-          "Proposal not found or already resolved",
+          "Proposal resolution already in flight",
         );
       }
+      claimingProposals.add(claimKey);
 
-      if (input.decision === "reject") {
-        await deps.storage.saveProposal({ ...proposal, state: "rejected" });
-        const artifactId = `rejected:${proposal.proposalId}:${proposal.revision}`;
-        await deps.storage.finalizeReceipt(scope, {
-          status: "applied",
-          intentHash,
-          artifactId,
-        });
-        return {
-          outcome: "Applied",
-          artifactId,
-          bugId: proposal.bugId,
-          auditRecorded: false,
-        };
-      }
-
-      // Decision is "approve": verify approval authority strictly by deployment mode
-      if (ctx.deploymentMode === "cloud-multi-user") {
-        if (!input.approval || input.approval.kind !== "cloud_signed_token") {
+      try {
+        const proposal = await deps.storage.getProposal(
+          ctx.principalId,
+          ctx.instanceUrl,
+          input.proposalId,
+          input.revision,
+        );
+        if (!proposal || proposal.state !== "pending") {
           await deps.storage.finalizeReceipt(scope, {
             status: "failed",
             intentHash,
-            errorCode: "missing_cloud_approval",
+            errorCode: "proposal_not_pending",
           });
           throw new McpDomainError(
-            McpErrorCode.SEP_EVENTS_FORBIDDEN,
-            "Cloud guarded execution requires a server-verified signed approval token",
+            McpErrorCode.INVALID_PARAMS,
+            "Proposal not found or already resolved",
           );
         }
-        if (!deps.cloudApprovalService) {
+
+        if (input.decision === "reject") {
+          await deps.storage.saveProposal({ ...proposal, state: "rejected" });
+          const artifactId = `rejected:${proposal.proposalId}:${proposal.revision}`;
           await deps.storage.finalizeReceipt(scope, {
-            status: "failed",
+            status: "applied",
             intentHash,
-            errorCode: "approval_service_unavailable",
+            artifactId,
           });
-          throw new McpDomainError(
-            McpErrorCode.INTERNAL_ERROR,
-            "Cloud approval verification service is not configured",
-          );
-        }
-        const verification = await deps.cloudApprovalService.verifyAndConsume(
-          input.approval.token,
-          {
-            approverPrincipalId: ctx.principalId,
-            instanceUrl: ctx.instanceUrl,
-            proposalId: proposal.proposalId,
-            revision: proposal.revision,
+          return {
+            outcome: "Applied",
+            artifactId,
             bugId: proposal.bugId,
-            baseVersion: proposal.baseVersion,
-            diff: proposal.diff,
-            visibility: "public",
-            nowMs: clock(),
-          },
-        );
-        if (!verification.valid) {
-          await deps.storage.finalizeReceipt(scope, {
-            status: "failed",
-            intentHash,
-            errorCode: verification.reason,
-          });
-          throw new McpDomainError(
-            McpErrorCode.SEP_EVENTS_FORBIDDEN,
-            `Approval verification failed: ${verification.reason}`,
-          );
+            auditRecorded: false,
+          };
         }
-      } else {
-        // Local trusted IDE mode allows local_ide_host_confirmed or valid cloud_signed_token
+
+        // Decision is "approve": exhaustively verify approval proof by deployment mode (WRITE-02)
         if (!input.approval) {
           await deps.storage.finalizeReceipt(scope, {
             status: "failed",
             intentHash,
-            errorCode: "missing_local_approval",
+            errorCode: "missing_approval",
           });
           throw new McpDomainError(
             McpErrorCode.SEP_EVENTS_FORBIDDEN,
-            "Local guarded execution requires host confirmation",
+            "Guarded proposal approval requires a valid approval proof",
           );
         }
-        if (input.approval.kind === "cloud_signed_token" && deps.cloudApprovalService) {
-          const verification = await deps.cloudApprovalService.verifyAndConsume(
-            input.approval.token,
-            {
-              approverPrincipalId: ctx.principalId,
-              instanceUrl: ctx.instanceUrl,
-              proposalId: proposal.proposalId,
-              revision: proposal.revision,
-              bugId: proposal.bugId,
-              baseVersion: proposal.baseVersion,
-              diff: proposal.diff,
-              visibility: "public",
-              nowMs: clock(),
-            },
-          );
-          if (!verification.valid) {
-            await deps.storage.finalizeReceipt(scope, {
-              status: "failed",
-              intentHash,
-              errorCode: verification.reason,
-            });
-            throw new McpDomainError(
-              McpErrorCode.SEP_EVENTS_FORBIDDEN,
-              `Approval verification failed: ${verification.reason}`,
+
+        switch (input.approval.kind) {
+          case "cloud_signed_token": {
+            if (!deps.cloudApprovalService) {
+              await deps.storage.finalizeReceipt(scope, {
+                status: "failed",
+                intentHash,
+                errorCode: "approval_service_unavailable",
+              });
+              throw new McpDomainError(
+                McpErrorCode.INTERNAL_ERROR,
+                "Cloud approval verification service is not configured",
+              );
+            }
+            const verification = await deps.cloudApprovalService.verifyAndConsume(
+              input.approval.token,
+              {
+                approverPrincipalId: ctx.principalId,
+                instanceUrl: ctx.instanceUrl,
+                proposalId: proposal.proposalId,
+                revision: proposal.revision,
+                bugId: proposal.bugId,
+                baseVersion: proposal.baseVersion,
+                diff: proposal.diff,
+                visibility: "public",
+                nowMs: clock(),
+              },
             );
+            if (!verification.valid) {
+              await deps.storage.finalizeReceipt(scope, {
+                status: "failed",
+                intentHash,
+                errorCode: verification.reason,
+              });
+              throw new McpDomainError(
+                McpErrorCode.SEP_EVENTS_FORBIDDEN,
+                `Approval verification failed: ${verification.reason}`,
+              );
+            }
+            break;
+          }
+          case "local_ide_host_confirmed": {
+            if (ctx.deploymentMode !== "local-trusted-ide") {
+              await deps.storage.finalizeReceipt(scope, {
+                status: "failed",
+                intentHash,
+                errorCode: "local_proof_forbidden_in_cloud",
+              });
+              throw new McpDomainError(
+                McpErrorCode.SEP_EVENTS_FORBIDDEN,
+                "Cloud guarded execution requires a server-verified signed approval token",
+              );
+            }
+            break;
+          }
+          case "policy_grant": {
+            const granted = deps.isPolicyGranted
+              ? await deps.isPolicyGranted(ctx, {
+                  bugId: proposal.bugId,
+                  idempotencyKey: input.idempotencyKey,
+                  expectedLastChangeTime: proposal.baseVersion,
+                  diff: proposal.diff,
+                  rationale: proposal.rationale,
+                })
+              : false;
+            if (!granted) {
+              await deps.storage.finalizeReceipt(scope, {
+                status: "failed",
+                intentHash,
+                errorCode: "policy_not_granted",
+              });
+              throw new McpDomainError(
+                McpErrorCode.SEP_EVENTS_FORBIDDEN,
+                "Policy grant denied by server policy",
+              );
+            }
+            break;
           }
         }
-      }
 
-      const dossier = await client.getBugDossierData(proposal.bugId, {
-        maxComments: 0,
-        maxHistory: 0,
-      });
-      if (!dossier) {
-        await deps.storage.finalizeReceipt(scope, {
-          status: "failed",
-          intentHash,
-          errorCode: "bug_inaccessible",
-        });
-        throw new McpDomainError(McpErrorCode.INVALID_PARAMS, "Bug inaccessible");
-      }
-      if (dossier.bug.lastChangeTime !== proposal.baseVersion) {
-        await deps.storage.saveProposal({ ...proposal, state: "stale" });
-        await deps.storage.finalizeReceipt(scope, {
-          status: "failed",
-          intentHash,
-          errorCode: "stale_bug_conflict",
-        });
-        return {
-          outcome: "StaleBugConflict",
-          expectedLastChangeTime: proposal.baseVersion,
-          actualLastChangeTime: dossier.bug.lastChangeTime,
-          latestAuthorizedSnapshot: dossier.bug,
-        };
-      }
+        // Persist claimed approved state before upstream dispatch
+        await deps.storage.saveProposal({ ...proposal, state: "approved" });
 
-      try {
-        const updated = await client.applyBugUpdate(proposal.bugId, proposal.diff);
-        const artifactId = `update:${proposal.bugId}:${updated.updatedLastChangeTime}`;
-        await deps.storage.saveProposal({ ...proposal, state: "applied" });
-        await deps.storage.recordWriteAudit({
-          auditId: randomUUID(),
-          principalId: ctx.principalId,
-          instanceUrl: ctx.instanceUrl,
-          bugId: proposal.bugId,
-          proposalId: proposal.proposalId,
-          revision: proposal.revision,
-          expectedLastChangeTime: proposal.baseVersion,
-          updatedLastChangeTime: updated.updatedLastChangeTime,
-          diff: proposal.diff,
-          recordedAt: nowIso(clock),
+        const dossier = await client.getBugDossierData(proposal.bugId, {
+          maxComments: 0,
+          maxHistory: 0,
         });
-        await deps.storage.recordSelfWrite({
-          instanceUrl: ctx.instanceUrl,
-          bugId: proposal.bugId,
-          ...(updated.commentId !== undefined ? { commentId: updated.commentId } : {}),
-          diffKey: sha256Hex(canonicalJson(proposal.diff)),
-        });
-        await deps.storage.finalizeReceipt(scope, {
-          status: "applied",
-          intentHash,
-          artifactId,
-        });
-        return {
-          outcome: "Applied",
-          artifactId,
-          bugId: proposal.bugId,
-          auditRecorded: true,
-        };
-      } catch {
-        await deps.storage.saveProposal({ ...proposal, state: "indeterminate" });
-        await deps.storage.finalizeReceipt(scope, {
-          status: "indeterminate",
-          intentHash,
-          recordedAt: nowIso(clock),
-        });
-        return {
-          outcome: "OperationIndeterminate",
-          idempotencyKey: input.idempotencyKey,
-          reconciliationHint: INDETERMINATE_HINT,
-        };
+        if (!dossier) {
+          await deps.storage.saveProposal({ ...proposal, state: "pending" });
+          await deps.storage.finalizeReceipt(scope, {
+            status: "failed",
+            intentHash,
+            errorCode: "bug_inaccessible",
+          });
+          throw new McpDomainError(McpErrorCode.INVALID_PARAMS, "Bug inaccessible");
+        }
+        if (dossier.bug.lastChangeTime !== proposal.baseVersion) {
+          await deps.storage.saveProposal({ ...proposal, state: "stale" });
+          await deps.storage.finalizeReceipt(scope, {
+            status: "failed",
+            intentHash,
+            errorCode: "stale_bug_conflict",
+          });
+          return {
+            outcome: "StaleBugConflict",
+            expectedLastChangeTime: proposal.baseVersion,
+            actualLastChangeTime: dossier.bug.lastChangeTime,
+            latestAuthorizedSnapshot: dossier.bug,
+          };
+        }
+
+        try {
+          const updated = await client.applyBugUpdate(proposal.bugId, proposal.diff);
+          const artifactId = `update:${proposal.bugId}:${updated.updatedLastChangeTime}`;
+          await deps.storage.saveProposal({ ...proposal, state: "applied" });
+          await deps.storage.recordWriteAudit({
+            auditId: randomUUID(),
+            principalId: ctx.principalId,
+            instanceUrl: ctx.instanceUrl,
+            bugId: proposal.bugId,
+            proposalId: proposal.proposalId,
+            revision: proposal.revision,
+            expectedLastChangeTime: proposal.baseVersion,
+            updatedLastChangeTime: updated.updatedLastChangeTime,
+            diff: proposal.diff,
+            recordedAt: nowIso(clock),
+          });
+          await deps.storage.recordSelfWrite({
+            instanceUrl: ctx.instanceUrl,
+            bugId: proposal.bugId,
+            ...(updated.commentId !== undefined ? { commentId: updated.commentId } : {}),
+            diffKey: sha256Hex(canonicalJson(proposal.diff)),
+          });
+          await deps.storage.finalizeReceipt(scope, {
+            status: "applied",
+            intentHash,
+            artifactId,
+          });
+          return {
+            outcome: "Applied",
+            artifactId,
+            bugId: proposal.bugId,
+            auditRecorded: true,
+          };
+        } catch {
+          await deps.storage.saveProposal({ ...proposal, state: "indeterminate" });
+          await deps.storage.finalizeReceipt(scope, {
+            status: "indeterminate",
+            intentHash,
+            recordedAt: nowIso(clock),
+          });
+          return {
+            outcome: "OperationIndeterminate",
+            idempotencyKey: input.idempotencyKey,
+            reconciliationHint: INDETERMINATE_HINT,
+          };
+        }
+      } finally {
+        claimingProposals.delete(claimKey);
       }
     },
 

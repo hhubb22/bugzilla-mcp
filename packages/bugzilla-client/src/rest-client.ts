@@ -69,16 +69,29 @@ function toBugSummary(raw: RawBug): BugSummary {
 }
 
 export function createRestBugzillaClient(config: BugzillaClientConfig): BugzillaClient {
+  const parsedBase = new URL(config.baseUrl);
+  const isLocal = parsedBase.hostname === "localhost" || parsedBase.hostname === "127.0.0.1";
+  if (parsedBase.protocol !== "https:" && !isLocal) {
+    throw new Error("Bugzilla baseUrl must use https:// outside localhost");
+  }
+  if (parsedBase.username || parsedBase.password) {
+    throw new Error("Bugzilla baseUrl must not contain embedded credentials");
+  }
   const baseUrl = config.baseUrl.replace(/\/+$/, "");
 
   async function requestJson<T>(
     path: string,
-    init: { method?: "GET" | "POST" | "PUT"; query?: Record<string, string>; body?: unknown } = {},
-  ): Promise<{ status: number; data: T | null }> {
+    init: {
+      method?: "GET" | "POST" | "PUT";
+      query?: Array<[string, string]>;
+      body?: unknown;
+      timeoutMs?: number;
+    } = {},
+  ): Promise<{ status: number; data: T | null; parseOk: boolean }> {
     const url = new URL(`${baseUrl}/rest${path}`);
     if (init.query) {
-      for (const [k, v] of Object.entries(init.query)) {
-        url.searchParams.set(k, v);
+      for (const [k, v] of init.query) {
+        url.searchParams.append(k, v);
       }
     }
     const headers: Record<string, string> = {
@@ -94,18 +107,21 @@ export function createRestBugzillaClient(config: BugzillaClientConfig): Bugzilla
       method: init.method ?? "GET",
       headers,
       redirect: "error",
+      signal: AbortSignal.timeout(init.timeoutMs ?? 15_000),
       ...(serializedBody !== undefined ? { body: serializedBody } : {}),
     });
     const text = await response.text();
     let parsed: T | null = null;
+    let parseOk = true;
     if (text.length > 0) {
       try {
         parsed = JSON.parse(text) as T;
       } catch {
         parsed = null;
+        parseOk = false;
       }
     }
-    return { status: response.status, data: parsed };
+    return { status: response.status, data: parsed, parseOk };
   }
 
   return {
@@ -132,19 +148,26 @@ export function createRestBugzillaClient(config: BugzillaClientConfig): Bugzilla
     },
 
     async searchBugs(params) {
-      const query: Record<string, string> = {
-        include_fields:
+      const query: Array<[string, string]> = [
+        [
+          "include_fields",
           "id,summary,product,component,status,resolution,priority,severity,assigned_to,last_change_time",
-        limit: String(params.limit + 1),
-        offset: String(params.offset),
-      };
-      if (params.product) query.product = params.product;
-      if (params.component) query.component = params.component;
-      if (params.assignedTo) query.assigned_to = params.assignedTo;
-      if (params.updatedSince) query.last_change_time = params.updatedSince;
-      if (params.query) query.summary = params.query;
+        ],
+        ["limit", String(params.limit + 1)],
+        ["offset", String(params.offset)],
+      ];
+      if (params.product) query.push(["product", params.product]);
+      if (params.component) query.push(["component", params.component]);
+      if (params.assignedTo) query.push(["assigned_to", params.assignedTo]);
+      if (params.updatedSince) query.push(["last_change_time", params.updatedSince]);
+      if (params.query) query.push(["summary", params.query]);
+      if (params.status) {
+        for (const s of params.status) {
+          query.push(["status", s]);
+        }
+      }
       const resp = await requestJson<{ bugs?: RawBug[] }>("/bug", { query });
-      if (resp.status >= 400 || !resp.data) {
+      if (resp.status >= 400 || !resp.parseOk || !resp.data) {
         throw new Error(`Bugzilla search failed (${resp.status})`);
       }
       const bugs = resp.data.bugs ?? [];
@@ -162,14 +185,30 @@ export function createRestBugzillaClient(config: BugzillaClientConfig): Bugzilla
       if (bugResp.status === 401 || bugResp.status === 403 || bugResp.status === 404) {
         return null;
       }
+      if (bugResp.status >= 500 || !bugResp.parseOk) {
+        throw new Error(`Bugzilla get bug transient failure (${bugResp.status})`);
+      }
       const rawBug = bugResp.data?.bugs?.[0];
       if (!rawBug) return null;
 
+      if (opts.maxComments === 0 && opts.maxHistory === 0) {
+        return {
+          bug: toBugSummary(rawBug),
+          recentComments: [],
+          recentHistory: [],
+          attachments: [],
+        };
+      }
+
       const [commentsResp, historyResp, attachments] = await Promise.all([
-        requestJson<{ bugs?: Record<string, { comments?: RawComment[] }> }>(
-          `/bug/${bugId}/comment`,
-        ),
-        requestJson<{ bugs?: Array<{ history?: RawHistoryEntry[] }> }>(`/bug/${bugId}/history`),
+        opts.maxComments > 0
+          ? requestJson<{ bugs?: Record<string, { comments?: RawComment[] }> }>(
+              `/bug/${bugId}/comment`,
+            )
+          : Promise.resolve({ status: 200, data: null, parseOk: true }),
+        opts.maxHistory > 0
+          ? requestJson<{ bugs?: Array<{ history?: RawHistoryEntry[] }> }>(`/bug/${bugId}/history`)
+          : Promise.resolve({ status: 200, data: null, parseOk: true }),
         this.listAttachments(bugId),
       ]);
 
@@ -178,23 +217,29 @@ export function createRestBugzillaClient(config: BugzillaClientConfig): Bugzilla
 
       return {
         bug: toBugSummary(rawBug),
-        recentComments: rawComments.slice(-opts.maxComments).map((c) => ({
-          id: c.id,
-          creator: c.creator,
-          time: c.time,
-          isPrivate: Boolean(c.is_private),
-          text: c.text,
-          untrustedUserContent: true,
-        })),
-        recentHistory: rawHistory.slice(-opts.maxHistory).map((entry) => ({
-          when: entry.when,
-          who: entry.who,
-          changes: entry.changes.map((ch) => ({
-            fieldName: ch.field_name,
-            removed: ch.removed,
-            added: ch.added,
-          })),
-        })),
+        recentComments:
+          opts.maxComments > 0
+            ? rawComments.slice(-opts.maxComments).map((c) => ({
+                id: c.id,
+                creator: c.creator,
+                time: c.time,
+                isPrivate: Boolean(c.is_private),
+                text: c.text,
+                untrustedUserContent: true,
+              }))
+            : [],
+        recentHistory:
+          opts.maxHistory > 0
+            ? rawHistory.slice(-opts.maxHistory).map((entry) => ({
+                when: entry.when,
+                who: entry.who,
+                changes: entry.changes.map((ch) => ({
+                  fieldName: ch.field_name,
+                  removed: ch.removed,
+                  added: ch.added,
+                })),
+              }))
+            : [],
         attachments,
       };
     },
@@ -202,7 +247,7 @@ export function createRestBugzillaClient(config: BugzillaClientConfig): Bugzilla
     async listAttachments(bugId: BugId): Promise<AttachmentMeta[]> {
       const resp = await requestJson<{ bugs?: Record<string, RawAttachment[]> }>(
         `/bug/${bugId}/attachment`,
-        { query: { exclude_fields: "data" } },
+        { query: [["exclude_fields", "data"]] },
       );
       if (resp.status >= 400) return [];
       const list = resp.data?.bugs?.[String(bugId)] ?? [];
@@ -249,18 +294,29 @@ export function createRestBugzillaClient(config: BugzillaClientConfig): Bugzilla
       const resp = await requestJson<{
         bugs?: Array<{ last_change_time?: IsoTimestamp }>;
       }>(`/bug/${bugId}`, { method: "PUT", body });
-      if (resp.status >= 400) {
+      if (resp.status >= 400 || !resp.parseOk) {
         throw new Error(`Bugzilla update failed (${resp.status})`);
       }
-      const updatedLastChangeTime =
-        resp.data?.bugs?.[0]?.last_change_time ?? new Date().toISOString();
+      const updatedLastChangeTime = resp.data?.bugs?.[0]?.last_change_time;
+      if (!updatedLastChangeTime) {
+        throw new Error("Bugzilla update response missing last_change_time acknowledgement");
+      }
       return { updatedLastChangeTime };
     },
 
     async createBug(input: Omit<BugzillaCreateBugInput, "idempotencyKey">) {
+      const safeCustomFields: Record<string, unknown> = {};
+      if (input.customFields) {
+        for (const [key, value] of Object.entries(input.customFields)) {
+          if (key.startsWith("cf_")) {
+            safeCustomFields[key] = value;
+          }
+        }
+      }
       const resp = await requestJson<{ id?: number }>("/bug", {
         method: "POST",
         body: {
+          ...safeCustomFields,
           product: input.product,
           component: input.component,
           version: input.version,
@@ -268,26 +324,41 @@ export function createRestBugzillaClient(config: BugzillaClientConfig): Bugzilla
           description: input.description,
           severity: input.severity,
           priority: input.priority,
-          ...input.customFields,
         },
       });
-      if (resp.status >= 400 || resp.data?.id === undefined) {
+      if (resp.status >= 400 || !resp.parseOk || resp.data?.id === undefined) {
         throw new Error(`Bugzilla create bug failed (${resp.status})`);
       }
       return { bugId: resp.data.id };
     },
 
     async listChangesSince(params) {
+      // Overlap by 1 second because Bugzilla 5.2 comment new_since uses strictly-greater comparison
+      const overlapSince = new Date(Math.max(0, Date.parse(params.since) - 1_000)).toISOString();
       const search = await this.searchBugs({
-        updatedSince: params.since,
+        updatedSince: overlapSince,
         limit: params.limit,
         offset: params.offset,
       });
       const occurrences: UpstreamBugzillaOccurrence[] = [];
       for (const bug of search.items) {
-        const commentsResp = await requestJson<{
-          bugs?: Record<string, { comments?: RawComment[] }>;
-        }>(`/bug/${bug.id}/comment`, { query: { new_since: params.since } });
+        const [commentsResp, historyResp] = await Promise.all([
+          requestJson<{ bugs?: Record<string, { comments?: RawComment[] }> }>(
+            `/bug/${bug.id}/comment`,
+            { query: [["new_since", overlapSince]] },
+          ),
+          requestJson<{ bugs?: Array<{ history?: RawHistoryEntry[] }> }>(`/bug/${bug.id}/history`, {
+            query: [["new_since", overlapSince]],
+          }),
+        ]);
+        if (
+          commentsResp.status >= 500 ||
+          !commentsResp.parseOk ||
+          historyResp.status >= 500 ||
+          !historyResp.parseOk
+        ) {
+          return { occurrences: [], scanComplete: false };
+        }
         const comments = commentsResp.data?.bugs?.[String(bug.id)]?.comments ?? [];
         for (const c of comments) {
           occurrences.push({
@@ -302,14 +373,48 @@ export function createRestBugzillaClient(config: BugzillaClientConfig): Bugzilla
             commentText: c.text,
           });
         }
+        const historyEntries = historyResp.data?.bugs?.[0]?.history ?? [];
+        for (const entry of historyEntries) {
+          const fieldsChanged = entry.changes.map((ch) => ch.field_name);
+          occurrences.push({
+            kind: "bugzilla.bug.updated",
+            bugId: bug.id,
+            changeKey: `history-${entry.when}-${entry.who}-${fieldsChanged.join(",")}`,
+            timestamp: entry.when,
+            product: bug.product,
+            component: bug.component,
+            actor: entry.who,
+            fieldsChanged,
+            summaryText: bug.summary,
+          });
+          if (
+            entry.changes.some(
+              (ch) => ch.field_name === "flagtypes.name" && ch.added.includes("needinfo?"),
+            )
+          ) {
+            occurrences.push({
+              kind: "bugzilla.flag.needinfo",
+              bugId: bug.id,
+              changeKey: `needinfo-${entry.when}-${entry.who}`,
+              timestamp: entry.when,
+              product: bug.product,
+              component: bug.component,
+              actor: entry.who,
+              summaryText: bug.summary,
+            });
+          }
+        }
       }
       return { occurrences, scanComplete: !search.hasMore };
     },
 
     async checkVisibility(bugId: BugId, commentId?: number) {
       const resp = await requestJson<{ bugs?: RawBug[] }>(`/bug/${bugId}`, {
-        query: { include_fields: "id" },
+        query: [["include_fields", "id"]],
       });
+      if (resp.status >= 500 || !resp.parseOk) {
+        throw new Error(`Bugzilla visibility check transient failure (${resp.status})`);
+      }
       if (resp.status === 401) return "credential_revoked";
       if (resp.status === 403 || resp.status === 404 || !resp.data?.bugs?.length) {
         return "restricted_or_missing";
@@ -318,6 +423,9 @@ export function createRestBugzillaClient(config: BugzillaClientConfig): Bugzilla
         const cResp = await requestJson<{ comments?: Record<string, RawComment> }>(
           `/bug/comment/${commentId}`,
         );
+        if (cResp.status >= 500 || !cResp.parseOk) {
+          throw new Error(`Bugzilla comment visibility check transient failure (${cResp.status})`);
+        }
         if (cResp.status === 401) return "credential_revoked";
         if (cResp.status >= 400 || !cResp.data?.comments?.[String(commentId)]) {
           return "restricted_or_missing";

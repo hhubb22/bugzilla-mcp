@@ -152,6 +152,17 @@ export function createBindingManager(config: HttpServerConfig) {
     },
 
     async handleBindPost(req: DualEraHttpRequest): Promise<DualEraHttpResponse> {
+      const expectedOrigin = new URL(publicBaseUrl).origin;
+      const reqOrigin = Object.entries(req.headers).find(
+        ([k]) => k.toLowerCase() === "origin",
+      )?.[1];
+      if (reqOrigin !== undefined && reqOrigin !== expectedOrigin) {
+        return {
+          status: 403,
+          headers: { "content-type": "text/plain" },
+          body: "Forbidden origin on binding submission",
+        };
+      }
       const url = new URL(req.path, publicBaseUrl);
       const form = new URLSearchParams(req.rawBody);
       const ticketId = form.get("t") ?? url.searchParams.get("t");
@@ -195,7 +206,14 @@ export function createBindingManager(config: HttpServerConfig) {
         };
       }
 
-      // Mark consumed before awaiting storage to prevent concurrent double-submit
+      // Atomic check-and-claim AFTER async opener verification prevents concurrent double-submit (AUTH-04)
+      if (clock() > ticket.expiresAtMs || ticket.completed) {
+        return {
+          status: 410,
+          headers: { "content-type": "text/plain" },
+          body: "Binding ticket expired or already consumed",
+        };
+      }
       ticket.completed = true;
       try {
         const stored = await config.storeBoundApiKey(

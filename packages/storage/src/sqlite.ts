@@ -92,6 +92,15 @@ const SCHEMA_SQL = `
     sub_json TEXT NOT NULL,
     PRIMARY KEY (principal_id, url, name, canonical_args_json)
   );
+
+  CREATE INDEX IF NOT EXISTS idx_self_writes_lookup
+    ON self_writes (instance_url, bug_id, comment_id, diff_key);
+  CREATE INDEX IF NOT EXISTS idx_write_audits_lookup
+    ON write_audits (principal_id, instance_url, bug_id);
+  CREATE INDEX IF NOT EXISTS idx_causal_budget_lookup
+    ON causal_budget (instance_url, bug_id, at_ms);
+  CREATE INDEX IF NOT EXISTS idx_internal_notes_lookup
+    ON internal_notes (principal_id, instance_url, bug_id);
 `;
 
 export function openSqliteStorage(dbPath: string): StoragePorts {
@@ -213,6 +222,9 @@ export function openSqliteStorage(dbPath: string): StoragePorts {
     },
 
     async consumeCausalBudget({ instanceUrl, bugId, maxWrites, windowMs, nowMs }) {
+      if (maxWrites <= 0) {
+        return { allowed: false, retryAfterMs: windowMs };
+      }
       const cutoff = nowMs - windowMs;
       db.exec("BEGIN IMMEDIATE");
       try {
@@ -224,10 +236,13 @@ export function openSqliteStorage(dbPath: string): StoragePorts {
             `SELECT at_ms FROM causal_budget WHERE instance_url = ? AND bug_id = ? ORDER BY at_ms ASC`,
           )
           .all(instanceUrl, bugId) as Array<{ at_ms: number }>;
-        const oldest = rows[0];
-        if (oldest !== undefined && rows.length >= maxWrites) {
+        if (rows.length >= maxWrites) {
+          const oldest = rows[0];
           db.exec("COMMIT");
-          return { allowed: false, retryAfterMs: oldest.at_ms + windowMs - nowMs };
+          return {
+            allowed: false,
+            retryAfterMs: oldest !== undefined ? oldest.at_ms + windowMs - nowMs : windowMs,
+          };
         }
         db.prepare(`INSERT INTO causal_budget (instance_url, bug_id, at_ms) VALUES (?, ?, ?)`).run(
           instanceUrl,

@@ -199,9 +199,39 @@ export function buildDualEraHttpHandler(config: HttpServerConfig): DualEraMcpHan
   const eventsService = createSyntheticEventsService(config.core);
   const binding = createBindingManager(config);
   const legacySessions = new Map<string, { protocolVersion: string; initialized: boolean }>();
+  const publicBaseUrl = (config.publicBaseUrl ?? "https://mcp.example").replace(/\/+$/, "");
 
-  // Partitioned per (principalId, instanceUrl, credentialGeneration, uri)
-  const dossierCache = new Map<string, unknown>();
+  function insufficientScopeResponse(requiredScope: string): DualEraHttpResponse {
+    return {
+      status: 403,
+      headers: {
+        "www-authenticate": `Bearer error="insufficient_scope", scope="${requiredScope}", resource_metadata="${publicBaseUrl}/.well-known/oauth-protected-resource"`,
+        "content-type": "application/json",
+      },
+      body: JSON.stringify({ error: "insufficient_scope", requiredScope }),
+    };
+  }
+
+  function requiredScopeForRpc(
+    method: string,
+    params: Record<string, unknown>,
+  ): PrincipalContext["scopes"][number] | null {
+    if (method === "resources/read") return "bz:read";
+    if (method.startsWith("events/")) return "bz:events";
+    if (method === "tools/call") {
+      const name = typeof params.name === "string" ? params.name : "";
+      if (name === "bugzilla_post_analysis") return "bz:write:safe";
+      if (
+        name === "bugzilla_propose_update" ||
+        name === "bugzilla_create_bug" ||
+        name === "app_resolve_proposal"
+      ) {
+        return "bz:write:guarded";
+      }
+      return "bz:read";
+    }
+    return null;
+  }
 
   async function authenticate(req: DualEraHttpRequest): Promise<PrincipalContext | null> {
     if (config.mode === "local-trusted-ide" && !config.authenticateBearerToken) {
@@ -278,6 +308,15 @@ export function buildDualEraHttpHandler(config: HttpServerConfig): DualEraMcpHan
   return {
     async handleHttp(req: DualEraHttpRequest): Promise<DualEraHttpResponse> {
       const pathname = new URL(req.path, "https://mcp.local").pathname;
+
+      // RFC 9728 Protected Resource Metadata discovery endpoint (MCP-03)
+      if (pathname === "/.well-known/oauth-protected-resource" && req.method === "GET") {
+        return jsonResponse(200, {
+          resource: `${publicBaseUrl}/mcp`,
+          authorization_servers: [],
+          scopes_supported: ["bz:read", "bz:write:safe", "bz:write:guarded", "bz:events"],
+        });
+      }
 
       // Out-of-band HTTPS binding routes
       if (pathname === "/bind") {
@@ -462,6 +501,12 @@ export function buildDualEraHttpHandler(config: HttpServerConfig): DualEraMcpHan
 
       const clientCapabilities = metaCaps as ClientCapabilities;
 
+      // Enforce OAuth scopes before resolving credentials, issuing tickets, or reserving receipts (AUTH-01)
+      const neededScope = requiredScopeForRpc(rpc.method, params);
+      if (neededScope && !ctx.scopes.includes(neededScope)) {
+        return insufficientScopeResponse(neededScope);
+      }
+
       try {
         if (rpc.method === "tools/list") {
           return jsonResponse(200, {
@@ -478,8 +523,9 @@ export function buildDualEraHttpHandler(config: HttpServerConfig): DualEraMcpHan
 
         if (rpc.method === "resources/read") {
           const uri = typeof params.uri === "string" ? params.uri : "";
-          const match = /^bugzilla:\/\/bug\/(\d+)$/.exec(uri);
-          if (!match || !match[1]) {
+          const match = /^bugzilla:\/\/bug\/([1-9]\d*)$/.exec(uri);
+          const bugId = match?.[1] ? Number(match[1]) : NaN;
+          if (!Number.isSafeInteger(bugId) || bugId <= 0) {
             return rpcErrorResponse(
               200,
               rpc.id,
@@ -487,7 +533,6 @@ export function buildDualEraHttpHandler(config: HttpServerConfig): DualEraMcpHan
               INDISTINGUISHABLE_RESOURCE_ERROR.message,
             );
           }
-          const bugId = Number(match[1]);
           const client = await config.core.resolveClient(ctx);
           if (!client) {
             return rpcErrorResponse(
@@ -506,26 +551,22 @@ export function buildDualEraHttpHandler(config: HttpServerConfig): DualEraMcpHan
               INDISTINGUISHABLE_RESOURCE_ERROR.message,
             );
           }
-          const cacheKey = `${ctx.principalId}|${ctx.instanceUrl}|${ctx.credentialGeneration}|${uri}`;
-          let dossier = dossierCache.get(cacheKey);
-          if (!dossier) {
-            const raw = await client.getBugDossierData(bugId, { maxComments: 15, maxHistory: 30 });
-            if (!raw) {
-              return rpcErrorResponse(
-                200,
-                rpc.id,
-                INDISTINGUISHABLE_RESOURCE_ERROR.code,
-                INDISTINGUISHABLE_RESOURCE_ERROR.message,
-              );
-            }
-            const internalNotes = await config.core.storage.listInternalNotes(
-              ctx.principalId,
-              ctx.instanceUrl,
-              bugId,
+          // Always fetch live authorized dossier on sensitive resource reads (AUTH-02: ttlMs 0)
+          const raw = await client.getBugDossierData(bugId, { maxComments: 15, maxHistory: 30 });
+          if (!raw) {
+            return rpcErrorResponse(
+              200,
+              rpc.id,
+              INDISTINGUISHABLE_RESOURCE_ERROR.code,
+              INDISTINGUISHABLE_RESOURCE_ERROR.message,
             );
-            dossier = { ...raw, internalNotes };
-            dossierCache.set(cacheKey, dossier);
           }
+          const internalNotes = await config.core.storage.listInternalNotes(
+            ctx.principalId,
+            ctx.instanceUrl,
+            bugId,
+          );
+          const dossier = { ...raw, internalNotes };
           return jsonResponse(200, {
             jsonrpc: "2.0",
             id: rpc.id,
@@ -552,8 +593,29 @@ export function buildDualEraHttpHandler(config: HttpServerConfig): DualEraMcpHan
               : {};
           const paramsHash = sha256Hex(canonicalJson(toolArgs));
 
-          // If MRTR continuation state is supplied, strictly validate & consume single-use
-          if (typeof params.requestState === "string") {
+          // Strictly validate continuation envelope including non-string state & decline/cancel (AUTH-06)
+          if (params.requestState !== undefined) {
+            if (typeof params.requestState !== "string") {
+              return rpcErrorResponse(
+                400,
+                rpc.id,
+                McpErrorCode.INVALID_PARAMS,
+                "Malformed continuation requestState",
+              );
+            }
+            const responses =
+              typeof params.inputResponses === "object" && params.inputResponses !== null
+                ? (params.inputResponses as Record<string, { action?: unknown }>)
+                : undefined;
+            const bindResp = responses?.bind_bugzilla_api_key;
+            if (bindResp && (bindResp.action === "decline" || bindResp.action === "cancel")) {
+              return rpcErrorResponse(
+                400,
+                rpc.id,
+                McpErrorCode.INVALID_PARAMS,
+                "User declined or cancelled credential binding elicitation",
+              );
+            }
             const validRetry = binding.verifyAndConsumeRetryState(
               params.requestState,
               ctx,
@@ -764,12 +826,7 @@ export function buildDualEraHttpHandler(config: HttpServerConfig): DualEraMcpHan
         if (err instanceof McpDomainError) {
           return rpcErrorResponse(200, rpc.id, err.code, err.message, err.data);
         }
-        return rpcErrorResponse(
-          500,
-          rpc.id,
-          McpErrorCode.INTERNAL_ERROR,
-          err instanceof Error ? err.message : "Internal error",
-        );
+        return rpcErrorResponse(500, rpc.id, McpErrorCode.INTERNAL_ERROR, "Internal server error");
       }
     },
   };

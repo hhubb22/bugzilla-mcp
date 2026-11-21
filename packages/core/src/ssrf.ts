@@ -84,28 +84,27 @@ export function isPublicIpAddress(ip: string): boolean {
       number,
       number,
     ];
-    // Unspecified :: or loopback ::1
-    if (g0 === 0 && g1 === 0 && g2 === 0 && g3 === 0 && g4 === 0 && g5 === 0 && g6 === 0) {
-      if (g7 === 0 || g7 === 1) return false;
+    // Allow only globally routable unicast space (2000::/3), rejecting ::/96 IPv4-compatible,
+    // ::ffff:0:0/96 IPv4-mapped, 64:ff9b::/96 NAT64, 100::/64 discard, fc00::/7 ULA, fe80::/10, ff00::/8, etc.
+    if ((g0 & 0xe000) !== 0x2000) {
+      // Special case: allow ::ffff:<public-ipv4> ONLY if embedded IPv4 is globally public?
+      // Security best practice: reject all IPv4-mapped/translated transition addresses in SSRF checks.
+      return false;
     }
-    // IPv4-mapped ::ffff:0:0/96 or IPv4-translated ::ffff:0:0:0/96
-    if (g0 === 0 && g1 === 0 && g2 === 0 && g3 === 0 && g4 === 0 && g5 === 0xffff) {
-      const octets: [number, number, number, number] = [
-        (g6 >> 8) & 0xff,
-        g6 & 0xff,
-        (g7 >> 8) & 0xff,
-        g7 & 0xff,
-      ];
-      return !isNonPublicIpv4(octets);
-    }
-    // Unique local fc00::/7
-    if ((g0 & 0xfe00) === 0xfc00) return false;
-    // Link-local fe80::/10
-    if ((g0 & 0xffc0) === 0xfe80) return false;
-    // Multicast ff00::/8
-    if ((g0 & 0xff00) === 0xff00) return false;
-    // Documentation 2001:db8::/32
+    // Reject IETF Protocol Assignments 2001::/23 (covers Teredo 2001:0000::/32, Benchmarking 2001:2::/48, ORCHID)
+    if (g0 === 0x2001 && g1 <= 0x01ff) return false;
+    // Reject Documentation 2001:db8::/32
     if (g0 === 0x2001 && g1 === 0x0db8) return false;
+    // Reject 6to4 tunnel prefix 2002::/16 (can encapsulate private IPv4)
+    if (g0 === 0x2002) return false;
+    // Reject 3ffe::/16 (deprecated 6bone)
+    if (g0 === 0x3ffe) return false;
+    void g2;
+    void g3;
+    void g4;
+    void g5;
+    void g6;
+    void g7;
     return true;
   }
   return false;

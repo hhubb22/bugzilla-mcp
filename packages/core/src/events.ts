@@ -556,6 +556,18 @@ export function buildSyntheticEventsService(deps: CoreDependencies): SyntheticEv
       if (!WebhookSecretSchema.safeParse(params.delivery.secret).success) {
         throw new McpDomainError(McpErrorCode.INVALID_PARAMS, "Invalid webhook secret format");
       }
+      const rawSecretB64 = params.delivery.secret.slice("whsec_".length);
+      const decodedSecret = Buffer.from(rawSecretB64, "base64");
+      if (
+        decodedSecret.byteLength < 24 ||
+        decodedSecret.byteLength > 64 ||
+        decodedSecret.toString("base64") !== rawSecretB64
+      ) {
+        throw new McpDomainError(
+          McpErrorCode.INVALID_PARAMS,
+          "Webhook secret must be canonical base64 of 24-64 random bytes",
+        );
+      }
 
       const nowMs = clock();
       const safePrefixMs = nowMs - deps.lagWindowMs;
@@ -598,14 +610,21 @@ export function buildSyntheticEventsService(deps: CoreDependencies): SyntheticEv
         const challenge = randomBytes(16).toString("base64url");
         const verifyWebhookId = `msg_verification_${randomBytes(12).toString("base64url")}`;
         const verifyBody = JSON.stringify({ type: "verification", challenge });
-        const resp = await sendSignedPinnedPost({
-          url: params.delivery.url,
-          subscriptionId: subId,
-          webhookId: verifyWebhookId,
-          secrets: [params.delivery.secret],
-          rawBody: verifyBody,
-          nowMs,
-        });
+        let resp: WebhookPinnedResponse | null = null;
+        try {
+          resp = await sendSignedPinnedPost({
+            url: params.delivery.url,
+            subscriptionId: subId,
+            webhookId: verifyWebhookId,
+            secrets: [params.delivery.secret],
+            rawBody: verifyBody,
+            nowMs,
+          });
+        } catch {
+          throw new McpDomainError(callbackErrorCode(), "Callback verification transport failure", {
+            reason: "connection_refused",
+          });
+        }
         if (!resp || resp.status < 200 || resp.status >= 300) {
           throw new McpDomainError(callbackErrorCode(), "Callback verification failed", {
             reason: !resp ? "connection_refused" : "http_5xx",
@@ -637,6 +656,8 @@ export function buildSyntheticEventsService(deps: CoreDependencies): SyntheticEv
           : new Date(nowMs + (params.ttlMs ?? 24 * 60 * 60 * 1000)).toISOString();
 
       const rotated = existing && existing.secret !== params.delivery.secret;
+      const reportTruncated =
+        truncated || (deps.eventsProfile === "chatgpt-events" && Boolean(existing?.gapPending));
       const updatedSub: StoredWebhookSubscription = {
         id: subId,
         principalId: ctx.principalId,
@@ -659,7 +680,11 @@ export function buildSyntheticEventsService(deps: CoreDependencies): SyntheticEv
         refreshBefore,
         verified: true,
         safeWatermark: startCursor,
-        gapPending: truncated || Boolean(existing?.gapPending),
+        // ChatGPT surfaces pending gap via truncated: true on refresh; SEP keeps gapPending until signed gap ACK
+        gapPending:
+          deps.eventsProfile === "chatgpt-events"
+            ? false
+            : truncated || Boolean(existing?.gapPending),
       };
 
       await deps.storage.upsertWebhookSubscription(updatedSub);
@@ -669,7 +694,7 @@ export function buildSyntheticEventsService(deps: CoreDependencies): SyntheticEv
         id: subId,
         refreshBefore,
         cursor: startCursor,
-        truncated,
+        truncated: reportTruncated,
       };
     },
 
@@ -701,17 +726,25 @@ export function buildSyntheticEventsService(deps: CoreDependencies): SyntheticEv
 
       for (const sub of subs) {
         if (!sub.verified) continue;
+        // Isolate subscriptions strictly to the active Bugzilla instance (EVENT-09)
+        if (sub.instanceUrl !== ctx.instanceUrl) continue;
+        // Enforce finite grant expiry before any outbound attempt (EVENT-08)
+        if (sub.refreshBefore !== null && nowMs > Date.parse(sub.refreshBefore)) {
+          continue;
+        }
         const secrets = activeSecrets(sub, nowMs);
         const scopeHash = buildScopeHash(ctx, sub.name, sub.args);
+        let liveGapPending = sub.gapPending;
 
-        // Emit pending SEP-3415 gap control envelope before event delivery
-        if (sub.gapPending) {
-          if (deps.eventsProfile === "sep-3415") {
-            const gapCursor =
-              sub.safeWatermark ??
-              encodeCursor({ v: schemaEpoch, scope: scopeHash, ts: safePrefixMs, tie: "" });
-            const gapBody = JSON.stringify({ type: "gap", cursor: gapCursor });
-            const gapResp = await sendSignedPinnedPost({
+        // Emit pending SEP-3415 gap control envelope before event delivery (EVENT-11)
+        if (liveGapPending && deps.eventsProfile === "sep-3415") {
+          const gapCursor =
+            sub.safeWatermark ??
+            encodeCursor({ v: schemaEpoch, scope: scopeHash, ts: safePrefixMs, tie: "" });
+          const gapBody = JSON.stringify({ type: "gap", cursor: gapCursor });
+          let gapResp: WebhookPinnedResponse | null = null;
+          try {
+            gapResp = await sendSignedPinnedPost({
               url: sub.url,
               subscriptionId: sub.id,
               webhookId: `msg_gap_${randomBytes(12).toString("base64url")}`,
@@ -719,11 +752,20 @@ export function buildSyntheticEventsService(deps: CoreDependencies): SyntheticEv
               rawBody: gapBody,
               nowMs,
             });
-            if (gapResp && gapResp.status >= 200 && gapResp.status < 300) {
-              await deps.storage.upsertWebhookSubscription({ ...sub, gapPending: false });
+          } catch {
+            gapResp = null;
+          }
+          if (gapResp && gapResp.status >= 200 && gapResp.status < 300) {
+            liveGapPending = false;
+            const freshSub = await deps.storage.getWebhookSubscription({
+              principalId: sub.principalId,
+              url: sub.url,
+              name: sub.name,
+              canonicalArgsJson: sub.canonicalArgsJson,
+            });
+            if (freshSub && freshSub.id === sub.id) {
+              await deps.storage.upsertWebhookSubscription({ ...freshSub, gapPending: false });
             }
-          } else {
-            await deps.storage.upsertWebhookSubscription({ ...sub, gapPending: false });
           }
         }
 
@@ -769,15 +811,20 @@ export function buildSyntheticEventsService(deps: CoreDependencies): SyntheticEv
 
         let subTerminated = false;
         let hasUnresolved = false;
-        let declaredGap = false;
+        let contiguousCursorStr =
+          sub.safeWatermark ??
+          encodeCursor({ v: schemaEpoch, scope: scopeHash, ts: safePrefixMs, tie: "" });
         let highestProcessed: { ts: number; tie: string } | null = null;
 
         for (const item of Array.from(queue.values())) {
           // Re-verify per-occurrence visibility BEFORE every send or retry
-          const vis = await client.checkVisibility(
-            item.occurrence.bugId,
-            item.occurrence.commentId,
-          );
+          let vis: "visible" | "restricted_or_missing" | "credential_revoked";
+          try {
+            vis = await client.checkVisibility(item.occurrence.bugId, item.occurrence.commentId);
+          } catch {
+            hasUnresolved = true;
+            continue;
+          }
           if (vis === "credential_revoked") {
             subTerminated = true;
             terminated += 1;
@@ -787,14 +834,18 @@ export function buildSyntheticEventsService(deps: CoreDependencies): SyntheticEv
                 type: "terminated",
                 error: { code: McpErrorCode.SEP_EVENTS_FORBIDDEN, message: "Credential revoked" },
               });
-              await sendSignedPinnedPost({
-                url: sub.url,
-                subscriptionId: sub.id,
-                webhookId: `msg_terminated_${randomBytes(12).toString("base64url")}`,
-                secrets,
-                rawBody: termBody,
-                nowMs,
-              });
+              try {
+                await sendSignedPinnedPost({
+                  url: sub.url,
+                  subscriptionId: sub.id,
+                  webhookId: `msg_terminated_${randomBytes(12).toString("base64url")}`,
+                  secrets,
+                  rawBody: termBody,
+                  nowMs,
+                });
+              } catch {
+                // Best-effort termination envelope
+              }
             }
             await deps.storage.deleteWebhookSubscription({
               principalId: sub.principalId,
@@ -809,7 +860,8 @@ export function buildSyntheticEventsService(deps: CoreDependencies): SyntheticEv
             continue;
           }
 
-          const nextCursor = encodeCursor({
+          // Publish contiguous safe cursor ONLY when no earlier event is unresolved (EVENT-05)
+          const itemCursor = encodeCursor({
             v: schemaEpoch,
             scope: scopeHash,
             ts: item.tsMs,
@@ -817,21 +869,43 @@ export function buildSyntheticEventsService(deps: CoreDependencies): SyntheticEv
           });
           const bodyObj = {
             ...buildOccurrencePayload(item.occurrence),
-            cursor: nextCursor,
+            cursor: hasUnresolved ? contiguousCursorStr : itemCursor,
           };
-          const rawBody = JSON.stringify(bodyObj);
+          let rawBody = JSON.stringify(bodyObj);
+          if (Buffer.byteLength(rawBody, "utf8") > MAX_WEBHOOK_BYTES) {
+            // Re-trim data excerpt to guarantee final escaped JSON fits strictly <= 256 KiB (EVENT-15)
+            const minimalObj = {
+              eventId: bodyObj.eventId,
+              name: bodyObj.name,
+              timestamp: bodyObj.timestamp,
+              data: {
+                bugId: item.occurrence.bugId,
+                product: item.occurrence.product,
+                component: item.occurrence.component,
+                excerptTruncated: true,
+                untrustedUserContent: true,
+              },
+              cursor: bodyObj.cursor,
+            };
+            rawBody = JSON.stringify(minimalObj);
+          }
 
-          const resp = await sendSignedPinnedPost({
-            url: sub.url,
-            subscriptionId: sub.id,
-            webhookId: item.webhookId,
-            secrets,
-            rawBody,
-            nowMs,
-          });
+          let resp: WebhookPinnedResponse | null = null;
+          try {
+            resp = await sendSignedPinnedPost({
+              url: sub.url,
+              subscriptionId: sub.id,
+              webhookId: item.webhookId,
+              secrets,
+              rawBody,
+              nowMs,
+            });
+          } catch {
+            resp = null;
+          }
 
           if (!resp) {
-            // SSRF / DNS check blocked this outbound attempt — keep unresolved, do not advance watermark
+            // SSRF / DNS check or transport blocked — keep unresolved, do not advance watermark
             hasUnresolved = true;
             continue;
           }
@@ -839,40 +913,90 @@ export function buildSyntheticEventsService(deps: CoreDependencies): SyntheticEv
           if (resp.status >= 200 && resp.status < 300) {
             queue.delete(item.eventId);
             delivered += 1;
-            highestProcessed = { ts: item.tsMs, tie: item.tieKey };
+            if (!hasUnresolved) {
+              contiguousCursorStr = itemCursor;
+              highestProcessed = { ts: item.tsMs, tie: item.tieKey };
+            }
           } else if (resp.status === 410 || resp.status === 413) {
-            // Terminal for this delivery: NEVER retry; declare durable gap and advance past abandoned item
+            // Terminal for this delivery: NEVER retry; immediately persist durable gapPending (EVENT-06)
             queue.delete(item.eventId);
             abandonedSet.add(item.eventId);
             abandoned += 1;
-            declaredGap = true;
-            highestProcessed = { ts: item.tsMs, tie: item.tieKey };
+            liveGapPending = true;
+            if (!hasUnresolved) {
+              contiguousCursorStr = itemCursor;
+              highestProcessed = { ts: item.tsMs, tie: item.tieKey };
+            }
+            const freshSub = await deps.storage.getWebhookSubscription({
+              principalId: sub.principalId,
+              url: sub.url,
+              name: sub.name,
+              canonicalArgsJson: sub.canonicalArgsJson,
+            });
+            if (freshSub && freshSub.id === sub.id) {
+              await deps.storage.upsertWebhookSubscription({
+                ...freshSub,
+                safeWatermark: hasUnresolved ? freshSub.safeWatermark : contiguousCursorStr,
+                gapPending: true,
+              });
+            }
           } else {
             item.attempts += 1;
             if (item.attempts >= maxRetries) {
               queue.delete(item.eventId);
               abandonedSet.add(item.eventId);
               abandoned += 1;
-              declaredGap = true;
-              highestProcessed = { ts: item.tsMs, tie: item.tieKey };
+              liveGapPending = true;
+              if (!hasUnresolved) {
+                contiguousCursorStr = itemCursor;
+                highestProcessed = { ts: item.tsMs, tie: item.tieKey };
+              }
+              const freshSub = await deps.storage.getWebhookSubscription({
+                principalId: sub.principalId,
+                url: sub.url,
+                name: sub.name,
+                canonicalArgsJson: sub.canonicalArgsJson,
+              });
+              if (freshSub && freshSub.id === sub.id) {
+                await deps.storage.upsertWebhookSubscription({
+                  ...freshSub,
+                  safeWatermark: hasUnresolved ? freshSub.safeWatermark : contiguousCursorStr,
+                  gapPending: true,
+                });
+              }
             } else {
               hasUnresolved = true;
             }
           }
         }
 
-        if (!subTerminated && !hasUnresolved && queue.size === 0 && highestProcessed) {
-          const newWm = encodeCursor({
-            v: schemaEpoch,
-            scope: scopeHash,
-            ts: Math.max(highestProcessed.ts, safePrefixMs),
-            tie: highestProcessed.ts >= safePrefixMs ? highestProcessed.tie : "",
+        // Only advance watermark if scan was complete, no unresolved items remain, AND live subscription still exists (EVENT-07, EVENT-08)
+        if (
+          !subTerminated &&
+          scan.scanComplete &&
+          !hasUnresolved &&
+          queue.size === 0 &&
+          highestProcessed
+        ) {
+          const freshSub = await deps.storage.getWebhookSubscription({
+            principalId: sub.principalId,
+            url: sub.url,
+            name: sub.name,
+            canonicalArgsJson: sub.canonicalArgsJson,
           });
-          await deps.storage.upsertWebhookSubscription({
-            ...sub,
-            safeWatermark: newWm,
-            gapPending: sub.gapPending || declaredGap,
-          });
+          if (freshSub && freshSub.id === sub.id) {
+            const newWm = encodeCursor({
+              v: schemaEpoch,
+              scope: scopeHash,
+              ts: Math.max(highestProcessed.ts, safePrefixMs),
+              tie: highestProcessed.ts >= safePrefixMs ? highestProcessed.tie : "",
+            });
+            await deps.storage.upsertWebhookSubscription({
+              ...freshSub,
+              safeWatermark: newWm,
+              gapPending: freshSub.gapPending || liveGapPending,
+            });
+          }
         }
       }
 
