@@ -19,7 +19,11 @@ export type StoredReceipt =
   | { readonly status: "pending"; readonly intentHash: string; readonly createdAt: IsoTimestamp }
   | { readonly status: "applied"; readonly intentHash: string; readonly artifactId: string }
   | { readonly status: "failed"; readonly intentHash: string; readonly errorCode: string }
-  | { readonly status: "indeterminate"; readonly intentHash: string; readonly recordedAt: IsoTimestamp };
+  | {
+      readonly status: "indeterminate";
+      readonly intentHash: string;
+      readonly recordedAt: IsoTimestamp;
+    };
 
 export interface StoredProposal {
   readonly proposalId: string;
@@ -43,7 +47,11 @@ export interface StoragePorts {
     bugId: BugId,
     text: string,
   ): Promise<InternalNote>;
-  listInternalNotes(principalId: string, instanceUrl: string, bugId: BugId): Promise<InternalNote[]>;
+  listInternalNotes(
+    principalId: string,
+    instanceUrl: string,
+    bugId: BugId,
+  ): Promise<InternalNote[]>;
   saveProposal(proposal: StoredProposal): Promise<void>;
   getProposal(
     principalId: string,

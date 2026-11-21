@@ -1,15 +1,16 @@
 # Bugzilla Frontier MCP Server: 架构与契约规范（C0 Frozen）
 
 > 上游基线：[brief.md](./brief.md) · 鉴权与绑定细化：[auth-and-binding-flow.md](./auth-and-binding-flow.md) · MCP App 交互设计：[mcp-app-ux-design.md](./mcp-app-ux-design.md)
-> 技术栈：TypeScript (Node 22+ / ESM) · 协议基线：MCP Core `2026-07-28` (+ `2025-11-25` Dual-Era) · SEP-1865 (MCP Apps) · SEP-3415 (MCP Events)
+> 技术栈：TypeScript + Bun (1.3+ Workspaces & `bun:sqlite`) + VoidZero (`vite-plus`: Rolldown / Oxlint / Oxfmt / Vitest) · 协议基线：MCP Core `2026-07-28` (+ `2025-11-25` Dual-Era) · SEP-1865 (MCP Apps) · SEP-3415 (MCP Events)
 
 ## 1. TS 项目结构与分层架构
 
-采用单仓库多包（`pnpm workspaces`）+ 强类型契约优先（`zod` / TypeScript strict）布局，确保云端、本地与前端 MCP App 共享同一套领域类型与 Schema，避免漂移：
+采用单仓库多包（`Bun workspaces`）+ VoidZero 统一工具链（`vite-plus`：`vp check` / `vp test` / `vp build`）+ 强类型契约优先（`zod` / TypeScript strict）布局，确保云端、本地与前端 MCP App 共享同一套领域类型与 Schema，避免漂移：
 
 ```text
 bugzilla-mcp/
-├── pnpm-workspace.yaml
+├── package.json                # Bun workspaces + vite-plus + quint
+├── vite.config.ts              # VoidZero (Oxlint / Oxfmt / Vitest / Rolldown) 统一配置
 ├── packages/
 │   ├── contracts/              # [纯类型 + Zod Schema + 错误域 + 游标/状态联合类型]（零运行时副作用）
 │   │   ├── src/
@@ -28,7 +29,7 @@ bugzilla-mcp/
 │   ├── storage/                # [可插拔持久化端口]
 │   │   └── src/
 │   │       ├── ports.ts        # CredentialStore / ProposalStore / SubscriptionStore / IdempotencyStore
-│   │       ├── sqlite.ts       # 本地单用户 / 单机轻量部署（Node built-in sqlite / better-sqlite3）
+│   │       ├── sqlite.ts       # 本地单用户 / 单机轻量部署（Bun 内置 bun:sqlite + Drizzle）
 │   │       └── postgres.ts     # 云端多用户高可用部署（含加密信封凭据与分布式租约锁）
 │   ├── server/                 # [MCP 协议入口与双代路由]
 │   │   └── src/

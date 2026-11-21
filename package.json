@@ -2,20 +2,28 @@
   "name": "bugzilla-mcp",
   "version": "0.1.0",
   "private": true,
+  "workspaces": [
+    "packages/*"
+  ],
   "type": "module",
-  "engines": {
-    "node": ">=22.0.0"
-  },
   "scripts": {
-    "typecheck": "pnpm -r typecheck",
-    "test": "vitest run",
-    "test:watch": "vitest",
-    "verify:quint": "npx -y @informalsystems/quint run specs/write_guard.qnt --invariant=allSafetyInvariants --max-samples=2000 --max-steps=25 --verbosity=1 && npx -y @informalsystems/quint run specs/events_ingestion.qnt --invariant=allSafetyInvariants --max-samples=2000 --max-steps=25 --verbosity=1"
+    "typecheck": "bun --filter '*' typecheck",
+    "check": "bunx vp check",
+    "lint": "bunx vp lint",
+    "fmt": "bunx vp fmt",
+    "test": "bunx vp test run",
+    "test:bun": "bun test",
+    "verify:quint": "bunx quint run specs/write_guard.qnt --invariant=allSafetyInvariants --max-samples=2000 --max-steps=25 --verbosity=1 && bunx quint run specs/events_ingestion.qnt --invariant=allSafetyInvariants --max-samples=2000 --max-steps=25 --verbosity=1"
   },
   "devDependencies": {
-    "@types/node": "^22.15.0",
-    "fast-check": "^4.1.1",
-    "typescript": "^5.8.3",
-    "vitest": "^3.1.3"
+    "@informalsystems/quint": "0.33.1",
+    "@types/bun": "^1.2.15",
+    "fast-check": "^4.10.3",
+    "typescript": "^5.9.3",
+    "vite": "npm:@voidzero-dev/vite-plus-core@1.4.0",
+    "vite-plus": "1.4.0"
+  },
+  "overrides": {
+    "vite": "npm:@voidzero-dev/vite-plus-core@1.4.0"
   }
 }

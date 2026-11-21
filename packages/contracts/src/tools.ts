@@ -73,7 +73,9 @@ export const BugzillaGetAttachmentExcerptInputSchema = z.object({
   byteOffset: z.number().int().nonnegative().default(0),
   maxBytes: z.number().int().min(1).max(65_536).default(16_384),
 });
-export type BugzillaGetAttachmentExcerptInput = z.infer<typeof BugzillaGetAttachmentExcerptInputSchema>;
+export type BugzillaGetAttachmentExcerptInput = z.infer<
+  typeof BugzillaGetAttachmentExcerptInputSchema
+>;
 
 export const AppResolveProposalInputSchema = z.object({
   proposalId: z.string().min(1),

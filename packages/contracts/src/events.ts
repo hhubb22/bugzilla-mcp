@@ -57,7 +57,10 @@ export type PollEventsResult = z.infer<typeof PollEventsResultSchema>;
 
 export const WebhookSecretSchema = z
   .string()
-  .regex(/^whsec_[A-Za-z0-9+/=]{32,88}$/, "Must be whsec_ followed by base64 of 24-64 random bytes");
+  .regex(
+    /^whsec_[A-Za-z0-9+/=]{32,88}$/,
+    "Must be whsec_ followed by base64 of 24-64 random bytes",
+  );
 
 export const WebhookSubscribeParamsSchema = z.object({
   name: EventNameSchema,

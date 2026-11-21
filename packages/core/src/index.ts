@@ -25,17 +25,30 @@ export interface CoreDependencies {
 
 export interface WriteGuardService {
   postAnalysis(ctx: PrincipalContext, input: BugzillaPostAnalysisInput): Promise<WriteGuardOutcome>;
-  proposeUpdate(ctx: PrincipalContext, input: BugzillaProposeUpdateInput): Promise<WriteGuardOutcome>;
-  resolveProposal(ctx: PrincipalContext, input: AppResolveProposalInput): Promise<WriteGuardOutcome>;
+  proposeUpdate(
+    ctx: PrincipalContext,
+    input: BugzillaProposeUpdateInput,
+  ): Promise<WriteGuardOutcome>;
+  resolveProposal(
+    ctx: PrincipalContext,
+    input: AppResolveProposalInput,
+  ): Promise<WriteGuardOutcome>;
   saveDraft(ctx: PrincipalContext, input: AppSaveDraftInput): Promise<DraftSaveResult>;
 }
 
 export interface SyntheticEventsService {
   poll(ctx: PrincipalContext, params: PollEventsParams): Promise<PollEventsResult>;
-  subscribeWebhook(ctx: PrincipalContext, params: WebhookSubscribeParams): Promise<WebhookSubscribeResult>;
+  subscribeWebhook(
+    ctx: PrincipalContext,
+    params: WebhookSubscribeParams,
+  ): Promise<WebhookSubscribeResult>;
   unsubscribeWebhook(
     ctx: PrincipalContext,
-    params: { name: string; arguments: Record<string, unknown>; delivery: { url: string; mode?: "webhook" } },
+    params: {
+      name: string;
+      arguments: Record<string, unknown>;
+      delivery: { url: string; mode?: "webhook" };
+    },
   ): Promise<{ resultType: "complete" }>;
 }
 
