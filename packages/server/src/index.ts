@@ -6,6 +6,8 @@ export interface HttpServerConfig {
   readonly allowedOrigins: readonly string[];
   readonly allowAbsentOrigin?: boolean;
   readonly eventsProfile: EventsProfile;
+  /** Explicitly opt-in non-sensitive parameter names annotated with x-mcp-header per tool/event name */
+  readonly headerRoutedParams?: Readonly<Record<string, readonly string[]>>;
   readonly core: CoreDependencies;
   readonly publicBaseUrl?: string;
   readonly authenticateBearerToken?: (token: string) => Promise<PrincipalContext | null>;

@@ -54,6 +54,19 @@ export interface SelfWriteProvenance {
   readonly diffKey?: string;
 }
 
+export interface WriteAuditEntry {
+  readonly auditId: string;
+  readonly principalId: string;
+  readonly instanceUrl: string;
+  readonly bugId: BugId;
+  readonly proposalId?: string;
+  readonly revision?: number;
+  readonly expectedLastChangeTime: IsoTimestamp;
+  readonly updatedLastChangeTime: IsoTimestamp;
+  readonly diff: ProposalDiff;
+  readonly recordedAt: IsoTimestamp;
+}
+
 export interface StoredWebhookSubscription {
   readonly id: string;
   readonly principalId: string;
@@ -77,6 +90,12 @@ export interface StoragePorts {
   finalizeReceipt(scope: IdempotencyScope, receipt: StoredReceipt): Promise<void>;
   recordSelfWrite(entry: SelfWriteProvenance): Promise<void>;
   hasSelfWrite(entry: SelfWriteProvenance): Promise<boolean>;
+  recordWriteAudit(entry: WriteAuditEntry): Promise<void>;
+  listWriteAudits(
+    principalId: string,
+    instanceUrl: string,
+    bugId: BugId,
+  ): Promise<WriteAuditEntry[]>;
   consumeCausalBudget(params: {
     instanceUrl: string;
     bugId: BugId;

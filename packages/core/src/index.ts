@@ -57,6 +57,7 @@ export interface CoreDependencies {
   readonly storage: StoragePorts;
   readonly resolveClient: (ctx: PrincipalContext) => Promise<BugzillaClient | null>;
   readonly eventsProfile: EventsProfile;
+  readonly eventSchemaEpoch?: number;
   readonly causalBudgetPerBug: number;
   readonly causalBudgetWindowMs?: number;
   readonly lagWindowMs: number;
