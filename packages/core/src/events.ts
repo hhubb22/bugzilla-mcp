@@ -51,6 +51,7 @@ interface PendingWebhookItem {
   readonly tieKey: string;
   readonly tsMs: number;
   attempts: number;
+  nextAttemptAtMs: number;
 }
 
 function truncateUtf8(text: string, maxBytes: number): { text: string; truncated: boolean } {
@@ -158,12 +159,32 @@ function matchesFilter(
   occ: UpstreamBugzillaOccurrence,
   name: EventName,
   args: EventFilterArgs | undefined,
+  principalId?: string,
 ): boolean {
   if (occ.kind !== name) return false;
   if (args?.product && occ.product !== args.product) return false;
   if (args?.component && occ.component !== args.component) return false;
   if (args?.bugIds && args.bugIds.length > 0 && !args.bugIds.includes(occ.bugId)) {
     return false;
+  }
+  if (args?.watchedFields && args.watchedFields.length > 0) {
+    const changed = occ.fieldsChanged ?? [];
+    if (!changed.some((field) => args.watchedFields!.includes(field))) {
+      return false;
+    }
+  }
+  if (args?.mentionMe && principalId) {
+    const hay = `${occ.commentText ?? ""} ${occ.summaryText ?? ""}`.toLowerCase();
+    if (!hay.includes(principalId.toLowerCase())) {
+      return false;
+    }
+  }
+  if (args?.requestee) {
+    const expectedRequestee =
+      args.requestee.toLowerCase() === "me" && principalId ? principalId : args.requestee;
+    if (!occ.requestee || occ.requestee.toLowerCase() !== expectedRequestee.toLowerCase()) {
+      return false;
+    }
   }
   return true;
 }
@@ -222,13 +243,21 @@ export function buildSyntheticEventsService(deps: CoreDependencies): SyntheticEv
     let complete = false;
 
     for (let guard = 0; guard < 100; guard += 1) {
-      const page = await client.listChangesSince({
-        since: new Date(sinceMs).toISOString(),
-        limit: pageSize,
-        offset,
-      });
+      let page: Awaited<ReturnType<typeof client.listChangesSince>>;
+      try {
+        page = await client.listChangesSince({
+          since: new Date(sinceMs).toISOString(),
+          limit: pageSize,
+          offset,
+        });
+      } catch (err) {
+        if (err instanceof Error && err.name === "BugzillaCredentialRevokedError") {
+          throw new McpDomainError(McpErrorCode.SEP_EVENTS_FORBIDDEN, "Credential revoked");
+        }
+        throw err;
+      }
       for (const occ of page.occurrences) {
-        if (!matchesFilter(occ, name, args)) continue;
+        if (!matchesFilter(occ, name, args, ctx.principalId)) continue;
         const tsMs = Date.parse(occ.timestamp);
         if (!Number.isFinite(tsMs) || tsMs > upperBoundMs) continue;
         const eventId = occurrenceEventId(occ);
@@ -240,11 +269,12 @@ export function buildSyntheticEventsService(deps: CoreDependencies): SyntheticEv
         complete = true;
         break;
       }
-      if (page.occurrences.length === 0) {
+      const nextOffset = page.nextOffset ?? offset + page.occurrences.length;
+      if (nextOffset <= offset) {
         complete = false;
         break;
       }
-      offset += page.occurrences.length;
+      offset = nextOffset;
     }
 
     const items = [...dedup.values()].sort((a, b) => {
@@ -331,9 +361,37 @@ export function buildSyntheticEventsService(deps: CoreDependencies): SyntheticEv
         deps.eventsProfile === "chatgpt-events"
           ? (["webhook"] as const)
           : (["poll", "push", "webhook"] as const);
+      const inputSchema = {
+        type: "object",
+        properties: {
+          product: { type: "string", minLength: 1 },
+          component: { type: "string", minLength: 1 },
+          bugIds: { type: "array", items: { type: "integer", minimum: 1 }, maxItems: 100 },
+          watchedFields: { type: "array", items: { type: "string" } },
+          mentionMe: { type: "boolean" },
+          requestee: { type: "string" },
+          includeSelf: { type: "boolean", default: false },
+        },
+        additionalProperties: false,
+      };
+      const payloadSchema = {
+        type: "object",
+        required: ["bugId", "product", "component", "actor", "untrustedUserContent"],
+        properties: {
+          bugId: { type: "integer", minimum: 1 },
+          product: { type: "string" },
+          component: { type: "string" },
+          actor: { type: "string" },
+          commentId: { type: "integer" },
+          fieldsChanged: { type: "array", items: { type: "string" } },
+          summaryText: { type: "string" },
+          commentText: { type: "string" },
+          untrustedUserContent: { const: true },
+        },
+      };
       return {
         profile: deps.eventsProfile,
-        events: ALL_EVENTS.map((name) => ({ name, delivery })),
+        events: ALL_EVENTS.map((name) => ({ name, delivery, inputSchema, payloadSchema })),
       };
     },
 
@@ -776,6 +834,22 @@ export function buildSyntheticEventsService(deps: CoreDependencies): SyntheticEv
         if (!queue) {
           queue = new Map();
           retryQueues.set(key, queue);
+          // Rehydrate durable retry queue across process restarts (EVENT-02, EVENT-05, EVENT-06)
+          if (deps.storage.listWebhookRetryItems) {
+            const persisted = await deps.storage.listWebhookRetryItems(key);
+            for (const row of persisted) {
+              try {
+                const parsed = JSON.parse(row.payloadJson) as PendingWebhookItem;
+                queue.set(row.eventId, {
+                  ...parsed,
+                  attempts: row.attempts,
+                  nextAttemptAtMs: row.nextAttemptAtMs,
+                });
+              } catch {
+                await deps.storage.deleteWebhookRetryItem?.(key, row.eventId);
+              }
+            }
+          }
         }
         let abandonedSet = abandonedEventIds.get(key);
         if (!abandonedSet) {
@@ -783,12 +857,46 @@ export function buildSyntheticEventsService(deps: CoreDependencies): SyntheticEv
           abandonedEventIds.set(key, abandonedSet);
         }
 
-        // Scan newly available occurrences since safeWatermark
+        // Scan newly available occurrences since safeWatermark (propagating revocation -> terminate: REST-03)
         const wm = sub.safeWatermark
           ? decodeCursor(sub.safeWatermark, scopeHash, schemaEpoch)
           : { v: schemaEpoch, scope: scopeHash, ts: safePrefixMs, tie: "" };
 
-        const scan = await scanRange(ctx, sub.name, sub.args, wm.ts, safePrefixMs);
+        let scan: Awaited<ReturnType<typeof scanRange>>;
+        try {
+          scan = await scanRange(ctx, sub.name, sub.args, wm.ts, safePrefixMs);
+        } catch (err) {
+          if (err instanceof McpDomainError && err.code === McpErrorCode.SEP_EVENTS_FORBIDDEN) {
+            terminated += 1;
+            queue.clear();
+            if (deps.eventsProfile === "sep-3415") {
+              const termBody = JSON.stringify({
+                type: "terminated",
+                error: { code: McpErrorCode.SEP_EVENTS_FORBIDDEN, message: "Credential revoked" },
+              });
+              try {
+                await sendSignedPinnedPost({
+                  url: sub.url,
+                  subscriptionId: sub.id,
+                  webhookId: `msg_terminated_${randomBytes(12).toString("base64url")}`,
+                  secrets,
+                  rawBody: termBody,
+                  nowMs,
+                });
+              } catch {
+                // Best-effort termination envelope
+              }
+            }
+            await deps.storage.deleteWebhookSubscription({
+              principalId: sub.principalId,
+              url: sub.url,
+              name: sub.name,
+              canonicalArgsJson: sub.canonicalArgsJson,
+            });
+            continue;
+          }
+          throw err;
+        }
         if (scan.scanComplete) {
           for (const entry of scan.items) {
             const afterWm = entry.tsMs > wm.ts || (entry.tsMs === wm.ts && entry.tieKey > wm.tie);
@@ -798,13 +906,23 @@ export function buildSyntheticEventsService(deps: CoreDependencies): SyntheticEv
               deps.eventsProfile === "chatgpt-events"
                 ? entry.eventId
                 : `msg_evt_${randomBytes(12).toString("base64url")}`;
-            queue.set(entry.eventId, {
+            const newItem: PendingWebhookItem = {
               eventId: entry.eventId,
               webhookId,
               occurrence: entry.occ,
               tieKey: entry.tieKey,
               tsMs: entry.tsMs,
               attempts: 0,
+              nextAttemptAtMs: nowMs,
+            };
+            queue.set(entry.eventId, newItem);
+            // Persist stable delivery webhookId BEFORE the first outbound attempt (EVENT-03)
+            await deps.storage.upsertWebhookRetryItem?.({
+              subscriptionId: key,
+              eventId: newItem.eventId,
+              payloadJson: JSON.stringify(newItem),
+              attempts: 0,
+              nextAttemptAtMs: nowMs,
             });
           }
         }
@@ -816,7 +934,18 @@ export function buildSyntheticEventsService(deps: CoreDependencies): SyntheticEv
           encodeCursor({ v: schemaEpoch, scope: scopeHash, ts: safePrefixMs, tie: "" });
         let highestProcessed: { ts: number; tie: string } | null = null;
 
-        for (const item of Array.from(queue.values())) {
+        // Always iterate in canonical (tsMs, tieKey) event order so cursor never skips earlier retries (EVENT-02)
+        const orderedQueue = Array.from(queue.values()).sort((a, b) => {
+          if (a.tsMs !== b.tsMs) return a.tsMs - b.tsMs;
+          return a.tieKey < b.tieKey ? -1 : a.tieKey > b.tieKey ? 1 : 0;
+        });
+
+        for (const item of orderedQueue) {
+          // Enforce retry backoff while blocking cursor advancement past unresolved earlier item (EVENT-05)
+          if (nowMs < item.nextAttemptAtMs) {
+            hasUnresolved = true;
+            continue;
+          }
           // Re-verify per-occurrence visibility BEFORE every send or retry
           let vis: "visible" | "restricted_or_missing" | "credential_revoked";
           try {
@@ -857,6 +986,7 @@ export function buildSyntheticEventsService(deps: CoreDependencies): SyntheticEv
           }
           if (vis !== "visible") {
             queue.delete(item.eventId);
+            await deps.storage.deleteWebhookRetryItem?.(key, item.eventId);
             continue;
           }
 
@@ -912,6 +1042,7 @@ export function buildSyntheticEventsService(deps: CoreDependencies): SyntheticEv
 
           if (resp.status >= 200 && resp.status < 300) {
             queue.delete(item.eventId);
+            await deps.storage.deleteWebhookRetryItem?.(key, item.eventId);
             delivered += 1;
             if (!hasUnresolved) {
               contiguousCursorStr = itemCursor;
@@ -920,6 +1051,7 @@ export function buildSyntheticEventsService(deps: CoreDependencies): SyntheticEv
           } else if (resp.status === 410 || resp.status === 413) {
             // Terminal for this delivery: NEVER retry; immediately persist durable gapPending (EVENT-06)
             queue.delete(item.eventId);
+            await deps.storage.deleteWebhookRetryItem?.(key, item.eventId);
             abandonedSet.add(item.eventId);
             abandoned += 1;
             liveGapPending = true;
@@ -944,6 +1076,7 @@ export function buildSyntheticEventsService(deps: CoreDependencies): SyntheticEv
             item.attempts += 1;
             if (item.attempts >= maxRetries) {
               queue.delete(item.eventId);
+              await deps.storage.deleteWebhookRetryItem?.(key, item.eventId);
               abandonedSet.add(item.eventId);
               abandoned += 1;
               liveGapPending = true;
@@ -965,6 +1098,15 @@ export function buildSyntheticEventsService(deps: CoreDependencies): SyntheticEv
                 });
               }
             } else {
+              const backoffMs = Math.min(10_000, 1_000 * 2 ** (item.attempts - 1));
+              item.nextAttemptAtMs = nowMs + backoffMs;
+              await deps.storage.upsertWebhookRetryItem?.({
+                subscriptionId: key,
+                eventId: item.eventId,
+                payloadJson: JSON.stringify(item),
+                attempts: item.attempts,
+                nextAttemptAtMs: item.nextAttemptAtMs,
+              });
               hasUnresolved = true;
             }
           }

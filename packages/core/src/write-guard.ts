@@ -204,7 +204,27 @@ export function buildWriteGuardService(deps: CoreDependencies): WriteGuardServic
           bugId: validInput.bugId,
           auditRecorded: false,
         };
-      } catch {
+      } catch (err) {
+        // Definitive upstream access denial or credential revocation is NOT indeterminate (REST-01)
+        if (err instanceof Error && err.name === "BugzillaAccessDeniedError") {
+          await deps.storage.finalizeReceipt(scope, {
+            status: "failed",
+            intentHash,
+            errorCode: "resource_inaccessible",
+          });
+          throw new McpDomainError(
+            McpErrorCode.INVALID_PARAMS,
+            "Resource not found or inaccessible",
+          );
+        }
+        if (err instanceof Error && err.name === "BugzillaCredentialRevokedError") {
+          await deps.storage.finalizeReceipt(scope, {
+            status: "failed",
+            intentHash,
+            errorCode: "credential_revoked",
+          });
+          throw new McpDomainError(McpErrorCode.SEP_EVENTS_FORBIDDEN, "Credential revoked");
+        }
         await deps.storage.finalizeReceipt(scope, {
           status: "indeterminate",
           intentHash,
@@ -452,7 +472,29 @@ export function buildWriteGuardService(deps: CoreDependencies): WriteGuardServic
         }
 
         if (input.decision === "reject") {
-          await deps.storage.saveProposal({ ...proposal, state: "rejected" });
+          if (deps.storage.claimProposalTransition) {
+            const won = await deps.storage.claimProposalTransition({
+              principalId: ctx.principalId,
+              instanceUrl: ctx.instanceUrl,
+              proposalId: proposal.proposalId,
+              revision: proposal.revision,
+              fromState: "pending",
+              toState: "rejected",
+            });
+            if (!won) {
+              await deps.storage.finalizeReceipt(scope, {
+                status: "failed",
+                intentHash,
+                errorCode: "proposal_not_pending",
+              });
+              throw new McpDomainError(
+                McpErrorCode.INVALID_PARAMS,
+                "Proposal not found or already resolved",
+              );
+            }
+          } else {
+            await deps.storage.saveProposal({ ...proposal, state: "rejected" });
+          }
           const artifactId = `rejected:${proposal.proposalId}:${proposal.revision}`;
           await deps.storage.finalizeReceipt(scope, {
             status: "applied",
@@ -559,8 +601,30 @@ export function buildWriteGuardService(deps: CoreDependencies): WriteGuardServic
           }
         }
 
-        // Persist claimed approved state before upstream dispatch
-        await deps.storage.saveProposal({ ...proposal, state: "approved" });
+        // Atomically claim pending -> approved across workers before upstream dispatch (AUTH-10)
+        if (deps.storage.claimProposalTransition) {
+          const won = await deps.storage.claimProposalTransition({
+            principalId: ctx.principalId,
+            instanceUrl: ctx.instanceUrl,
+            proposalId: proposal.proposalId,
+            revision: proposal.revision,
+            fromState: "pending",
+            toState: "approved",
+          });
+          if (!won) {
+            await deps.storage.finalizeReceipt(scope, {
+              status: "failed",
+              intentHash,
+              errorCode: "proposal_not_pending",
+            });
+            throw new McpDomainError(
+              McpErrorCode.INVALID_PARAMS,
+              "Proposal not found or already resolved",
+            );
+          }
+        } else {
+          await deps.storage.saveProposal({ ...proposal, state: "approved" });
+        }
 
         const dossier = await client.getBugDossierData(proposal.bugId, {
           maxComments: 0,

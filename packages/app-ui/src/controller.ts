@@ -2,7 +2,7 @@ import type {
   McpAppHostPort,
   TriageAppController,
   UntrustedBugzillaDisplayInput,
-} from "./index.js";
+} from "./types.js";
 import {
   buildSafeResourceLinks,
   formatSafeUserIntentMessage,

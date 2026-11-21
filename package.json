@@ -12,7 +12,9 @@
     "check": "bunx vp check",
     "lint": "bunx vp lint",
     "fmt": "bunx vp fmt",
-    "test": "bunx vp test run",
+    "test": "bunx vp test run tests/",
+    "test:e2e": "bunx vp test run tests-e2e/",
+    "build:ui": "bun run --cwd packages/app-ui build:ui",
     "test:bun": "bun test",
     "verify:quint": "bunx quint run specs/write_guard.qnt --invariant=allSafetyInvariants --max-samples=2000 --max-steps=25 --verbosity=1 && bunx quint run specs/events_ingestion.qnt --invariant=allSafetyInvariants --max-samples=2000 --max-steps=25 --verbosity=1"
   },

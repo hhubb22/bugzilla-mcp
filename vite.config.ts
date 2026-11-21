@@ -5,9 +5,9 @@ export default defineConfig({
     singleQuote: false,
     semi: true,
     printWidth: 100,
-    ignorePatterns: ["specs/**", "dist/**", "node_modules/**"],
+    ignorePatterns: ["specs/**", "dist/**", "dist-web/**", "docker/**", "node_modules/**"],
   },
   lint: {
-    ignorePatterns: ["specs/**", "dist/**", "node_modules/**"],
+    ignorePatterns: ["specs/**", "dist/**", "dist-web/**", "docker/**", "node_modules/**"],
   },
 });

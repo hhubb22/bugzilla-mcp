@@ -84,6 +84,54 @@ export interface StoredWebhookSubscription {
   readonly gapPending: boolean;
 }
 
+export interface StoredBindingTicket {
+  readonly ticketId: string;
+  readonly issuer: string;
+  readonly principalId: string;
+  readonly clientId: string;
+  readonly instanceUrl: string;
+  readonly toolName: string;
+  readonly paramsHash: string;
+  readonly expiresAtMs: number;
+  readonly csrfToken: string;
+  readonly completed: boolean;
+  readonly credentialGeneration?: number;
+}
+
+export interface StoredBoundCredential {
+  readonly issuer: string;
+  readonly principalId: string;
+  readonly instanceUrl: string;
+  readonly ciphertext: string;
+  readonly iv: string;
+  readonly authTag: string;
+  readonly credentialGeneration: number;
+  readonly updatedAt: IsoTimestamp;
+}
+
+export interface StoredApprovalTicket {
+  readonly ticketId: string;
+  readonly csrfToken: string;
+  readonly issuer: string;
+  readonly approverPrincipalId: string;
+  readonly instanceUrl: string;
+  readonly proposalId: string;
+  readonly revision: number;
+  readonly bugId: number;
+  readonly baseVersion: string;
+  readonly visibility: "public" | "private";
+  readonly expiresAtMs: number;
+  readonly consumed: boolean;
+}
+
+export interface StoredWebhookRetryItem {
+  readonly subscriptionId: string;
+  readonly eventId: string;
+  readonly payloadJson: string;
+  readonly attempts: number;
+  readonly nextAttemptAtMs: number;
+}
+
 export interface StoragePorts {
   getReceipt(scope: IdempotencyScope): Promise<StoredReceipt | null>;
   reservePending(scope: IdempotencyScope, intentHash: string): Promise<"reserved" | StoredReceipt>;
@@ -149,6 +197,49 @@ export interface StoragePorts {
     name: EventName;
     canonicalArgsJson: string;
   }): Promise<boolean>;
+
+  // Additive Slice-2 durable persistence hooks (optional for minimal in-memory test doubles)
+  listProposals?(
+    principalId: string,
+    instanceUrl: string,
+    filter?: { bugId?: BugId; state?: StoredProposal["state"] },
+  ): Promise<StoredProposal[]>;
+  claimProposalTransition?(params: {
+    principalId: string;
+    instanceUrl: string;
+    proposalId: string;
+    revision: number;
+    fromState: StoredProposal["state"];
+    toState: StoredProposal["state"];
+  }): Promise<boolean>;
+  consumeApprovalJti?(jti: string, expiresAtMs: number, nowMs?: number): Promise<boolean>;
+  saveBindingTicket?(ticket: StoredBindingTicket): Promise<void>;
+  getBindingTicket?(ticketId: string): Promise<StoredBindingTicket | null>;
+  markBindingTicketCompleted?(
+    ticketId: string,
+    credentialGeneration: number,
+    nowMs?: number,
+  ): Promise<boolean>;
+  consumeRetryState?(stateHash: string, expiresAtMs: number, nowMs?: number): Promise<boolean>;
+  saveApprovalTicket?(ticket: StoredApprovalTicket): Promise<void>;
+  getApprovalTicket?(ticketId: string): Promise<StoredApprovalTicket | null>;
+  consumeApprovalTicket?(ticketId: string, nowMs: number): Promise<boolean>;
+  saveBoundCredential?(
+    entry: Omit<StoredBoundCredential, "credentialGeneration" | "updatedAt">,
+  ): Promise<{ credentialGeneration: number }>;
+  getBoundCredential?(
+    issuer: string,
+    principalId: string,
+    instanceUrl: string,
+  ): Promise<StoredBoundCredential | null>;
+  revokeBoundCredential?(
+    issuer: string,
+    principalId: string,
+    instanceUrl: string,
+  ): Promise<boolean>;
+  upsertWebhookRetryItem?(item: StoredWebhookRetryItem): Promise<void>;
+  listWebhookRetryItems?(subscriptionId?: string): Promise<StoredWebhookRetryItem[]>;
+  deleteWebhookRetryItem?(subscriptionId: string, eventId: string): Promise<void>;
 }
 
 import { openSqliteStorage } from "./sqlite.js";

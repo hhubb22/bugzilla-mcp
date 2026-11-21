@@ -1,7 +1,7 @@
-import { randomUUID } from "node:crypto";
+import { randomUUID, timingSafeEqual } from "node:crypto";
 import {
-  BugzillaGetDossierInputSchema,
-  BugzillaPostAnalysisInputSchema,
+  EventFilterArgsSchema,
+  EventNameSchema,
   MCP_PROTOCOL_LEGACY,
   MCP_PROTOCOL_MODERN,
   McpErrorCode,
@@ -17,6 +17,7 @@ import {
   McpDomainError,
   sha256Hex,
 } from "@bugzilla-mcp/core";
+import { createApprovalPageManager } from "./approval-page.js";
 import { createBindingManager } from "./binding.js";
 import type {
   DualEraHttpRequest,
@@ -24,6 +25,12 @@ import type {
   DualEraMcpHandler,
   HttpServerConfig,
 } from "./index.js";
+import {
+  buildFullToolCatalog,
+  buildResourceCatalog,
+  dispatchToolCall,
+  readMcpResource,
+} from "./tool-dispatch.js";
 
 const VERSION_META_KEY = "io.modelcontextprotocol/protocolVersion";
 const CAPS_META_KEY = "io.modelcontextprotocol/clientCapabilities";
@@ -36,11 +43,6 @@ const NAMED_METHODS = new Set([
   "events/subscribe",
   "events/unsubscribe",
 ]);
-
-const INDISTINGUISHABLE_RESOURCE_ERROR = {
-  code: McpErrorCode.INVALID_PARAMS,
-  message: "Resource not found or inaccessible",
-} as const;
 
 interface JsonRpcRequest {
   jsonrpc?: string;
@@ -93,90 +95,6 @@ function rpcErrorResponse(
   });
 }
 
-function buildToolCatalog(headerRoutedParams: Readonly<Record<string, readonly string[]>> = {}) {
-  const annotate = (toolName: string, propName: string, schema: Record<string, unknown>) => {
-    const enabled = headerRoutedParams[toolName]?.includes(propName);
-    return enabled ? { ...schema, "x-mcp-header": propName } : schema;
-  };
-
-  return [
-    {
-      name: "bugzilla_search",
-      description: "Search Bugzilla bugs with compact projected summaries.",
-      annotations: { readOnlyHint: true, idempotentHint: true },
-      inputSchema: {
-        type: "object",
-        properties: {
-          product: annotate("bugzilla_search", "product", { type: "string" }),
-          limit: { type: "integer", minimum: 1, maximum: 50 },
-          offset: { type: "integer", minimum: 0 },
-        },
-      },
-    },
-    {
-      name: "bugzilla_get_dossier",
-      description: "Fetch compact Bugzilla dossier with recent comments, history, and metadata.",
-      annotations: { readOnlyHint: true, idempotentHint: true },
-      _meta: { ui: { resourceUri: "ui://bugzilla/dossier-card.html" } },
-      inputSchema: {
-        type: "object",
-        required: ["bugId"],
-        properties: {
-          bugId: annotate("bugzilla_get_dossier", "bugId", { type: "integer", minimum: 1 }),
-        },
-      },
-    },
-    {
-      name: "bugzilla_triage_board",
-      description: "Open the Bugzilla Triage workbench in side pane or global view.",
-      annotations: { readOnlyHint: true, idempotentHint: true },
-      _meta: {
-        ui: { resourceUri: "ui://bugzilla/triage-app.html" },
-        "com.google.antigravity/ui": {
-          entrypoints: [
-            { type: "aux_pane", title: "Bugzilla" },
-            { type: "global", title: "Bugzilla" },
-          ],
-        },
-      },
-      inputSchema: { type: "object", properties: {} },
-    },
-    {
-      name: "bugzilla_post_analysis",
-      description: "Post private Safe-Auto analysis comment (fails closed to internal note).",
-      annotations: { readOnlyHint: false, destructiveHint: false, idempotentHint: false },
-      inputSchema: {
-        type: "object",
-        required: ["bugId", "idempotencyKey", "isPrivate", "analysisMarkdown"],
-        properties: {
-          bugId: { type: "integer", minimum: 1 },
-          idempotencyKey: { type: "string", minLength: 8 },
-          isPrivate: annotate("bugzilla_post_analysis", "isPrivate", { const: true }),
-          analysisMarkdown: { type: "string", minLength: 1 },
-        },
-      },
-    },
-    {
-      name: "bugzilla_propose_update",
-      description: "Create or execute a guarded Bugzilla update proposal.",
-      annotations: { readOnlyHint: false, destructiveHint: true, idempotentHint: false },
-      inputSchema: { type: "object", properties: {} },
-    },
-    {
-      name: "bugzilla_create_bug",
-      description: "Create a Bugzilla bug with idempotency protection.",
-      annotations: { readOnlyHint: false, destructiveHint: false, idempotentHint: false },
-      inputSchema: { type: "object", properties: {} },
-    },
-    {
-      name: "bugzilla_get_attachment_excerpt",
-      description: "Read a bounded text excerpt of a Bugzilla attachment.",
-      annotations: { readOnlyHint: true, idempotentHint: true },
-      inputSchema: { type: "object", properties: {} },
-    },
-  ];
-}
-
 function validatePrimitiveMirror(rawHeader: string | undefined, value: unknown): boolean {
   if (rawHeader === undefined) return false;
   if (typeof value === "boolean") {
@@ -198,6 +116,7 @@ export function buildDualEraHttpHandler(config: HttpServerConfig): DualEraMcpHan
   const writeGuard = createWriteGuardService(config.core);
   const eventsService = createSyntheticEventsService(config.core);
   const binding = createBindingManager(config);
+  const approvalPage = createApprovalPageManager(config);
   const legacySessions = new Map<string, { protocolVersion: string; initialized: boolean }>();
   const publicBaseUrl = (config.publicBaseUrl ?? "https://mcp.example").replace(/\/+$/, "");
 
@@ -234,18 +153,28 @@ export function buildDualEraHttpHandler(config: HttpServerConfig): DualEraMcpHan
   }
 
   async function authenticate(req: DualEraHttpRequest): Promise<PrincipalContext | null> {
-    if (config.mode === "local-trusted-ide" && !config.authenticateBearerToken) {
-      return {
-        issuer: "local://ide",
-        principalId: "local-user",
-        clientId: "local-ide",
-        instanceUrl: "https://bugzilla.local",
-        credentialGeneration: 1,
-        scopes: ["bz:read", "bz:write:safe", "bz:write:guarded", "bz:events"],
-        deploymentMode: "local-trusted-ide",
-      };
-    }
     const auth = getHeader(req.headers, "authorization");
+    if (config.mode === "local-trusted-ide" && !config.authenticateBearerToken) {
+      if (config.localAuthToken) {
+        if (!auth || !auth.startsWith("Bearer ")) return null;
+        const provided = Buffer.from(auth.slice("Bearer ".length).trim(), "utf8");
+        const expected = Buffer.from(config.localAuthToken, "utf8");
+        if (provided.length !== expected.length || !timingSafeEqual(provided, expected)) {
+          return null;
+        }
+      }
+      return (
+        config.localPrincipal ?? {
+          issuer: "local://ide",
+          principalId: "local-user",
+          clientId: "local-ide",
+          instanceUrl: "https://bugzilla.local",
+          credentialGeneration: 1,
+          scopes: ["bz:read", "bz:write:safe", "bz:write:guarded", "bz:events"],
+          deploymentMode: "local-trusted-ide",
+        }
+      );
+    }
     if (!auth || !auth.startsWith("Bearer ")) return null;
     const token = auth.slice("Bearer ".length).trim();
     if (!token || !config.authenticateBearerToken) return null;
@@ -322,6 +251,17 @@ export function buildDualEraHttpHandler(config: HttpServerConfig): DualEraMcpHan
       if (pathname === "/bind") {
         if (req.method === "GET") return binding.handleBindGet(req);
         if (req.method === "POST") return binding.handleBindPost(req);
+        return {
+          status: 405,
+          headers: { "content-type": "text/plain" },
+          body: "Method Not Allowed",
+        };
+      }
+
+      // Out-of-band HTTPS Guarded-Write human approval routes (Cloud mode)
+      if (pathname === "/approve") {
+        if (req.method === "GET") return approvalPage.handleApproveGet(req);
+        if (req.method === "POST") return approvalPage.handleApprovePost(req);
         return {
           status: 405,
           headers: { "content-type": "text/plain" },
@@ -413,11 +353,77 @@ export function buildDualEraHttpHandler(config: HttpServerConfig): DualEraMcpHan
             body: "",
           };
         }
+        const neededLegacyScope = requiredScopeForRpc(rpc.method, params);
+        if (neededLegacyScope && !ctx.scopes.includes(neededLegacyScope)) {
+          return insufficientScopeResponse(neededLegacyScope);
+        }
         if (rpc.method === "tools/list") {
           return jsonResponse(200, {
             jsonrpc: "2.0",
             id: rpc.id,
-            result: { tools: buildToolCatalog(config.headerRoutedParams) },
+            result: { tools: buildFullToolCatalog(config.headerRoutedParams) },
+          });
+        }
+        if (rpc.method === "resources/list") {
+          return jsonResponse(200, {
+            jsonrpc: "2.0",
+            id: rpc.id,
+            result: { resources: buildResourceCatalog() },
+          });
+        }
+        if (rpc.method === "resources/read") {
+          const uri = typeof params.uri === "string" ? params.uri : "";
+          const outcome = await readMcpResource({
+            uri,
+            ctx,
+            core: config.core,
+            ...(config.appHtmlOverridePath !== undefined
+              ? { appHtmlOverridePath: config.appHtmlOverridePath }
+              : {}),
+          });
+          if (outcome.kind === "rpc_error") {
+            return rpcErrorResponse(200, rpc.id, outcome.code, outcome.message);
+          }
+          return jsonResponse(200, {
+            jsonrpc: "2.0",
+            id: rpc.id,
+            result: { contents: outcome.contents },
+          });
+        }
+        if (rpc.method === "tools/call") {
+          const toolName = typeof params.name === "string" ? params.name : "";
+          const toolArgs =
+            typeof params.arguments === "object" && params.arguments !== null
+              ? (params.arguments as Record<string, unknown>)
+              : {};
+          const client = await config.core.resolveClient(ctx);
+          if (!client) {
+            return rpcErrorResponse(
+              200,
+              rpc.id,
+              McpErrorCode.INVALID_PARAMS,
+              "CredentialBindingRequired",
+            );
+          }
+          const outcome = await dispatchToolCall({
+            toolName,
+            toolArgs,
+            ctx,
+            client,
+            core: config.core,
+            writeGuard,
+            approvalPage,
+          });
+          if (outcome.kind === "rpc_error") {
+            return rpcErrorResponse(200, rpc.id, outcome.code, outcome.message);
+          }
+          return jsonResponse(200, {
+            jsonrpc: "2.0",
+            id: rpc.id,
+            result: {
+              content: outcome.content,
+              structuredContent: outcome.structuredContent,
+            },
           });
         }
         return rpcErrorResponse(
@@ -516,71 +522,45 @@ export function buildDualEraHttpHandler(config: HttpServerConfig): DualEraMcpHan
               resultType: "complete",
               ttlMs: 300_000,
               cacheScope: "private",
-              tools: buildToolCatalog(config.headerRoutedParams),
+              tools: buildFullToolCatalog(config.headerRoutedParams),
+            },
+          });
+        }
+
+        if (rpc.method === "resources/list") {
+          return jsonResponse(200, {
+            jsonrpc: "2.0",
+            id: rpc.id,
+            result: {
+              resultType: "complete",
+              ttlMs: 300_000,
+              cacheScope: "public",
+              resources: buildResourceCatalog(),
             },
           });
         }
 
         if (rpc.method === "resources/read") {
           const uri = typeof params.uri === "string" ? params.uri : "";
-          const match = /^bugzilla:\/\/bug\/([1-9]\d*)$/.exec(uri);
-          const bugId = match?.[1] ? Number(match[1]) : NaN;
-          if (!Number.isSafeInteger(bugId) || bugId <= 0) {
-            return rpcErrorResponse(
-              200,
-              rpc.id,
-              INDISTINGUISHABLE_RESOURCE_ERROR.code,
-              INDISTINGUISHABLE_RESOURCE_ERROR.message,
-            );
+          const outcome = await readMcpResource({
+            uri,
+            ctx,
+            core: config.core,
+            ...(config.appHtmlOverridePath !== undefined
+              ? { appHtmlOverridePath: config.appHtmlOverridePath }
+              : {}),
+          });
+          if (outcome.kind === "rpc_error") {
+            return rpcErrorResponse(200, rpc.id, outcome.code, outcome.message);
           }
-          const client = await config.core.resolveClient(ctx);
-          if (!client) {
-            return rpcErrorResponse(
-              200,
-              rpc.id,
-              McpErrorCode.INVALID_PARAMS,
-              "CredentialBindingRequired",
-            );
-          }
-          const vis = await client.checkVisibility(bugId);
-          if (vis !== "visible") {
-            return rpcErrorResponse(
-              200,
-              rpc.id,
-              INDISTINGUISHABLE_RESOURCE_ERROR.code,
-              INDISTINGUISHABLE_RESOURCE_ERROR.message,
-            );
-          }
-          // Always fetch live authorized dossier on sensitive resource reads (AUTH-02: ttlMs 0)
-          const raw = await client.getBugDossierData(bugId, { maxComments: 15, maxHistory: 30 });
-          if (!raw) {
-            return rpcErrorResponse(
-              200,
-              rpc.id,
-              INDISTINGUISHABLE_RESOURCE_ERROR.code,
-              INDISTINGUISHABLE_RESOURCE_ERROR.message,
-            );
-          }
-          const internalNotes = await config.core.storage.listInternalNotes(
-            ctx.principalId,
-            ctx.instanceUrl,
-            bugId,
-          );
-          const dossier = { ...raw, internalNotes };
           return jsonResponse(200, {
             jsonrpc: "2.0",
             id: rpc.id,
             result: {
               resultType: "complete",
-              ttlMs: 0,
-              cacheScope: "private",
-              contents: [
-                {
-                  uri,
-                  mimeType: "application/json",
-                  text: JSON.stringify(dossier),
-                },
-              ],
+              ttlMs: outcome.ttlMs,
+              cacheScope: outcome.cacheScope,
+              contents: outcome.contents,
             },
           });
         }
@@ -616,7 +596,7 @@ export function buildDualEraHttpHandler(config: HttpServerConfig): DualEraMcpHan
                 "User declined or cancelled credential binding elicitation",
               );
             }
-            const validRetry = binding.verifyAndConsumeRetryState(
+            const validRetry = await binding.verifyAndConsumeRetryState(
               params.requestState,
               ctx,
               toolName,
@@ -635,7 +615,7 @@ export function buildDualEraHttpHandler(config: HttpServerConfig): DualEraMcpHan
           const client = await config.core.resolveClient(ctx);
           if (!client) {
             if (clientCapabilities.elicitation?.url !== undefined) {
-              const challenge = binding.issueChallenge(ctx, toolName, paramsHash);
+              const challenge = await binding.issueChallenge(ctx, toolName, paramsHash);
               return jsonResponse(200, {
                 jsonrpc: "2.0",
                 id: rpc.id,
@@ -671,77 +651,27 @@ export function buildDualEraHttpHandler(config: HttpServerConfig): DualEraMcpHan
             });
           }
 
-          if (toolName === "bugzilla_post_analysis") {
-            const parsed = BugzillaPostAnalysisInputSchema.safeParse(toolArgs);
-            if (!parsed.success) {
-              return rpcErrorResponse(
-                200,
-                rpc.id,
-                McpErrorCode.INVALID_PARAMS,
-                "Invalid Safe-Auto analysis arguments (isPrivate must be true)",
-              );
-            }
-            const outcome = await writeGuard.postAnalysis(ctx, parsed.data);
-            return jsonResponse(200, {
-              jsonrpc: "2.0",
-              id: rpc.id,
-              result: {
-                resultType: "complete",
-                content: [{ type: "text", text: JSON.stringify(outcome) }],
-                structuredContent: outcome,
-              },
-            });
+          const outcome = await dispatchToolCall({
+            toolName,
+            toolArgs,
+            ctx,
+            client,
+            core: config.core,
+            writeGuard,
+            approvalPage,
+          });
+          if (outcome.kind === "rpc_error") {
+            return rpcErrorResponse(200, rpc.id, outcome.code, outcome.message);
           }
-
-          if (toolName === "bugzilla_get_dossier") {
-            const parsed = BugzillaGetDossierInputSchema.safeParse(toolArgs);
-            if (!parsed.success) {
-              return rpcErrorResponse(200, rpc.id, McpErrorCode.INVALID_PARAMS, "Invalid bugId");
-            }
-            const vis = await client.checkVisibility(parsed.data.bugId);
-            if (vis !== "visible") {
-              return rpcErrorResponse(
-                200,
-                rpc.id,
-                INDISTINGUISHABLE_RESOURCE_ERROR.code,
-                INDISTINGUISHABLE_RESOURCE_ERROR.message,
-              );
-            }
-            const raw = await client.getBugDossierData(parsed.data.bugId, {
-              maxComments: parsed.data.maxComments,
-              maxHistory: parsed.data.maxHistory,
-            });
-            if (!raw) {
-              return rpcErrorResponse(
-                200,
-                rpc.id,
-                INDISTINGUISHABLE_RESOURCE_ERROR.code,
-                INDISTINGUISHABLE_RESOURCE_ERROR.message,
-              );
-            }
-            const internalNotes = await config.core.storage.listInternalNotes(
-              ctx.principalId,
-              ctx.instanceUrl,
-              parsed.data.bugId,
-            );
-            const dossier = { ...raw, internalNotes };
-            return jsonResponse(200, {
-              jsonrpc: "2.0",
-              id: rpc.id,
-              result: {
-                resultType: "complete",
-                content: [{ type: "text", text: JSON.stringify(dossier) }],
-                structuredContent: dossier,
-              },
-            });
-          }
-
-          return rpcErrorResponse(
-            200,
-            rpc.id,
-            McpErrorCode.INVALID_PARAMS,
-            `Unknown tool: ${toolName}`,
-          );
+          return jsonResponse(200, {
+            jsonrpc: "2.0",
+            id: rpc.id,
+            result: {
+              resultType: "complete",
+              content: outcome.content,
+              structuredContent: outcome.structuredContent,
+            },
+          });
         }
 
         if (rpc.method === "events/list") {
@@ -767,6 +697,90 @@ export function buildDualEraHttpHandler(config: HttpServerConfig): DualEraMcpHan
           }
           const result = await eventsService.poll(ctx, parsed.data);
           return jsonResponse(200, { jsonrpc: "2.0", id: rpc.id, result });
+        }
+
+        if (rpc.method === "events/stream") {
+          const nameParsed = EventNameSchema.safeParse(params.name);
+          const argsParsed = EventFilterArgsSchema.optional().safeParse(params.arguments);
+          if (!nameParsed.success || !argsParsed.success) {
+            return rpcErrorResponse(
+              200,
+              rpc.id,
+              McpErrorCode.INVALID_PARAMS,
+              "Invalid events/stream params",
+            );
+          }
+          const subscriptionId = `sub_${randomUUID()}`;
+          const sseChunks: string[] = [];
+          let lastCursor: string | null = null;
+          for await (const frame of eventsService.stream(ctx, {
+            name: nameParsed.data,
+            ...(argsParsed.data !== undefined ? { arguments: argsParsed.data } : {}),
+            ...(typeof params.cursor === "string" || params.cursor === null
+              ? { cursor: params.cursor }
+              : {}),
+            ...(typeof params.maxAgeMs === "number" ? { maxAgeMs: params.maxAgeMs } : {}),
+            ...(typeof params.heartbeatMs === "number" ? { heartbeatMs: params.heartbeatMs } : {}),
+          })) {
+            // SEP-3415 flattened notification payload + subscriptionId correlation (EVENT-01)
+            let notificationParams: Record<string, unknown>;
+            if (frame.method === "notifications/events/event") {
+              notificationParams = {
+                subscriptionId,
+                eventId: frame.occurrence.eventId,
+                name: frame.occurrence.name,
+                timestamp: frame.occurrence.timestamp,
+                data: frame.occurrence.data,
+                ...(frame.occurrence.cursor !== undefined
+                  ? { cursor: frame.occurrence.cursor }
+                  : {}),
+              };
+            } else if (frame.method === "notifications/events/active") {
+              lastCursor = frame.cursor;
+              notificationParams = {
+                subscriptionId,
+                cursor: frame.cursor,
+                truncated: frame.truncated,
+                heartbeatMs: frame.heartbeatMs,
+              };
+            } else if (frame.method === "notifications/events/heartbeat") {
+              lastCursor = frame.cursor;
+              notificationParams = { subscriptionId, cursor: frame.cursor };
+            } else if (frame.method === "notifications/events/terminated") {
+              notificationParams = {
+                subscriptionId,
+                code: frame.code,
+                reason: frame.reason,
+              };
+            } else {
+              notificationParams = { subscriptionId, message: frame.message };
+            }
+            const payload = JSON.stringify({
+              jsonrpc: "2.0",
+              method: frame.method,
+              params: notificationParams,
+            });
+            sseChunks.push(`event: message\ndata: ${payload}\n\n`);
+          }
+          // Emit final correlated JSON-RPC result frame on graceful stream close (EVENT-01)
+          const finalFrame = JSON.stringify({
+            jsonrpc: "2.0",
+            ...(rpc.id !== undefined ? { id: rpc.id } : {}),
+            result: {
+              resultType: "complete",
+              subscriptionId,
+              cursor: lastCursor,
+            },
+          });
+          sseChunks.push(`event: message\ndata: ${finalFrame}\n\n`);
+          return {
+            status: 200,
+            headers: {
+              "content-type": "text/event-stream; charset=utf-8",
+              "cache-control": "no-cache",
+            },
+            body: sseChunks.join(""),
+          };
         }
 
         if (rpc.method === "events/subscribe") {

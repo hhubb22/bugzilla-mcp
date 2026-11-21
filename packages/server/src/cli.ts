@@ -1,0 +1,100 @@
+#!/usr/bin/env bun
+import { randomBytes } from "node:crypto";
+import { createBugzillaClient } from "@bugzilla-mcp/bugzilla-client";
+import type { PrincipalContext } from "@bugzilla-mcp/contracts";
+import { createCloudApprovalTokenService } from "@bugzilla-mcp/core";
+import { createSqliteStorage } from "@bugzilla-mcp/storage";
+import { type HttpServerConfig, runStdioServer, startMcpHttpServer } from "./index.js";
+
+function parseFlag(name: string): string | undefined {
+  const prefix = `--${name}=`;
+  const hit = process.argv.find((arg) => arg.startsWith(prefix));
+  return hit ? hit.slice(prefix.length) : undefined;
+}
+
+async function main() {
+  const transport = parseFlag("transport") ?? process.env.MCP_TRANSPORT ?? "stdio";
+  const baseUrl = process.env.BUGZILLA_BASE_URL ?? "http://127.0.0.1:18080";
+  const apiKey = process.env.BUGZILLA_API_KEY ?? "";
+  const allowQueryFallback = process.env.BUGZILLA_ALLOW_QUERY_FALLBACK === "true";
+  const dbPath = process.env.BUGZILLA_DB_PATH ?? ":memory:";
+  const mode =
+    process.env.MCP_DEPLOYMENT_MODE === "cloud-multi-user"
+      ? ("cloud-multi-user" as const)
+      : ("local-trusted-ide" as const);
+  const eventsProfile =
+    process.env.MCP_EVENTS_PROFILE === "chatgpt-events"
+      ? ("chatgpt-events" as const)
+      : ("sep-3415" as const);
+
+  // Reject unsupported cloud/stdio combination and fail fast on incomplete cloud config (AUTH-09, RUNTIME-01)
+  if (mode === "cloud-multi-user") {
+    if (transport === "stdio") {
+      throw new Error(
+        "cloud-multi-user mode cannot run over stdio transport; use --transport=http",
+      );
+    }
+    throw new Error(
+      "cloud-multi-user mode requires programmatic OAuth bearer verifier, opener-session verifier, and encrypted credential vault wiring via startMcpHttpServer()",
+    );
+  }
+
+  const storage = createSqliteStorage(dbPath);
+  const signingSecret = process.env.MCP_SIGNING_SECRET ?? randomBytes(32).toString("hex");
+  const cloudApprovalService = createCloudApprovalTokenService(signingSecret, storage);
+
+  const client = apiKey ? createBugzillaClient({ baseUrl, apiKey, allowQueryFallback }) : null;
+
+  const localPrincipal: PrincipalContext = {
+    issuer: "local://ide",
+    principalId: process.env.BUGZILLA_PRINCIPAL_ID ?? "local-user",
+    clientId: "local-ide",
+    instanceUrl: baseUrl,
+    credentialGeneration: 1,
+    scopes: ["bz:read", "bz:write:safe", "bz:write:guarded", "bz:events"],
+    deploymentMode: "local-trusted-ide",
+  };
+
+  // Per-installation bearer token required for local Streamable HTTP (AUTH-07, AUTH-08)
+  const localAuthToken = process.env.MCP_LOCAL_TOKEN ?? randomBytes(24).toString("base64url");
+
+  const config: HttpServerConfig = {
+    mode: "local-trusted-ide",
+    allowedOrigins: (process.env.MCP_ALLOWED_ORIGINS ?? "http://127.0.0.1,http://localhost").split(
+      ",",
+    ),
+    allowAbsentOrigin: true,
+    eventsProfile,
+    bindingSecret: signingSecret,
+    localPrincipal,
+    localAuthToken,
+    core: {
+      storage,
+      resolveClient: async () => client,
+      lagWindowMs: Number(process.env.MCP_LAG_WINDOW_MS ?? "3000"),
+      causalBudgetPerBug: Number(process.env.MCP_CAUSAL_MAX_WRITES ?? "5"),
+      causalBudgetWindowMs: Number(process.env.MCP_CAUSAL_WINDOW_MS ?? "300000"),
+      eventsProfile,
+      cloudApprovalService,
+    },
+  };
+
+  if (transport === "http") {
+    const port = Number(parseFlag("port") ?? process.env.PORT ?? "3878");
+    const host = parseFlag("host") ?? process.env.HOST ?? "127.0.0.1";
+    const running = await startMcpHttpServer({ config, host, port });
+    process.stderr.write(
+      `[bugzilla-mcp] Local HTTP listening on ${running.baseUrl}/mcp (Bearer token required)\n`,
+    );
+    return;
+  }
+
+  await runStdioServer({ config, principal: localPrincipal });
+}
+
+if (import.meta.main) {
+  void main().catch((err) => {
+    process.stderr.write(`[bugzilla-mcp] Fatal startup error: ${String(err)}\n`);
+    process.exit(1);
+  });
+}

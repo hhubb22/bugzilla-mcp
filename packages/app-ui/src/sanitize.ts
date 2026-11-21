@@ -3,7 +3,7 @@ import type {
   SafeRenderedBugView,
   SafeUserIntentMessage,
   UntrustedBugzillaDisplayInput,
-} from "./index.js";
+} from "./types.js";
 
 const HTML_ESCAPE_MAP: Readonly<Record<string, string>> = {
   "&": "&amp;",

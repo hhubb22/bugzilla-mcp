@@ -11,6 +11,11 @@ export interface HttpServerConfig {
   readonly core: CoreDependencies;
   readonly publicBaseUrl?: string;
   readonly bindingSecret?: string;
+  readonly appHtmlOverridePath?: string;
+  /** Configured principal for local-trusted-ide mode (AUTH-08) */
+  readonly localPrincipal?: PrincipalContext;
+  /** Per-installation bearer token required for local HTTP mode (AUTH-07) */
+  readonly localAuthToken?: string;
   readonly authenticateBearerToken?: (token: string) => Promise<PrincipalContext | null>;
   readonly verifyBindingOpenerSession?: (
     req: DualEraHttpRequest,
@@ -43,3 +48,7 @@ import { buildDualEraHttpHandler } from "./http-handler.js";
 export function createDualEraHttpHandler(config: HttpServerConfig): DualEraMcpHandler {
   return buildDualEraHttpHandler(config);
 }
+
+export { createEncryptedCredentialVault, type EncryptedCredentialVault } from "./crypto-store.js";
+export { type RunningHttpServer, startMcpHttpServer } from "./runtime.js";
+export { createStdioRpcProcessor, runStdioServer } from "./stdio.js";

@@ -1,4 +1,5 @@
 import { createHmac, randomBytes, timingSafeEqual } from "node:crypto";
+import type { StoragePorts } from "@bugzilla-mcp/storage";
 import { canonicalJson, sha256Hex } from "./canonical.js";
 import type {
   CloudApprovalExpected,
@@ -23,7 +24,10 @@ function signPayload(secret: string, encodedPayload: string): string {
   return createHmac("sha256", secret).update(encodedPayload, "utf8").digest("base64url");
 }
 
-export function buildCloudApprovalTokenService(signingSecret: string): CloudApprovalTokenService {
+export function buildCloudApprovalTokenService(
+  signingSecret: string,
+  storage?: StoragePorts,
+): CloudApprovalTokenService {
   const consumedJtis = new Set<string>();
 
   return {
@@ -77,7 +81,7 @@ export function buildCloudApprovalTokenService(signingSecret: string): CloudAppr
         return { valid: false, reason: "invalid_signature" };
       }
 
-      if (expected.nowMs > payload.expiresAtMs) {
+      if (expected.nowMs >= payload.expiresAtMs) {
         return { valid: false, reason: "expired" };
       }
 
@@ -99,11 +103,22 @@ export function buildCloudApprovalTokenService(signingSecret: string): CloudAppr
         return { valid: false, reason: "binding_mismatch" };
       }
 
-      // Synchronous check-and-mark guarantees single-use under concurrent Promise.all
+      // Synchronous check-and-mark guarantees single-use under concurrent Promise.all,
+      // plus durable SQLite persistence across restarts when storage supports it (AUTH-05).
       if (consumedJtis.has(payload.jti)) {
         return { valid: false, reason: "replayed" };
       }
       consumedJtis.add(payload.jti);
+      if (storage?.consumeApprovalJti) {
+        const newlyConsumed = await storage.consumeApprovalJti(
+          payload.jti,
+          payload.expiresAtMs,
+          expected.nowMs,
+        );
+        if (!newlyConsumed) {
+          return { valid: false, reason: "replayed" };
+        }
+      }
       return { valid: true };
     },
   };

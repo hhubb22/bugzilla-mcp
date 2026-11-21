@@ -56,9 +56,32 @@ export function createBindingManager(config: HttpServerConfig) {
 
   const tickets = new Map<string, TicketRecord>();
   const consumedStates = new Set<string>();
+  const storage = config.core.storage;
+
+  async function loadTicket(ticketId: string): Promise<TicketRecord | undefined> {
+    // Always prefer durable SQLite state across workers when available (AUTH-01)
+    if (storage.getBindingTicket) {
+      const stored = await storage.getBindingTicket(ticketId);
+      if (!stored) return undefined;
+      return {
+        ticketId: stored.ticketId,
+        csrfToken: stored.csrfToken,
+        issuer: stored.issuer,
+        principalId: stored.principalId,
+        clientId: stored.clientId,
+        instanceUrl: stored.instanceUrl,
+        expiresAtMs: stored.expiresAtMs,
+        completed: stored.completed,
+        ...(stored.credentialGeneration !== undefined
+          ? { completedGeneration: stored.credentialGeneration }
+          : {}),
+      };
+    }
+    return tickets.get(ticketId);
+  }
 
   return {
-    issueChallenge(ctx: PrincipalContext, toolName: string, paramsHash: string) {
+    async issueChallenge(ctx: PrincipalContext, toolName: string, paramsHash: string) {
       const nowMs = clock();
       const expiresAtMs = nowMs + TICKET_TTL_MS;
       const ticketId = randomBytes(18).toString("base64url");
@@ -73,6 +96,18 @@ export function createBindingManager(config: HttpServerConfig) {
         clientId: ctx.clientId,
         instanceUrl: ctx.instanceUrl,
         expiresAtMs,
+        completed: false,
+      });
+      await storage.saveBindingTicket?.({
+        ticketId,
+        issuer: ctx.issuer,
+        principalId: ctx.principalId,
+        clientId: ctx.clientId,
+        instanceUrl: ctx.instanceUrl,
+        toolName,
+        paramsHash,
+        expiresAtMs,
+        csrfToken,
         completed: false,
       });
 
@@ -103,8 +138,8 @@ export function createBindingManager(config: HttpServerConfig) {
       if (!ticketId) {
         return { status: 400, headers: { "content-type": "text/plain" }, body: "Missing ticket" };
       }
-      const ticket = tickets.get(ticketId);
-      if (!ticket || clock() > ticket.expiresAtMs || ticket.completed) {
+      const ticket = await loadTicket(ticketId);
+      if (!ticket || clock() >= ticket.expiresAtMs || ticket.completed) {
         return {
           status: 410,
           headers: { "content-type": "text/plain" },
@@ -127,10 +162,13 @@ export function createBindingManager(config: HttpServerConfig) {
         };
       }
 
+      const apiKeyHelpUrl = `${ticket.instanceUrl.replace(/\/+$/, "")}/userprefs.cgi?tab=apikey`;
       const html = [
         "<!doctype html>",
-        "<html><body>",
+        '<html lang="en"><head><meta charset="utf-8"><meta name="color-scheme" content="light dark">',
+        "<title>Bind Bugzilla API Key</title></head><body>",
         "<h1>Bind Bugzilla API Key</h1>",
+        `<p>Instance: <code>${escapeAttr(ticket.instanceUrl)}</code> · <a href="${escapeAttr(apiKeyHelpUrl)}" rel="noopener noreferrer" target="_blank">Generate API key in Bugzilla</a></p>`,
         `<form method="POST" action="/bind?t=${escapeAttr(ticketId)}">`,
         `<input type="hidden" name="t" value="${escapeAttr(ticketId)}" />`,
         `<input type="hidden" name="csrf" value="${escapeAttr(ticket.csrfToken)}" />`,
@@ -156,11 +194,14 @@ export function createBindingManager(config: HttpServerConfig) {
       const reqOrigin = Object.entries(req.headers).find(
         ([k]) => k.toLowerCase() === "origin",
       )?.[1];
-      if (reqOrigin !== undefined && reqOrigin !== expectedOrigin) {
+      if (
+        (reqOrigin !== undefined && reqOrigin !== expectedOrigin) ||
+        (reqOrigin === undefined && config.allowAbsentOrigin === false)
+      ) {
         return {
           status: 403,
           headers: { "content-type": "text/plain" },
-          body: "Forbidden origin on binding submission",
+          body: "Forbidden or missing origin on binding submission",
         };
       }
       const url = new URL(req.path, publicBaseUrl);
@@ -176,8 +217,8 @@ export function createBindingManager(config: HttpServerConfig) {
           body: "Missing required binding fields",
         };
       }
-      const ticket = tickets.get(ticketId);
-      if (!ticket || clock() > ticket.expiresAtMs || ticket.completed) {
+      const ticket = await loadTicket(ticketId);
+      if (!ticket || clock() >= ticket.expiresAtMs || ticket.completed) {
         return {
           status: 410,
           headers: { "content-type": "text/plain" },
@@ -206,15 +247,26 @@ export function createBindingManager(config: HttpServerConfig) {
         };
       }
 
-      // Atomic check-and-claim AFTER async opener verification prevents concurrent double-submit (AUTH-04)
-      if (clock() > ticket.expiresAtMs || ticket.completed) {
+      // Atomic check-and-claim AFTER async opener verification prevents concurrent double-submit (AUTH-01, AUTH-04)
+      const nowMs = clock();
+      if (nowMs >= ticket.expiresAtMs || ticket.completed) {
         return {
           status: 410,
           headers: { "content-type": "text/plain" },
           body: "Binding ticket expired or already consumed",
         };
       }
-      ticket.completed = true;
+      const inMemoryTicket = tickets.get(ticketId);
+      if (inMemoryTicket) {
+        if (inMemoryTicket.completed) {
+          return {
+            status: 410,
+            headers: { "content-type": "text/plain" },
+            body: "Binding ticket expired or already consumed",
+          };
+        }
+        inMemoryTicket.completed = true;
+      }
       try {
         const stored = await config.storeBoundApiKey(
           {
@@ -224,9 +276,27 @@ export function createBindingManager(config: HttpServerConfig) {
           },
           apiKey,
         );
-        ticket.completedGeneration = stored.credentialGeneration;
+        if (storage.markBindingTicketCompleted) {
+          const claimed = await storage.markBindingTicketCompleted(
+            ticketId,
+            stored.credentialGeneration,
+            nowMs,
+          );
+          if (!claimed) {
+            return {
+              status: 410,
+              headers: { "content-type": "text/plain" },
+              body: "Binding ticket expired or already consumed",
+            };
+          }
+        }
+        if (inMemoryTicket) {
+          inMemoryTicket.completedGeneration = stored.credentialGeneration;
+        }
       } catch {
-        ticket.completed = false;
+        if (inMemoryTicket) {
+          inMemoryTicket.completed = false;
+        }
         return {
           status: 400,
           headers: { "content-type": "text/plain" },
@@ -244,12 +314,12 @@ export function createBindingManager(config: HttpServerConfig) {
       };
     },
 
-    verifyAndConsumeRetryState(
+    async verifyAndConsumeRetryState(
       requestState: string,
       ctx: PrincipalContext,
       toolName: string,
       paramsHash: string,
-    ): boolean {
+    ): Promise<boolean> {
       const parts = requestState.split(".");
       if (parts.length !== 2) return false;
       const [encoded, providedSig] = parts;
@@ -269,7 +339,8 @@ export function createBindingManager(config: HttpServerConfig) {
         return false;
       }
 
-      if (clock() > payload.expiresAtMs) return false;
+      const nowMs = clock();
+      if (nowMs >= payload.expiresAtMs) return false;
       if (
         payload.issuer !== ctx.issuer ||
         payload.principalId !== ctx.principalId ||
@@ -281,21 +352,29 @@ export function createBindingManager(config: HttpServerConfig) {
         return false;
       }
 
-      const ticket = tickets.get(payload.ticketId);
+      // Synchronous single-use check-and-mark BEFORE async awaits prevents concurrent Promise.all double-use
+      if (consumedStates.has(payload.stateId)) {
+        return false;
+      }
+      consumedStates.add(payload.stateId);
+
+      const ticket = await loadTicket(payload.ticketId);
       if (
         !ticket ||
         !ticket.completed ||
         ticket.completedGeneration === undefined ||
         ticket.completedGeneration !== ctx.credentialGeneration
       ) {
+        consumedStates.delete(payload.stateId);
         return false;
       }
 
-      // Synchronous single-use check-and-mark prevents concurrent Promise.all double-use
-      if (consumedStates.has(payload.stateId)) {
-        return false;
+      if (storage.consumeRetryState) {
+        const fresh = await storage.consumeRetryState(payload.stateId, payload.expiresAtMs, nowMs);
+        if (!fresh) {
+          return false;
+        }
       }
-      consumedStates.add(payload.stateId);
       return true;
     },
   };

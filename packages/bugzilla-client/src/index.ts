@@ -22,6 +22,27 @@ export interface BugzillaInstanceCapabilities {
   readonly isInsider: boolean;
 }
 
+export class BugzillaCredentialRevokedError extends Error {
+  constructor(message = "Bugzilla API key invalid or revoked") {
+    super(message);
+    this.name = "BugzillaCredentialRevokedError";
+  }
+}
+
+export class BugzillaAccessDeniedError extends Error {
+  constructor(message = "Bugzilla resource not found or inaccessible") {
+    super(message);
+    this.name = "BugzillaAccessDeniedError";
+  }
+}
+
+export class BugzillaUnsupportedAttachmentError extends Error {
+  constructor(message = "Attachment is non-text or exceeds safe excerpt size limit") {
+    super(message);
+    this.name = "BugzillaUnsupportedAttachmentError";
+  }
+}
+
 export interface UpstreamBugzillaOccurrence {
   readonly kind: EventName;
   readonly bugId: BugId;
@@ -31,6 +52,7 @@ export interface UpstreamBugzillaOccurrence {
   readonly product: string;
   readonly component: string;
   readonly actor: string;
+  readonly requestee?: string;
   readonly fieldsChanged?: readonly string[];
   readonly summaryText?: string;
   readonly commentText?: string;
@@ -53,6 +75,21 @@ export interface BugzillaClient {
     opts: { maxComments: number; maxHistory: number },
   ): Promise<Omit<BugDossier, "internalNotes"> | null>;
   listAttachments(bugId: BugId): Promise<AttachmentMeta[]>;
+  getAttachmentExcerpt?(params: {
+    attachmentId: number;
+    byteOffset: number;
+    maxBytes: number;
+  }): Promise<{
+    attachmentId: number;
+    bugId: BugId;
+    fileName: string;
+    contentType: string;
+    totalBytes: number;
+    byteOffset: number;
+    excerptText: string;
+    truncated: boolean;
+    isPrivate: boolean;
+  } | null>;
   postPrivateComment(
     bugId: BugId,
     text: string,
@@ -62,11 +99,11 @@ export interface BugzillaClient {
     diff: ProposalDiff,
   ): Promise<{ updatedLastChangeTime: IsoTimestamp; commentId?: number }>;
   createBug(input: Omit<BugzillaCreateBugInput, "idempotencyKey">): Promise<{ bugId: BugId }>;
-  listChangesSince(params: {
-    since: IsoTimestamp;
-    limit: number;
-    offset: number;
-  }): Promise<{ occurrences: readonly UpstreamBugzillaOccurrence[]; scanComplete: boolean }>;
+  listChangesSince(params: { since: IsoTimestamp; limit: number; offset: number }): Promise<{
+    occurrences: readonly UpstreamBugzillaOccurrence[];
+    scanComplete: boolean;
+    nextOffset?: number;
+  }>;
   checkVisibility(
     bugId: BugId,
     commentId?: number,

@@ -150,6 +150,8 @@ export interface SyntheticEventsService {
     readonly events: readonly {
       readonly name: EventName;
       readonly delivery: readonly ("poll" | "push" | "webhook")[];
+      readonly inputSchema?: Readonly<Record<string, unknown>>;
+      readonly payloadSchema?: Readonly<Record<string, unknown>>;
     }[];
   };
   poll(ctx: PrincipalContext, params: PollEventsParams): Promise<PollEventsResult>;
@@ -189,6 +191,45 @@ export function createSyntheticEventsService(deps: CoreDependencies): SyntheticE
   return buildSyntheticEventsService(deps);
 }
 
-export function createCloudApprovalTokenService(signingSecret: string): CloudApprovalTokenService {
-  return buildCloudApprovalTokenService(signingSecret);
+export function createCloudApprovalTokenService(
+  signingSecret: string,
+  storage?: StoragePorts,
+): CloudApprovalTokenService {
+  return buildCloudApprovalTokenService(signingSecret, storage);
+}
+
+export function startWebhookDeliveryLoop(params: {
+  events: SyntheticEventsService;
+  listPrincipals: () => Promise<readonly PrincipalContext[]>;
+  intervalMs: number;
+  onError?: (err: unknown) => void;
+}): { stop(): void } {
+  let stopped = false;
+  let running = false;
+  const timer = setInterval(() => {
+    if (stopped || running) return;
+    running = true;
+    void (async () => {
+      try {
+        const principals = await params.listPrincipals();
+        for (const ctx of principals) {
+          if (stopped) break;
+          await params.events.deliverPendingWebhooks(ctx);
+        }
+      } catch (err) {
+        params.onError?.(err);
+      } finally {
+        running = false;
+      }
+    })();
+  }, params.intervalMs);
+  if (typeof timer.unref === "function") {
+    timer.unref();
+  }
+  return {
+    stop() {
+      stopped = true;
+      clearInterval(timer);
+    },
+  };
 }

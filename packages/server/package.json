@@ -13,6 +13,7 @@
     "typecheck": "tsc --noEmit"
   },
   "dependencies": {
+    "@bugzilla-mcp/app-ui": "workspace:*",
     "@bugzilla-mcp/bugzilla-client": "workspace:*",
     "@bugzilla-mcp/contracts": "workspace:*",
     "@bugzilla-mcp/core": "workspace:*",
