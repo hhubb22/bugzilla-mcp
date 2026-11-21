@@ -8,6 +8,7 @@
   "type": "module",
   "scripts": {
     "typecheck": "bun --filter '*' typecheck",
+    "typecheck:tests": "tsc -p tests/tsconfig.json --noEmit",
     "check": "bunx vp check",
     "lint": "bunx vp lint",
     "fmt": "bunx vp fmt",
@@ -17,7 +18,7 @@
   },
   "devDependencies": {
     "@informalsystems/quint": "0.33.1",
-    "@types/bun": "^1.2.15",
+    "@types/bun": "^1.4.5",
     "fast-check": "^4.10.3",
     "typescript": "^5.9.3",
     "vite": "npm:@voidzero-dev/vite-plus-core@1.4.0",

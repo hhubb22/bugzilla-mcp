@@ -2,25 +2,71 @@ import type { BugzillaClient } from "@bugzilla-mcp/bugzilla-client";
 import type {
   AppResolveProposalInput,
   AppSaveDraftInput,
+  BugId,
+  BugzillaCreateBugInput,
   BugzillaPostAnalysisInput,
   BugzillaProposeUpdateInput,
   DraftSaveResult,
+  EventFilterArgs,
+  EventName,
+  EventOccurrence,
   EventsProfile,
+  IsoTimestamp,
   PollEventsParams,
   PollEventsResult,
   PrincipalContext,
+  ProposalDiff,
   WebhookSubscribeParams,
   WebhookSubscribeResult,
   WriteGuardOutcome,
 } from "@bugzilla-mcp/contracts";
-import type { StoragePorts } from "@bugzilla-mcp/storage";
+import type { StoragePorts, StoredDraft } from "@bugzilla-mcp/storage";
+
+export interface WebhookPinnedRequest {
+  readonly resolvedIp: string;
+  readonly hostHeader: string;
+  readonly tlsSni: string;
+  readonly url: string;
+  readonly headers: Readonly<Record<string, string>>;
+  readonly rawBody: string;
+  readonly followRedirects: false;
+}
+
+export interface WebhookPinnedResponse {
+  readonly status: number;
+  readonly body: string;
+}
+
+/** External network & DNS boundary port for SSRF-safe outbound webhooks */
+export interface WebhookOutboundTransport {
+  resolveHost(hostname: string): Promise<readonly string[]>;
+  postPinned(req: WebhookPinnedRequest): Promise<WebhookPinnedResponse>;
+}
+
+export interface CloudApprovalExpected {
+  readonly approverPrincipalId: string;
+  readonly instanceUrl: string;
+  readonly proposalId: string;
+  readonly revision: number;
+  readonly bugId: BugId;
+  readonly baseVersion: IsoTimestamp;
+  readonly diff: ProposalDiff;
+}
 
 export interface CoreDependencies {
   readonly storage: StoragePorts;
   readonly resolveClient: (ctx: PrincipalContext) => Promise<BugzillaClient | null>;
   readonly eventsProfile: EventsProfile;
   readonly causalBudgetPerBug: number;
+  readonly causalBudgetWindowMs?: number;
   readonly lagWindowMs: number;
+  readonly maxReplayWindowMs?: number;
+  readonly clock?: () => number;
+  readonly webhookTransport?: WebhookOutboundTransport;
+  readonly verifyCloudApprovalToken?: (
+    token: string,
+    expected: CloudApprovalExpected,
+  ) => Promise<boolean>;
 }
 
 export interface WriteGuardService {
@@ -29,15 +75,54 @@ export interface WriteGuardService {
     ctx: PrincipalContext,
     input: BugzillaProposeUpdateInput,
   ): Promise<WriteGuardOutcome>;
+  createBug(ctx: PrincipalContext, input: BugzillaCreateBugInput): Promise<WriteGuardOutcome>;
   resolveProposal(
     ctx: PrincipalContext,
     input: AppResolveProposalInput,
   ): Promise<WriteGuardOutcome>;
   saveDraft(ctx: PrincipalContext, input: AppSaveDraftInput): Promise<DraftSaveResult>;
+  getDraft(
+    ctx: PrincipalContext,
+    params: { bugId: BugId; draftKind: AppSaveDraftInput["draftKind"] },
+  ): Promise<StoredDraft | null>;
 }
 
+export type EventStreamFrame =
+  | {
+      readonly method: "notifications/events/active";
+      readonly cursor: string | null;
+      readonly truncated: boolean;
+      readonly heartbeatMs: number;
+    }
+  | { readonly method: "notifications/events/event"; readonly occurrence: EventOccurrence }
+  | { readonly method: "notifications/events/heartbeat"; readonly cursor: string | null }
+  | { readonly method: "notifications/events/error"; readonly message: string }
+  | {
+      readonly method: "notifications/events/terminated";
+      readonly code: number;
+      readonly reason: string;
+    };
+
 export interface SyntheticEventsService {
+  listEvents(): {
+    readonly profile: EventsProfile;
+    readonly events: readonly {
+      readonly name: EventName;
+      readonly delivery: readonly ("poll" | "push" | "webhook")[];
+    }[];
+  };
   poll(ctx: PrincipalContext, params: PollEventsParams): Promise<PollEventsResult>;
+  stream(
+    ctx: PrincipalContext,
+    params: {
+      name: EventName;
+      arguments?: EventFilterArgs;
+      cursor?: string | null;
+      maxAgeMs?: number;
+      heartbeatMs?: number;
+    },
+    signal?: AbortSignal,
+  ): AsyncIterable<EventStreamFrame>;
   subscribeWebhook(
     ctx: PrincipalContext,
     params: WebhookSubscribeParams,
@@ -45,11 +130,14 @@ export interface SyntheticEventsService {
   unsubscribeWebhook(
     ctx: PrincipalContext,
     params: {
-      name: string;
-      arguments: Record<string, unknown>;
+      name: EventName;
+      arguments: EventFilterArgs;
       delivery: { url: string; mode?: "webhook" };
     },
   ): Promise<{ resultType: "complete" }>;
+  deliverPendingWebhooks(
+    ctx: PrincipalContext,
+  ): Promise<{ delivered: number; abandoned: number; terminated: number }>;
 }
 
 export function createWriteGuardService(_deps: CoreDependencies): WriteGuardService {

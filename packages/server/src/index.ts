@@ -1,11 +1,21 @@
-import type { EventsProfile } from "@bugzilla-mcp/contracts";
+import type { EventsProfile, PrincipalContext } from "@bugzilla-mcp/contracts";
 import type { CoreDependencies } from "@bugzilla-mcp/core";
 
 export interface HttpServerConfig {
   readonly mode: "cloud-multi-user" | "local-trusted-ide";
   readonly allowedOrigins: readonly string[];
+  readonly allowAbsentOrigin?: boolean;
   readonly eventsProfile: EventsProfile;
   readonly core: CoreDependencies;
+  readonly publicBaseUrl?: string;
+  readonly authenticateBearerToken?: (token: string) => Promise<PrincipalContext | null>;
+  readonly verifyBindingOpenerSession?: (
+    req: DualEraHttpRequest,
+  ) => Promise<{ issuer: string; principalId: string } | null>;
+  readonly storeBoundApiKey?: (
+    ctx: Pick<PrincipalContext, "issuer" | "principalId" | "instanceUrl">,
+    apiKey: string,
+  ) => Promise<{ credentialGeneration: number }>;
 }
 
 export interface DualEraHttpRequest {
