@@ -6,7 +6,7 @@ Production-hardened, dual-mode (**Cloud Autonomous Agent** + **Local IDE / Antig
 
 - **MCP Core `2026-07-28`** (+ `2025-11-25` Dual-Era session compatibility with tenant-bound sessions)
 - **MCP Apps (`SEP-1865`)** single-file React workbench (`ui://bugzilla/triage-app.html`) & inline dossier card (`ui://bugzilla/dossier-card.html`)
-- **MCP Events (`SEP-3415` + ChatGPT Events dialect adapter)** with lag-windowed cursors & SSRF-hardened DNS-pinned Standard Webhooks
+- **MCP Events (`SEP-3415` and ChatGPT Events)** with REST-backed polling. Cloud Webhook deployment and legacy HTTP subscriptions still have gaps.
 
 ## Architecture Overview
 
@@ -62,7 +62,8 @@ Add to your MCP client configuration (Antigravity, Claude Desktop, Cursor, etc.)
 | [docs/quickstart-and-clients.md](docs/quickstart-and-clients.md)   | Local `stdio`, Loopback HTTP, and programmatic Cloud Multi-User embedding (`startMcpHttpServer`)              |
 | [docs/reference.md](docs/reference.md)                             | Environment variables, CLI flags, all 11 MCP tools, resources, events, webhooks, and HTTP routes              |
 | [docs/security-and-operations.md](docs/security-and-operations.md) | Threat model, Bugzilla 5.0/5.2 quirks & proxy checklist, SQLite pre-v3 migration runbook, and troubleshooting |
-| [specs/](specs/)                                                   | Frozen contract-driven specifications (`25` stamped `[R-xxxxxx]` EARS clauses) & Quint formal models          |
+| [specs/](specs/)                                                   | Project scope, frozen behavior contracts, and Quint models                                                    |
+| [Events reliability brief](specs/events-reliability.brief.md)      | Scope and acceptance criteria for the Events fixes                                                            |
 
 ## Workspace Packages
 
@@ -82,7 +83,7 @@ bun run build:ui        # Build single-file MCP App HTML (packages/app-ui/dist-w
 bun run check           # Format + Oxlint (vite-plus)
 bun run typecheck       # Type-check all 6 packages + React web bundle
 bun run typecheck:tests # Type-check test suite
-bun run test            # Contract & multi-issuer isolation suite (82 tests, 25/25 clauses)
+bun run test            # Run the existing contract and multi-issuer isolation tests
 bun run verify:quint    # Quint formal safety invariants (write_guard + events_ingestion)
 ```
 

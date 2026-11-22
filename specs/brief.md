@@ -37,7 +37,7 @@
 1. 协议与双代兼容：实现 `server/discover`、`resultType`、以及面向可缓存核心方法（`discover`/`list`/`resources/read`）的 `CacheableResult`（`ttlMs` + `cacheScope`），并严格隔离 `2026-07-28` 无状态 `_meta` 与 `2025-11-25` `initialize` 路由；Streamable HTTP 校验 `Origin`（`403`）与缺失/畸形/不匹配的镜像头（`-32020` / HTTP `400`）。
 2. 权限与缓存零泄露：多用户模式下所有服务端内部缓存、幂等表、草稿与提案均按 `(principal, instance)` 强制隔离；所有依赖个人 API Key 的可缓存结果标 `cacheScope: "private"`，不存在与无权访问资源对外返回不可区分的 `-32602`；云端通过 URL Elicitation 绑定个人 API Key，MCP Token 绝不透传上游。
 3. 写入幂等、状态机与防循环：按 `(principal, instance, operation)` 维护 `pending / applied / failed / indeterminate` 状态机，响应丢失后的 `indeterminate` 严禁自动重发；`Safe-Auto` 私有评论禁止降级为公评；`Guarded-Write` 执行前乐观校验 + 写后差异审计（云端需服务端独立验证一次性审批凭证）；防循环仅依赖可信持久化写溯源 + 服务端因果写入预算。
-4. 事件交付与安全契约：支持 `events/list|poll|stream|subscribe|unsubscribe`；游标仅推进至已完整扫描的安全前缀（带滞后窗口），投递与重试前逐条重验当前 Bugzilla 可见性（Fail-Closed）；Webhook 全链路连接（校验/投递/重试/控制帧）强制 HTTPS、连接时公网 IP 固定拨号（保留 Host/SNI）与禁重定向、Standard Webhooks `v1,` HMAC-SHA256、单载荷 `<= 256 KiB` 及持久化 `gap`；配置级独立切换 SEP-3415 与 ChatGPT Dialect。
+4. 事件交付与安全契约：本次交付 `events/list`、`events/poll`、`events/subscribe` 和 `events/unsubscribe`，受[行为契约](architecture-and-contracts.md)中的配置约束。`events/stream` 仍是后续目标，不声明 `push`。游标仅推进至已完整扫描的安全前缀。投递与重试前必须重验 Bugzilla 可见性。Webhook 使用 HTTPS、经验证的公网拨号地址和 Standard Webhooks 签名。不跟随重定向。单载荷不得超过 `256 KiB`，投递缺口在重启后仍须可报告。
 5. MCP App 安全与边界：拆分 Inline 单卡与 Aux Pane/Global 看板入口；严禁将不可信 Bug 文本拼入 `sendMessage`（user 角色）；草稿按 `(principal, instance, bugId, kind)` + 单调版本保存；主工具序列化结果 `<= 1 MiB`。
 6. 版本降级与凭据保护：启动探测 `/rest/version` 与认证身份接口，优先 Header 认证，绝不将 API Key 泄漏进日志、链路追踪、URL 重定向或模型上下文。
 

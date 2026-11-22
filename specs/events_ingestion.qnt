@@ -1,20 +1,38 @@
-// Formal C0 State Machine: Synthetic Event Ingestion, Safe Prefix & Delivery Watermark
-// Maps to specs/architecture-and-contracts.md Section 4.3
+// C0 model for one Events subscription. Time is measured in abstract seconds.
+// Models the event selection, scan, and delivery rules in Sections 3.4, 4.2, and 4.4.
 module events_ingestion {
   val LAG_BOUND = 2
-  val MAX_TIME = 6
+  val MAX_TIME = 12
+  // The first attempt is not a retry.
   val MAX_RETRIES = 2
 
   type Visibility =
     | Visible
     | Restricted
 
+  type Provenance =
+    | ConfirmedSelf
+    | Human
+    | Uncertain
+
+  type Severity =
+    | Critical
+    | Normal
+
+  type ScanResult =
+    | NotScanned
+    | Idle
+    | Complete
+    | Incomplete
+    | AuthorizationRevoked
+
   type UpstreamEvent = {
     id: int,
     commitTs: int,
-    visibleAt: int,       // commitTs <= visibleAt <= commitTs + LAG_BOUND
+    visibleAt: int,
     visibility: Visibility,
-    isSelfWrite: bool,
+    provenance: Provenance,
+    severity: Severity,
   }
 
   type DeliveryState =
@@ -23,28 +41,51 @@ module events_ingestion {
     | Suppressed
     | Abandoned
 
+  type Outcome =
+    | Accepted
+    | Timeout
+    | HttpFailure
+    | Interrupted
+    | Gone410
+    | TooLarge413
+
+  type Delivery = {
+    state: DeliveryState,
+    attempts: int,
+    eligibleAt: int,
+    lastSendAt: int,
+    lastSendNotBefore: int,
+    sentWhileRestricted: bool,
+  }
+
   var now: int
   var nextEventId: int
   var upstream: int -> UpstreamEvent
-  var lastCompleteScanEnd: int   // last wall-clock time at which a full scan completed
-  var safePrefix: int            // guaranteed complete prefix <= lastCompleteScanEnd - LAG_BOUND
-  var delivery: int -> DeliveryState
-  var retries: int -> int
+  var lastCompleteScanEnd: int
+  var safePrefix: int
+  var scanResult: ScanResult
+  var delivery: int -> Delivery
   var clientWatermark: int
-  var gapDeclared: bool
-  var leakedRestricted: bool
+  var reportedGaps: Set[int]
+  var subscription: { authorized: bool, includeSelf: bool, criticalOnly: bool }
 
-  action init = all {
+  action initWith(includeSelf: bool, criticalOnly: bool): bool = all {
     now' = 2,
     nextEventId' = 1,
     upstream' = Map(),
     lastCompleteScanEnd' = 2,
     safePrefix' = 0,
+    scanResult' = NotScanned,
     delivery' = Map(),
-    retries' = Map(),
     clientWatermark' = 0,
-    gapDeclared' = false,
-    leakedRestricted' = false,
+    reportedGaps' = Set(),
+    subscription' = { authorized: true, includeSelf: includeSelf, criticalOnly: criticalOnly },
+  }
+
+  action init = {
+    nondet includeSelf = oneOf(Set(true, false))
+    nondet criticalOnly = oneOf(Set(true, false))
+    initWith(includeSelf, criticalOnly)
   }
 
   // Environment: wall clock advances
@@ -55,15 +96,15 @@ module events_ingestion {
     upstream' = upstream,
     lastCompleteScanEnd' = lastCompleteScanEnd,
     safePrefix' = safePrefix,
+    scanResult' = scanResult,
     delivery' = delivery,
-    retries' = retries,
     clientWatermark' = clientWatermark,
-    gapDeclared' = gapDeclared,
-    leakedRestricted' = leakedRestricted,
+    reportedGaps' = reportedGaps,
+    subscription' = subscription,
   }
 
-  // Environment: Bugzilla commits a change at commitTs=now, becoming visible at now..now+LAG_BOUND
-  action upstreamCommit(lag: int, selfWrite: bool): bool = all {
+  // Bugzilla can expose a committed change up to LAG_BOUND seconds later.
+  action upstreamCommit(lag: int, provenance: Provenance, severity: Severity): bool = all {
     nextEventId <= 5,
     lag >= 0 and lag <= LAG_BOUND,
     upstream' = upstream.put(nextEventId, {
@@ -71,101 +112,141 @@ module events_ingestion {
       commitTs: now,
       visibleAt: now + lag,
       visibility: Visible,
-      isSelfWrite: selfWrite,
+      provenance: provenance,
+      severity: severity,
     }),
     nextEventId' = nextEventId + 1,
     now' = now,
     lastCompleteScanEnd' = lastCompleteScanEnd,
     safePrefix' = safePrefix,
+    scanResult' = scanResult,
     delivery' = delivery,
-    retries' = retries,
     clientWatermark' = clientWatermark,
-    gapDeclared' = gapDeclared,
-    leakedRestricted' = leakedRestricted,
+    reportedGaps' = reportedGaps,
+    subscription' = subscription,
   }
 
-  // Environment: Bug moves into a security group after commit/queueing
   action restrictEvent(eid: int): bool = all {
     upstream.keys().contains(eid),
-    val ev = upstream.get(eid)
-    upstream' = upstream.put(eid, { ...ev, visibility: Restricted }),
+    {
+      val ev = upstream.get(eid)
+      all {
+        ev.visibility == Visible,
+        upstream' = upstream.put(eid, { ...ev, visibility: Restricted }),
+      }
+    },
     now' = now,
     nextEventId' = nextEventId,
     lastCompleteScanEnd' = lastCompleteScanEnd,
     safePrefix' = safePrefix,
+    scanResult' = scanResult,
     delivery' = delivery,
-    retries' = retries,
     clientWatermark' = clientWatermark,
-    gapDeclared' = gapDeclared,
-    leakedRestricted' = leakedRestricted,
+    reportedGaps' = reportedGaps,
+    subscription' = subscription,
   }
 
-  // Incomplete scan: fails mid-pagination; MUST NOT advance safePrefix or clientWatermark
   action incompleteScan = all {
+    subscription.authorized,
     now' = now,
     nextEventId' = nextEventId,
     upstream' = upstream,
     lastCompleteScanEnd' = lastCompleteScanEnd,
     safePrefix' = safePrefix,
+    scanResult' = Incomplete,
     delivery' = delivery,
-    retries' = retries,
     clientWatermark' = clientWatermark,
-    gapDeclared' = gapDeclared,
-    leakedRestricted' = leakedRestricted,
+    reportedGaps' = reportedGaps,
+    subscription' = subscription,
   }
 
-  // Complete bounded-lag scan: discovers all currently visible, non-self events and advances safePrefix safely
+  action revokeSubscription = all {
+    subscription.authorized,
+    now' = now,
+    nextEventId' = nextEventId,
+    upstream' = upstream,
+    lastCompleteScanEnd' = lastCompleteScanEnd,
+    safePrefix' = safePrefix,
+    scanResult' = AuthorizationRevoked,
+    delivery' = delivery,
+    clientWatermark' = clientWatermark,
+    reportedGaps' = reportedGaps,
+    subscription' = { ...subscription, authorized: false },
+  }
+
+  action restart = all {
+    now' = now,
+    nextEventId' = nextEventId,
+    upstream' = upstream,
+    lastCompleteScanEnd' = lastCompleteScanEnd,
+    safePrefix' = safePrefix,
+    scanResult' = if (subscription.authorized) NotScanned else AuthorizationRevoked,
+    delivery' = delivery,
+    clientWatermark' = clientWatermark,
+    reportedGaps' = reportedGaps,
+    subscription' = subscription,
+  }
+
+  def matches(ev: UpstreamEvent, includeSelf: bool, criticalOnly: bool): bool =
+    (includeSelf or ev.provenance != ConfirmedSelf) and (not(criticalOnly) or ev.severity == Critical)
+
   action completeScan = {
-    val eligibleIds = upstream.keys().filter(id =>
+    val newSafe = now - LAG_BOUND
+    val discovered = upstream.keys().filter(id =>
       val ev = upstream.get(id)
-      ev.visibleAt <= now and not(ev.isSelfWrite) and not(delivery.keys().contains(id))
+      ev.commitTs <= newSafe and ev.visibleAt <= now
+        and matches(ev, subscription.includeSelf, subscription.criticalOnly)
+        and not(delivery.keys().contains(id))
     )
-    val newSafe = if (now - LAG_BOUND > safePrefix) now - LAG_BOUND else safePrefix
-    val updatedDelivery = eligibleIds.fold(delivery, (acc, id) => acc.put(id, Queued))
-    val updatedRetries = eligibleIds.fold(retries, (acc, id) => acc.put(id, 0))
+    val eligible = discovered.filter(id => upstream.get(id).visibility == Visible)
     all {
+      subscription.authorized,
       lastCompleteScanEnd' = now,
       safePrefix' = newSafe,
-      delivery' = updatedDelivery,
-      retries' = updatedRetries,
+      scanResult' = if (eligible == Set()) Idle else Complete,
+      delivery' = discovered.fold(delivery, (acc, id) => acc.put(id, {
+        state: if (eligible.contains(id)) Queued else Suppressed,
+        attempts: 0,
+        eligibleAt: now,
+        lastSendAt: 0,
+        lastSendNotBefore: 0,
+        sentWhileRestricted: false,
+      })),
       now' = now,
       nextEventId' = nextEventId,
       upstream' = upstream,
       clientWatermark' = clientWatermark,
-      gapDeclared' = gapDeclared,
-      leakedRestricted' = leakedRestricted,
+      reportedGaps' = reportedGaps,
+      subscription' = subscription,
     }
   }
 
-  // Webhook delivery attempt with per-occurrence re-authorization before release
-  action attemptDelivery(eid: int, outcome: str): bool = all {
+  def backoff(attempts: int): int = if (attempts > 4) 10 else 2 ^ (attempts - 1)
+
+  action attemptDelivery(eid: int, outcome: Outcome): bool = all {
     delivery.keys().contains(eid),
-    delivery.get(eid) == Queued,
-    val ev = upstream.get(eid)
-    if (ev.visibility == Restricted) {
-      // Fail closed: re-auth caught visibility change before send
+    {
+      val record = delivery.get(eid)
+      val visible = subscription.authorized and upstream.get(eid).visibility == Visible
       all {
-        delivery' = delivery.put(eid, Suppressed),
-        retries' = retries,
-        leakedRestricted' = leakedRestricted,
-      }
-    } else if (outcome == "ack") {
-      all {
-        delivery' = delivery.put(eid, Acked),
-        retries' = retries,
-        leakedRestricted' = leakedRestricted,
-      }
-    } else if (outcome == "terminal413" or retries.get(eid) + 1 >= MAX_RETRIES) {
-      all {
-        delivery' = delivery.put(eid, Abandoned),
-        retries' = retries.put(eid, retries.get(eid) + 1),
-        leakedRestricted' = leakedRestricted,
-      }
-    } else {
-      all {
-        delivery' = delivery,
-        retries' = retries.put(eid, retries.get(eid) + 1),
-        leakedRestricted' = leakedRestricted,
+        record.state == Queued,
+        now >= record.eligibleAt,
+        if (not(visible)) {
+          delivery' = delivery.put(eid, { ...record, state: Suppressed })
+        } else {
+          val attempts = record.attempts + 1
+          val nextState = if (outcome == Accepted) Acked
+            else if (outcome == Gone410 or outcome == TooLarge413 or attempts == 1 + MAX_RETRIES) Abandoned
+            else Queued
+          delivery' = delivery.put(eid, {
+            state: nextState,
+            attempts: attempts,
+            eligibleAt: now + backoff(attempts),
+            lastSendAt: now,
+            lastSendNotBefore: record.eligibleAt,
+            sentWhileRestricted: record.sentWhileRestricted or not(visible),
+          })
+        },
       }
     },
     now' = now,
@@ -173,74 +254,180 @@ module events_ingestion {
     upstream' = upstream,
     lastCompleteScanEnd' = lastCompleteScanEnd,
     safePrefix' = safePrefix,
+    scanResult' = scanResult,
     clientWatermark' = clientWatermark,
-    gapDeclared' = gapDeclared,
+    reportedGaps' = reportedGaps,
+    subscription' = subscription,
   }
 
-  // Advance clientWatermark only if NO Queued event <= target, and if any Abandoned <= target then MUST declare durable gap
-  action advanceWatermark = {
+  // A recovery response or an acknowledged gap envelope can advance past a lost delivery.
+  action advanceWatermark(reportGap: bool): bool = {
     val target = safePrefix
     val hasQueuedInPrefix = delivery.keys().exists(id =>
-      upstream.get(id).commitTs <= target and delivery.get(id) == Queued
+      upstream.get(id).commitTs <= target and delivery.get(id).state == Queued
     )
-    val hasAbandonedInPrefix = delivery.keys().exists(id =>
-      upstream.get(id).commitTs <= target and delivery.get(id) == Abandoned
+    val gaps = delivery.keys().filter(id =>
+      upstream.get(id).commitTs <= target and delivery.get(id).state == Abandoned
     )
     all {
+      subscription.authorized,
       target > clientWatermark,
       not(hasQueuedInPrefix),
+      reportGap == (gaps.exclude(reportedGaps) != Set()),
       clientWatermark' = target,
-      gapDeclared' = (gapDeclared or hasAbandonedInPrefix),
+      reportedGaps' = if (reportGap) reportedGaps.union(gaps) else reportedGaps,
       now' = now,
       nextEventId' = nextEventId,
       upstream' = upstream,
       lastCompleteScanEnd' = lastCompleteScanEnd,
       safePrefix' = safePrefix,
+      scanResult' = scanResult,
       delivery' = delivery,
-      retries' = retries,
-      leakedRestricted' = leakedRestricted,
+      subscription' = subscription,
     }
   }
 
   action step = any {
     tick,
     nondet lag = oneOf(Set(0, 1, 2))
-    nondet selfW = oneOf(Set(true, false))
-    upstreamCommit(lag, selfW),
+    nondet provenance = oneOf(Set(ConfirmedSelf, Human, Uncertain))
+    nondet severity = oneOf(Set(Critical, Normal))
+    upstreamCommit(lag, provenance, severity),
     nondet eid = oneOf(Set(1, 2, 3, 4, 5))
     restrictEvent(eid),
     incompleteScan,
     completeScan,
+    revokeSubscription,
+    restart,
     nondet eid = oneOf(Set(1, 2, 3, 4, 5))
-    nondet out = oneOf(Set("ack", "transient", "terminal413"))
+    nondet out = oneOf(Set(Accepted, Timeout, HttpFailure, Interrupted, Gone410, TooLarge413))
     attemptDelivery(eid, out),
-    advanceWatermark,
+    nondet report = oneOf(Set(true, false))
+    advanceWatermark(report),
   }
 
   // Safety Invariants
   val safePrefixBounded =
     safePrefix <= now - LAG_BOUND and safePrefix <= lastCompleteScanEnd - LAG_BOUND
 
-  val noLeakedRestrictedEvent = not(leakedRestricted)
+  val boundedAuthorizedAttempts = delivery.keys().forall(id =>
+    val record = delivery.get(id)
+    record.attempts <= 1 + MAX_RETRIES
+      and not(record.sentWhileRestricted)
+      and record.lastSendAt >= record.lastSendNotBefore
+      and (record.state == Queued implies record.attempts < 1 + MAX_RETRIES)
+  )
 
-  // Core Watermark Completeness Invariant:
-  // Every non-self event committed at or before clientWatermark is either Acked, Suppressed (restricted),
-  // or covered by an explicit durable gapDeclared signal — NEVER silently skipped!
+  val queuedFromVerifiedHistory = delivery.keys().forall(id =>
+    val ev = upstream.get(id)
+    ev.commitTs <= safePrefix and matches(ev, subscription.includeSelf, subscription.criticalOnly)
+  )
+
+  // A cursor covers acknowledgements, restricted events, and explicitly reported losses.
   val noSilentSkipBeforeWatermark =
-    upstream.keys().forall(id =>
+    clientWatermark <= safePrefix and upstream.keys().forall(id =>
       val ev = upstream.get(id)
-      (ev.commitTs <= clientWatermark and not(ev.isSelfWrite)) implies (
+      (ev.commitTs <= clientWatermark
+        and matches(ev, subscription.includeSelf, subscription.criticalOnly)) implies (
         delivery.keys().contains(id) and (
-          delivery.get(id) == Acked
-          or delivery.get(id) == Suppressed
-          or (delivery.get(id) == Abandoned and gapDeclared)
+          delivery.get(id).state == Acked
+          or (delivery.get(id).state == Suppressed and ev.visibility == Restricted)
+          or (delivery.get(id).state == Abandoned and reportedGaps.contains(id))
         )
       )
     )
 
   val allSafetyInvariants = and {
     safePrefixBounded,
-    noLeakedRestrictedEvent,
+    boundedAuthorizedAttempts,
+    queuedFromVerifiedHistory,
     noSilentSkipBeforeWatermark,
   }
+
+  // Deterministic traces for the C0 model, not tests of the HTTP implementation.
+  run scanRecoveryTest = initWith(false, true)
+    .then(upstreamCommit(2, Human, Critical))
+    .then(tick).then(tick)
+    .then(incompleteScan)
+    .expect(scanResult == Incomplete and safePrefix == 0 and clientWatermark == 0
+      and delivery.keys() == Set() and reportedGaps == Set())
+    .then(completeScan)
+    .expect(scanResult == Complete and safePrefix == 2 and delivery.get(1).state == Queued)
+    .then(attemptDelivery(1, Accepted))
+    .then(advanceWatermark(false))
+    .then(tick)
+    .then(completeScan)
+    .then(advanceWatermark(false))
+    .expect(scanResult == Idle and clientWatermark == 3 and reportedGaps == Set())
+
+  run retryRestartTest = initWith(false, false)
+    .then(upstreamCommit(0, Human, Normal))
+    .then(tick).then(tick)
+    .then(completeScan)
+    .then(attemptDelivery(1, Timeout))
+    .then(restart)
+    .expect(delivery.get(1).attempts == 1 and delivery.get(1).eligibleAt == 5
+      and delivery.get(1).state == Queued and clientWatermark == 0)
+    .then(tick)
+    .then(attemptDelivery(1, Interrupted))
+    .then(restart)
+    .expect(delivery.get(1).attempts == 2 and delivery.get(1).eligibleAt == 7)
+    .then(tick).then(tick)
+    .then(attemptDelivery(1, HttpFailure))
+    .then(restart)
+    .expect(delivery.get(1).attempts == 3 and delivery.get(1).state == Abandoned
+      and clientWatermark == 0 and reportedGaps == Set())
+    .then(advanceWatermark(true))
+    .expect(reportedGaps == Set(1) and clientWatermark == 2 and allSafetyInvariants)
+
+  run terminalResponsesTest = initWith(false, false)
+    .then(upstreamCommit(0, Human, Normal))
+    .then(upstreamCommit(0, Human, Normal))
+    .then(tick).then(tick)
+    .then(completeScan)
+    .then(attemptDelivery(1, Gone410))
+    .then(attemptDelivery(2, TooLarge413))
+    .expect(subscription.authorized and delivery.get(1).state == Abandoned
+      and delivery.get(2).state == Abandoned and delivery.get(1).attempts == 1
+      and delivery.get(2).attempts == 1)
+    .then(advanceWatermark(true))
+    .expect(reportedGaps == Set(1, 2) and clientWatermark == 2)
+
+  run revocationBeforeRetryTest = initWith(false, false)
+    .then(upstreamCommit(0, Human, Critical))
+    .then(upstreamCommit(0, Human, Critical))
+    .then(tick).then(tick)
+    .then(completeScan)
+    .then(attemptDelivery(1, Timeout))
+    .then(attemptDelivery(2, Timeout))
+    .then(tick)
+    .then(restrictEvent(1))
+    .then(attemptDelivery(1, Accepted))
+    .then(revokeSubscription)
+    .then(restart)
+    .then(attemptDelivery(2, Accepted))
+    .expect(scanResult == AuthorizationRevoked
+      and delivery.get(1).state == Suppressed and delivery.get(2).state == Suppressed
+      and delivery.get(1).attempts == 1 and delivery.get(2).attempts == 1
+      and reportedGaps == Set() and boundedAuthorizedAttempts)
+
+  run sameSecondSelectionTest = initWith(false, true)
+    .then(upstreamCommit(0, ConfirmedSelf, Critical))
+    .then(upstreamCommit(0, Human, Critical))
+    .then(upstreamCommit(0, Human, Normal))
+    .then(upstreamCommit(0, Uncertain, Critical))
+    .then(tick).then(tick)
+    .then(completeScan)
+    .expect(delivery.keys() == Set(2, 4))
+    .then(attemptDelivery(2, Accepted))
+    .then(attemptDelivery(4, Accepted))
+    .then(advanceWatermark(false))
+    .expect(clientWatermark == 2 and allSafetyInvariants)
+
+  run includeSelfSelectionTest = initWith(true, true)
+    .then(upstreamCommit(0, ConfirmedSelf, Critical))
+    .then(upstreamCommit(0, ConfirmedSelf, Normal))
+    .then(tick).then(tick)
+    .then(completeScan)
+    .expect(delivery.keys() == Set(1) and allSafetyInvariants)
 }

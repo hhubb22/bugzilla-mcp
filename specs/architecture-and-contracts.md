@@ -1,4 +1,4 @@
-# Bugzilla Frontier MCP Server: 架构与契约规范（C0 Frozen）
+# Bugzilla Frontier MCP Server: 架构与契约规范
 
 > 上游基线：[brief.md](./brief.md) · 鉴权与绑定细化：[auth-and-binding-flow.md](./auth-and-binding-flow.md) · MCP App 交互设计：[mcp-app-ux-design.md](./mcp-app-ux-design.md)
 > 技术栈：TypeScript + Bun (1.3+ Workspaces & `bun:sqlite`) + VoidZero (`vite-plus`: Rolldown / Oxlint / Oxfmt / Vitest) · 协议基线：MCP Core `2026-07-28` (+ `2025-11-25` Dual-Era) · SEP-1865 (MCP Apps) · SEP-3415 (MCP Events)
@@ -95,22 +95,25 @@ bugzilla-mcp/
 
 ### 3.4 MCP Events 目录与有界延迟合成模型（SEP-3415 + ChatGPT Dialect）
 
-**Profile 选择**：部署/连接器配置在 `server/discover` 前静态锁定 `eventsProfile: "sep-3415" | "chatgpt-events"`（本地无鉴权端点不广播 `webhook` 交付模式）。
+部署在启动前选择 `eventsProfile: "sep-3415" | "chatgpt-events"`。可声明的能力和交付方式见第 4.3 节。实时推送不在本次交付范围：不声明 `push`，也不接受 `events/stream`。本地仍可用 SEP 的 `poll`。
 
-事件目录（均含严格 `inputSchema` + `payloadSchema`，SEP-3415 支持 `["poll", "push", "webhook"]`，ChatGPT Profile 裁剪为 `["webhook"]`）：
-- `bugzilla.bug.created` — `{ product?, component?, severity?, includeSelf?: false }`
-- `bugzilla.bug.updated` — `{ product?, bugIds?, watchedFields?: ["status","assigned_to","priority","flags"], includeSelf?: false }`
-- `bugzilla.bug.commented` — `{ product?, bugIds?, mentionMe?: boolean, includeSelf?: false }`
-- `bugzilla.flag.needinfo` — `{ requestee?: "me" | string, product?, includeSelf?: false }`（映射到经实例验证的 flag 类型变更）
+每个目录项声明 `inputSchema` 和 `payloadSchema`。所有事件的 `includeSelf` 都是可选布尔值，省略时为 `false`。以下条件均为可选，已提供的条件必须同时满足：
+
+| 事件 | 除 `includeSelf` 外支持的条件 |
+| :--- | :--- |
+| `bugzilla.bug.created` | `product`、`component`、`severity`。`severity` 匹配采集该条事件时工单的 `severity`，不是创建时的历史值。重试沿用采集结果。 |
+| `bugzilla.bug.updated` | `product`、`bugIds`、`watchedFields`。`watchedFields` 允许 `status`、`assigned_to`、`priority`、`flags`。 |
+| `bugzilla.bug.commented` | `product`、`bugIds`、`mentionMe`。 |
+| `bugzilla.flag.needinfo` | `product`、`requestee`。`requestee` 接受 `me` 或指定用户。 |
 
 **完整事件发生体（`EventOccurrence`）**：
 - 必填：`eventId`（确定性稳定 ID）、`name`（事件名）、`timestamp`（ISO 8601 UTC）、`data`（符合 `payloadSchema`，单条完整 UTF-8 Webhook 信封 `<= 256 KiB`，用户内容标明不可信）；
-- 游标位置：`poll` 放于结果顶层 `cursor`（不放在单条 occurrence 内）；`push` 与 `webhook` 放于 occurrence 可选 `cursor` 字段；
-- **安全扫描前缀模型**：上游扫描区分“当前墙钟 `now`”与“已验证完整扫描的安全前缀 `safePrefix = min(lastCompleteScanEnd, now - configuredLagWindowMs)`”，通过边界重叠扫描 + 稳定去重避免 Bugzilla 事务提交/shadow DB 延迟导致漏单；不完整扫描绝不推进 `safePrefix`。
+- `poll` 的游标位于结果顶层。Webhook 事件可包含用于恢复的 `cursor`。
+- `safePrefix` 是最新一次完整扫描已验证的连续位置，不晚于该次扫描采用的 `now - configuredLagWindowMs`。扫描必须读取覆盖该位置的所有候选页及所需历史和评论。分页未完成或读取失败不产生新的 `safePrefix`。滞后窗口只覆盖窗口内的上游迟到数据。
 
 ## 4. 核心行为契约（EARS & Parnas 决策表）
 
-> 注：以下为 `C0` 冻结边界规范（仅约束外部可观测行为，不含内部实现细节），每条条款由 `spec_check.py stamp` 生成内容哈希 ID（`[R-xxxxxx]`），作为 `C1` 实现盲验证的唯一追踪锚点。
+> `spec_check.py stamp` 为每条行为生成内容哈希 ID（`[R-xxxxxx]`）。C0 签核后冻结条款，C1 使用这些 ID 追踪外部行为。
 
 ### 4.1 协议双代路由、安全隔离与凭据绑定
 
@@ -157,30 +160,83 @@ bugzilla-mcp/
 - [R-80b183] INVARIANT: `bugzilla_post_analysis` (`Safe-Auto`) SHALL enforce `isPrivate: true` unconditionally; IF the bound Bugzilla user lacks private-comment permission or Bugzilla rejects private visibility, THEN the server SHALL fail closed to `SavedAsInternalNote` and SHALL perform zero public Bugzilla writes.
 - [R-a722be] IF a `Guarded` mutation lacks an authorized policy grant or a valid single-use approval bound to `(approver, instance, proposalId, revision, canonicalDiffHash, baseVersion, visibility, exp)` (server-verified HTTPS approval in cloud mode; host-confirmed in local trusted IDE mode), THEN the server SHALL perform zero upstream mutations.
 - [R-f5dc7f] WHEN a `Guarded` proposal is executed against a Bugzilla instance without atomic CAS, the server SHALL perform a pre-dispatch `last_change_time` check rejecting mismatches with `StaleBugConflict` (returning only currently authorized fields and requiring a new immutable proposal revision to rebase) and SHALL record a post-write diff audit entry on completion.
-- [R-006bf9] WHILE `includeSelf` is `false` (default), the event synthesizer SHALL suppress only occurrences correlated to trusted durable write provenance `(instance, bugId, commentId/diffRecord)` and SHALL preserve eligible human occurrences that merely quote footer text or share a timestamp; independent of caller-supplied `idempotencyKey`, the server SHALL enforce a finite per-bug causal write budget for event-triggered action chains.
+- [R-5d5271] WHEN the server selects an otherwise eligible occurrence, the server SHALL omit it if and only if `includeSelf` is `false` and the same tenant's durable provenance uniquely identifies the occurrence as one of the server's writes.
+- [R-462339] WHERE event-triggered writes are authorized, the server SHALL enforce a finite per-bug causal write budget independent of the caller-supplied `idempotencyKey`.
 
-### 4.3 合成事件游标、重放、Webhook 安全与 MCP App 契约（Parnas 决策表）
+可信归因包括创建时 Bugzilla 返回的工单 ID、评论时返回的评论 ID，以及字段更新时 Bugzilla 确认的字段旧值和新值与历史记录的一对一对应。由同一条历史记录派生的 `needinfo` 事件沿用该记录的归因。不能证明对应关系时，归因为未知。请求意图哈希、账号、工单和时间戳的组合或评论文本都不能单独证明归因。
 
-**前置校验顺序**：① `principal` 鉴权与 `inputSchema` 校验 → ② 游标语法、作用域 `(instance, authView, canonicalFilter)` 与 `schemaEpoch` 校验 → ③ 扫描完整性与重放窗口判定。
+### 4.3 Events 能力声明和订阅
 
-| 游标状态 | 上游扫描完整? | 位于有效重放窗口且满足 `maxAgeMs` 下界? | 合格匹配事件数 vs `maxEvents`（仅 `poll`） | 交付模式 | 可观测结果与安全游标规则 |
-| :--- | :--- | :--- | :--- | :--- | :--- |
-| 畸形或异源作用域 | - | - | - | Any | 返回 `InvalidParams` |
-| 语法有效但 `schemaEpoch` 过期 | - | - | - | Any | 返回 `Unsupported(reason: "schema_changed")` |
-| `null` / 省略 | Yes | - | - | `poll` / `stream` / `webhook` | 零历史回放，锚定当前已提交安全前缀 `safePrefix`，返回非空 `cursor` 与 `truncated: false`（`stream` 先发 `active` 含 `heartbeatMs`） |
-| 有效游标 | No（上游故障/未翻尽） | - | - | Any | 保持上一次已验证安全游标不前推；`poll` 报错或返回未推进状态，`stream` 发可恢复 `error` |
-| 有效游标 | Yes | Yes | `0` | `poll` / `stream` / `webhook` | `poll` 返回空列表 + 推进至 `safePrefix` 的新 `cursor` + `nextPollMs`；`stream` 借 `heartbeat` 推进游标；`webhook` 刷新返回推进游标 |
-| 有效游标 | Yes | Yes | `1..maxEvents`（或流/Webhook 实时） | `poll` / `stream` / `webhook` | 逐条重验可见性后按序交付；`poll` `hasMore: false`, `truncated: false` |
-| 有效游标 | Yes | Yes | `> maxEvents` | `poll` | 返回前 `maxEvents` 条、`hasMore: true`、`truncated: false` 与严格落在当前页尾的中间 `cursor` |
-| 有效游标 | Yes | No（超出窗口或被 `maxAgeMs` 截断） | Any | `poll` / `stream` / `webhook` | 重置至有效窗口下界并显式标示 `truncated: true`（`stream` 发 `active(truncated: true)`；SEP Webhook 发已签名 `gap` 控制帧） |
+HTTP 请求先通过第 4.1 节的路由、会话和鉴权检查，再按下表分发。`startMcpHttpServer` 的 `config.webhookEnabled` 默认 `false`。只能在有身份认证的 HTTP 端点启用。启用要求可用的 HTTPS 发送器、重启可恢复的订阅和投递存储、可取回的当前租户绑定，以及随服务启停的投递循环。项目提供生产用的 HTTPS 发送器和投递循环，部署方不必自写发送器或另启循环。
 
-- [R-08abaf] WHEN `events/poll`, `events/stream`, or `events/subscribe` is called with `cursor: null` (or omitted), the server SHALL return zero historical occurrences and anchor a fresh non-null cursor at the current committed `safePrefix` (never ahead of the configured bounded-lag safety margin).
-- [R-d7d0a2] WHEN an event delivery request carries a cursor, the server SHALL enforce the Section 4.3 Parnas table: rejecting malformed/foreign cursors with `InvalidParams` and obsolete schema epochs with `Unsupported`, keeping the safe resume position at or before the last verified complete scan prefix whenever a scan is incomplete, advancing quiet cursors only to a verified complete `safePrefix`, and emitting every retained eligible occurrence strictly after the cursor boundary with distinct deterministic `eventId` values.
-- [R-f03918] INVARIANT: Before releasing any occurrence on `poll`, `stream`, `webhook`, or webhook retry, the server SHALL verify current visibility under the bound Bugzilla credential and fail closed (suppressing restricted/deleted objects without leaking IDs or counts); IF the credential or subscribed scope is revoked, THEN the server SHALL stop delivery and emit the profile-specific termination signal (`notifications/events/terminated` / `Forbidden` / SEP signed `terminated` envelope, never sending unsupported control envelopes under ChatGPT profile).
+| 配置及前置条件 | 能力与目录 | 禁用方法的结果 |
+| :--- | :--- | :--- |
+| 启用 Webhook，任一条件不满足 | 启动失败，错误 `code: "WebhookConfigurationError"`，不开放 HTTP 端点 | 不适用 |
+| `chatgpt-events`，Webhook 未启用 | 不声明 `capabilities.events` | `events/*` 返回 `-32601` |
+| `chatgpt-events`，Webhook 已启用 | 两代 HTTP 均声明 `capabilities.events`。目录只列 `webhook`。 | `events/poll`、`events/stream` 返回 `-32601` |
+| `sep-3415`，Webhook 未启用 | SEP 协商入口声明 `capabilities.extensions["io.modelcontextprotocol/events"]`。目录只列 `poll`。 | `events/stream`、Webhook 订阅方法返回 `-32026`，`data.reason: "delivery_disabled"` |
+| `sep-3415`，Webhook 已启用 | 同上。目录列 `poll` 和 `webhook`。 | `events/stream` 返回 `-32026`，`data.reason: "delivery_disabled"` |
+
+两个配置都接受 `events/subscribe` 的 `delivery: { mode: "webhook", url, secret }`。取消订阅时，ChatGPT 使用 `delivery: { mode: "webhook", url }`，SEP 使用 `delivery: { url }`。客户端不传订阅 `id`。现代 HTTP 成功结果包含 `resultType: "complete"`，旧版成功结果不含 `resultType`。
+
+- [R-48f15c] WHEN the operator starts the HTTP server, the server SHALL enforce the Section 4.3 readiness table and, on a successful Webhook-enabled start, SHALL verify subscriptions and deliver eligible events without an additional operator command.
+- [R-9b9b89] WHERE `chatgpt-events` is enabled on authenticated HTTP, the server SHALL support `events/list`, `events/subscribe`, and `events/unsubscribe` on both the negotiated `2025-11-25` session and the stateless `2026-07-28` route, with the same tenant-scoped behavior and the result envelope for each revision.
+- [R-e3c811] WHEN a validly routed request uses a disabled Events method, the server SHALL return the outcome in the Section 4.3 readiness table and SHALL perform no scan, callback, or subscription change.
+- [R-0986c6] WHEN `events/list` describes an event, the server SHALL declare the per-event arguments in Section 3.4 with `additionalProperties: false`, and every enabled delivery method SHALL reject unknown or ill-typed arguments with `-32602` before scanning or changing a subscription.
+- [R-8f1277] WHILE a `bugzilla.bug.created` request specifies `severity`, the server SHALL deliver every otherwise eligible occurrence whose Bugzilla severity at collection exactly equals the requested value and none whose severity differs or is unavailable.
+- [R-0b14d8] WHERE the HTTP triage connector is configured with `config.readOnly: true`, the server SHALL continue to serve authorized reads, list only read tools, and reject direct calls to mutating tools with `-32602` before any side effect.
+
+`readOnly` 默认 `false`。实际宿主验收使用启用 `readOnly` 的连接，不依赖提示词约束写入。未启用该选项的连接仍遵循第 4.2 节。
+
+### 4.4 扫描、重放与 Webhook 投递
+
+按以下顺序判断：先验鉴权和入参，再验游标的租户、可见范围、事件名、规范化参数与 `schemaEpoch`。新一轮重放的下界不早于服务端保留窗口和 `now - maxAgeMs`（如有）。重验当前事件可见性后才计算返回的合格事件。
+
+| 游标与扫描状态（按顺序匹配） | `events/poll` | Webhook 订阅或刷新 |
+| :--- | :--- | :--- |
+| 游标畸形或作用域不匹配 | `InvalidParams` | 同左 |
+| 游标的 `schemaEpoch` 已过期 | `Unsupported`，`data.reason: "schema_changed"` | 同左 |
+| 刷新同一个仍有效的 Webhook 订阅 | 不适用 | 返回下文定义的安全游标和缺口状态。刷新本身不重扫、不重置待投递状态，也不按 `maxAgeMs` 丢弃待投递项。 |
+| 游标为 `null` 或省略，已有可用的 `safePrefix` | 锚定 `safePrefix`。`events: []`、`hasMore: false`、`truncated: false`。 | 新订阅从 `safePrefix` 开始，返回该游标和 `truncated: false`。 |
+| 用于这次求取新位置的扫描未完成 | JSON-RPC `-32603`，`data.reason: "scan_incomplete"`。无结果或新游标。 | 新订阅返回同样的错误，不建立订阅。 |
+| 完整扫描，且有效游标不早于重放下界 | 批次按位置排序。还有合格项时返回 `maxEvents` 条、页尾游标、`hasMore: true`；否则返回所有合格项（可为空）、`safePrefix` 游标、`hasMore: false`。`truncated: false`。 | 补送游标后的合格事件。返回安全游标和 `truncated: false`。 |
+| 完整扫描，且有效游标早于重放下界 | 从下界开始，继续遵循批次规则。`truncated: true`。 | 从可重放的下界补送，返回恢复游标和 `truncated: true`。 |
+
+首次请求没有可用的 `safePrefix` 时，先扫描再锚定。扫描故障消除后，客户端可用原游标继续。已独立确认可交付的 Webhook 项仍可投递，不依赖失败的扫描。运维状态按授权和扫描的优先顺序报告：`authorization_revoked`、`scan_incomplete`、完整扫描无合格项时的 `idle`，或有合格项时的 `active`。
+
+- [R-1006f2] WHEN `events/poll` or `events/subscribe` receives `cursor: null` or no cursor, the server SHALL return the initial-anchor or refresh outcome in the Section 4.4 cursor table without replaying before the new subscription's `safePrefix`.
+- [R-c83005] WHEN an Events request supplies a non-null cursor, the server SHALL enforce the Section 4.4 cursor table and, for a poll or new replay, select every retained eligible occurrence after the effective boundary with a stable, distinct `eventId`.
+- [R-a36d59] IF the scan required by `events/poll` cannot establish a complete prefix, THEN the server SHALL return `-32603` with `data.reason: "scan_incomplete"` and no partial batch or replacement cursor.
+- [R-39bcf8] IF a Webhook scan cannot establish a complete prefix, THEN the failed scan SHALL neither advance acquisition nor create a history gap, and a later complete scan SHALL resume from the previous verified position.
+- [R-e4efb3] WHEN a Webhook subscription is first evaluated or changes scan or authorization state, the server SHALL emit an operator log record with `event: "mcp.events.scan"`, the opaque `subscriptionId`, and `state: "idle" | "active" | "scan_incomplete" | "authorization_revoked"` without credentials, callback addresses, or bug data.
+- [R-cad0d6] INVARIANT: Before releasing any occurrence on `poll` or Webhook, including retry, the server SHALL verify current visibility under the tenant's bound Bugzilla credential, suppress restricted or deleted data without leaking identifiers or counts, and stop delivery on credential or scope revocation with `Forbidden` for poll or refresh and a signed `terminated` envelope only for SEP Webhook.
 - [R-28f5c2] INVARIANT: On every outbound webhook HTTP connection (initial verification challenge, event delivery, retry, and control envelope), the server SHALL enforce HTTPS, connection-time validation of all normalized resolved IPs (blocking non-public/IPv4-mapped private addresses), IP-pinned dialing with preserved `Host` and TLS SNI, and disabled redirects.
-- [R-82de80] WHEN delivering webhook events under SEP-3415 profile, the server SHALL generate a unique high-entropy `webhook-id` independent of `eventId` (reused across retries with refreshed `webhook-timestamp` and `v1,` HMAC-SHA256 over `webhook-id.webhook-timestamp.rawBody`), include `X-MCP-Subscription-Id`, cap serialized UTF-8 envelopes at `<= 256 KiB`, stop retrying on `410` or `413`, and hold the safe client watermark behind unresolved deliveries or persist an explicit `gap`/`truncated: true` signal across restarts.
-- [R-cd4f75] WHERE `eventsProfile: "chatgpt-events"` is configured before discovery, the server SHALL advertise top-level `capabilities.events`, restrict `delivery` to `["webhook"]`, set `webhook-id = eventId`, accept `delivery.mode: "webhook"` with idempotent empty `{}` on `events/unsubscribe`, return `-32015` on callback failure, and expose lost-history recovery via `truncated: true` on refresh without sending unsupported `gap`/`terminated` bodies.
-- [R-81d5f2] WHEN the same authenticated principal refreshes a webhook subscription with canonical-JSON-equivalent `arguments`, the server SHALL preserve one subscription identity, dual-sign during secret rotation windows, and persist long-lived/no-expiry grants and verification status across restarts.
+
+| 已到发送时间时的结果（按顺序匹配） | 当前投递的结果 |
+| :--- | :--- |
+| 当前工单或评论不可见 | 不发事件，不标记缺口。订阅授权撤销时停止该订阅的所有事件投递。 |
+| 回调返回 `2xx` | 确认收件，不再发送该投递。 |
+| 回调返回 `410` 或 `413` | 结束该投递，不再重试。不取消订阅。 |
+| 超时、网络错误、进程中断导致结果未知，或其余非 `2xx`，仍有额度 | 等待持久保存的退避时间，保留相同消息 ID。 |
+| 同上，额度耗尽 | 结束该投递，并持久记录缺口。 |
+
+`maxWebhookRetries` 为非负整数，默认 `3`，不含首次发送。已开始但结果未知的尝试占用一次额度。第 `k` 次重试最早在前次失败后 `min(10000, 1000 * 2**(k-1))` 毫秒发送。调度可以更晚。服务重启和同一订阅的刷新不重置尝试次数、最早重试时间或消息 ID。新匹配事件按事件位置安排首次发送，不保证实际抵达顺序。
+
+`410`、`413` 或预算耗尽结束的是该订阅下的自动投递，不删除 Bugzilla 源记录。订阅再也不能补送时记录缺口。普通事件附带的游标不得越过未确认的投递或尚未告知客户端的缺口。SEP 在两次刷新之间发送带新游标的签名 `gap`；未获确认时，仍可在刷新中报告。ChatGPT 只在刷新中报告 `truncated: true` 和恢复游标。带旧游标刷新时，只要恢复游标越过缺口，响应就必须标记缺口，不能因重启或刷新响应丢失而省略。恢复游标不能跨过其他待投递项。
+
+Webhook 使用 `Content-Type: application/json`。首次验证请求为 `{"type":"verification","challenge":"<nonce>"}`，成功回调以 `{"challenge":"<nonce>"}` 应答。验证使用唯一的消息 ID 和一次性 challenge。
+
+- [R-cae32c] WHEN an authorized subscription targets a callback not yet verified for that tenant, the server SHALL send a fresh signed verification challenge and activate delivery only after the callback returns `2xx` and the JSON `challenge` matches exactly.
+- [R-cebf76] WHEN a Webhook attempt completes or is interrupted, the server SHALL enforce the Section 4.4 delivery table and its retry deadlines and budget across restart and refresh.
+- [R-836a57] WHEN a Webhook response or event exposes a resumable cursor, the server SHALL enforce the Section 4.4 watermark and gap rules without silently advancing past a pending or abandoned delivery.
+- [R-79300a] WHEN sending a Webhook envelope, the server SHALL cap the UTF-8 body at `256 KiB`, include `X-MCP-Subscription-Id`, and sign `webhook-id.webhook-timestamp.rawBody` with Standard Webhooks `v1,` HMAC-SHA256 using the same `webhook-id` and a current timestamp on retry.
+- [R-100db5] WHERE SEP Webhook is enabled, the server SHALL use an independent high-entropy `webhook-id` for each event delivery and return `-32027` when callback verification fails.
+- [R-3be334] WHERE ChatGPT Webhook is enabled, the server SHALL use `webhook-id = eventId` for event delivery and return `-32015` when callback verification fails, without sending `gap` or `terminated` bodies.
+- [R-81b530] WHEN a principal refreshes a subscription using the same callback URL, event name, and canonical arguments, the server SHALL retain that tenant's subscription identity, dual-sign during the secret rotation window, and preserve granted lifetimes and verification status across restarts.
+- [R-9f1561] WHEN a principal calls `events/unsubscribe` with the original name, canonical arguments, and callback URL, the server SHALL stop further sends for only that principal's matching subscription and return an idempotent success (`{}` in legacy or `{"resultType":"complete"}` in modern HTTP).
+
+### 4.5 MCP App 契约
+
 - [R-3d5465] WHEN rendering Bugzilla text or invoking `app.sendMessage()` / `app.updateModelContext()` in the MCP App, the UI SHALL render Bugzilla fields as inert data (preventing XSS) and SHALL exclude untrusted Bugzilla titles, comments, filenames, and conflict snapshots from user-role `sendMessage` instruction text.
 - [R-316609] WHEN `app_save_draft` acknowledges a revision for `(principal, instance, bugId, draftKind)`, the server SHALL persist that acknowledged revision across view replacement and restart and SHALL reject older `draftRevision` writes from overwriting it.
 
