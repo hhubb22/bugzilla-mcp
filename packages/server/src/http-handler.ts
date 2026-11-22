@@ -1,11 +1,11 @@
 import { randomUUID, timingSafeEqual } from "node:crypto";
 import {
-  EventFilterArgsSchema,
   EventNameSchema,
   MCP_PROTOCOL_LEGACY,
   MCP_PROTOCOL_MODERN,
   McpErrorCode,
   PollEventsParamsSchema,
+  parseEventFilters,
   RESERVED_LEGACY_ISSUER,
   WebhookSubscribeParamsSchema,
   type ClientCapabilities,
@@ -17,6 +17,7 @@ import {
   createWriteGuardService,
   McpDomainError,
   sha256Hex,
+  type SyntheticEventsService,
 } from "@bugzilla-mcp/core";
 import { createApprovalPageManager } from "./approval-page.js";
 import { createBindingManager } from "./binding.js";
@@ -113,9 +114,34 @@ function validatePrimitiveMirror(rawHeader: string | undefined, value: unknown):
   return false;
 }
 
-export function buildDualEraHttpHandler(config: HttpServerConfig): DualEraMcpHandler {
+export function buildDualEraHttpHandler(
+  config: HttpServerConfig,
+  events?: SyntheticEventsService,
+): DualEraMcpHandler {
   const writeGuard = createWriteGuardService(config.core);
-  const eventsService = createSyntheticEventsService(config.core);
+  // The HTTP runtime always passes an explicit readiness decision. Embedded handlers
+  // retain support for a host that already supplies and manages its own transport.
+  const webhookEnabled = config.webhookEnabled ?? Boolean(config.core.webhookTransport);
+  const chatgpt = config.eventsProfile === "chatgpt-events";
+  const eventsService =
+    events ??
+    createSyntheticEventsService({
+      ...config.core,
+      eventsProfile: config.eventsProfile,
+      webhookEnabled,
+    });
+  const eventsCapabilities = chatgpt
+    ? webhookEnabled
+      ? { events: {} }
+      : {}
+    : { extensions: { "io.modelcontextprotocol/events": { listChanged: false } } };
+  const tools = buildFullToolCatalog(config.headerRoutedParams);
+  const mutatingTools = new Set(
+    tools.filter((tool) => !tool.annotations.readOnlyHint).map((tool) => tool.name),
+  );
+  const listedTools = config.readOnly
+    ? tools.filter((tool) => tool.annotations.readOnlyHint)
+    : tools;
   const binding = createBindingManager(config);
   const approvalPage = createApprovalPageManager(config);
   const legacySessions = new Map<
@@ -137,6 +163,118 @@ export function buildDualEraHttpHandler(config: HttpServerConfig): DualEraMcpHan
       },
       body: JSON.stringify({ error: "insufficient_scope", requiredScope }),
     };
+  }
+
+  function rejectMutation(rpc: JsonRpcRequest): DualEraHttpResponse | undefined {
+    const name = rpc.params?.name;
+    if (
+      config.readOnly &&
+      rpc.method === "tools/call" &&
+      typeof name === "string" &&
+      mutatingTools.has(name)
+    ) {
+      return rpcErrorResponse(
+        200,
+        rpc.id,
+        McpErrorCode.INVALID_PARAMS,
+        "HTTP connector is read-only",
+      );
+    }
+  }
+
+  function missingScope(rpc: JsonRpcRequest, scope: string): DualEraHttpResponse {
+    if (rpc.method === "events/poll" || rpc.method === "events/subscribe") {
+      return rpcErrorResponse(
+        200,
+        rpc.id,
+        McpErrorCode.SEP_EVENTS_FORBIDDEN,
+        "Events access revoked",
+      );
+    }
+    return insufficientScopeResponse(scope);
+  }
+
+  async function handleEvents(
+    rpc: JsonRpcRequest,
+    ctx: PrincipalContext,
+    legacy: boolean,
+  ): Promise<DualEraHttpResponse> {
+    const success = (fields: object) =>
+      jsonResponse(200, {
+        jsonrpc: "2.0",
+        id: rpc.id,
+        result: legacy ? fields : { resultType: "complete", ...fields },
+      });
+    const invalid = () =>
+      rpcErrorResponse(200, rpc.id, McpErrorCode.INVALID_PARAMS, "Invalid Events parameters");
+
+    if (
+      (chatgpt && (!webhookEnabled || rpc.method === "events/poll")) ||
+      (chatgpt && rpc.method === "events/stream")
+    ) {
+      return rpcErrorResponse(200, rpc.id, McpErrorCode.METHOD_NOT_FOUND, "Unknown Events method");
+    }
+    if (
+      rpc.method === "events/stream" ||
+      (!webhookEnabled &&
+        (rpc.method === "events/subscribe" || rpc.method === "events/unsubscribe"))
+    ) {
+      return rpcErrorResponse(
+        200,
+        rpc.id,
+        McpErrorCode.SEP_EVENTS_UNSUPPORTED,
+        "Delivery disabled",
+        {
+          reason: "delivery_disabled",
+        },
+      );
+    }
+    if (rpc.method === "events/list") return success({ events: eventsService.listEvents().events });
+
+    const params = rpc.params ?? {};
+    const name = EventNameSchema.safeParse(params.name);
+    if (!name.success) return invalid();
+    const filters = parseEventFilters(name.data, params.arguments);
+    if (!filters.success) return invalid();
+    try {
+      if (rpc.method === "events/poll") {
+        const parsed = PollEventsParamsSchema.safeParse({ ...params, arguments: filters.data });
+        if (!parsed.success) return invalid();
+        const { resultType: _complete, ...fields } = await eventsService.poll(ctx, parsed.data);
+        return success(fields);
+      }
+      if (rpc.method === "events/subscribe") {
+        const parsed = WebhookSubscribeParamsSchema.safeParse({
+          ...params,
+          arguments: filters.data,
+        });
+        if (!parsed.success || "id" in params) return invalid();
+        const { resultType: _complete, ...fields } = await eventsService.subscribeWebhook(
+          ctx,
+          parsed.data,
+        );
+        return success(fields);
+      }
+      if (rpc.method === "events/unsubscribe") {
+        const schema = WebhookSubscribeParamsSchema.shape.delivery;
+        const delivery = (chatgpt ? schema.omit({ secret: true }) : schema.pick({ url: true }))
+          .strict()
+          .safeParse(params.delivery);
+        if (!delivery.success || "id" in params) return invalid();
+        await eventsService.unsubscribeWebhook(ctx, {
+          name: name.data,
+          arguments: filters.data,
+          delivery: delivery.data,
+        });
+        return success({});
+      }
+    } catch (error) {
+      if (error instanceof McpDomainError) {
+        return rpcErrorResponse(200, rpc.id, error.code, error.message, error.data);
+      }
+      return rpcErrorResponse(500, rpc.id, McpErrorCode.INTERNAL_ERROR, "Internal server error");
+    }
+    return rpcErrorResponse(200, rpc.id, McpErrorCode.METHOD_NOT_FOUND, "Unknown Events method");
   }
 
   function requiredScopeForRpc(
@@ -346,10 +484,7 @@ export function buildDualEraHttpHandler(config: HttpServerConfig): DualEraMcpHan
             id: rpc.id,
             result: {
               protocolVersion: MCP_PROTOCOL_LEGACY,
-              capabilities:
-                config.eventsProfile === "chatgpt-events"
-                  ? { tools: {}, resources: {}, events: {} }
-                  : { tools: {}, resources: {} },
+              capabilities: { tools: {}, resources: {}, ...eventsCapabilities },
               serverInfo: { name: "bugzilla-mcp", version: "0.1.0" },
             },
           },
@@ -398,15 +533,18 @@ export function buildDualEraHttpHandler(config: HttpServerConfig): DualEraMcpHan
           session.initialized = true;
           return { status: 202, headers: {}, body: "" };
         }
+        const mutation = rejectMutation(rpc);
+        if (mutation) return mutation;
         const neededLegacyScope = requiredScopeForRpc(rpc.method, params);
         if (neededLegacyScope && !ctx.scopes.includes(neededLegacyScope)) {
-          return insufficientScopeResponse(neededLegacyScope);
+          return missingScope(rpc, neededLegacyScope);
         }
+        if (rpc.method.startsWith("events/")) return handleEvents(rpc, ctx, true);
         if (rpc.method === "tools/list") {
           return jsonResponse(200, {
             jsonrpc: "2.0",
             id: rpc.id,
-            result: { tools: buildFullToolCatalog(config.headerRoutedParams) },
+            result: { tools: listedTools },
           });
         }
         if (rpc.method === "resources/list") {
@@ -515,16 +653,7 @@ export function buildDualEraHttpHandler(config: HttpServerConfig): DualEraMcpHan
 
       // Discovery may run unauthenticated or authenticated
       if (rpc.method === "server/discover") {
-        const capabilities =
-          config.eventsProfile === "chatgpt-events"
-            ? { tools: {}, resources: {}, events: {} }
-            : {
-                tools: {},
-                resources: {},
-                extensions: {
-                  "io.modelcontextprotocol/events": { listChanged: false },
-                },
-              };
+        const capabilities = { tools: {}, resources: {}, ...eventsCapabilities };
         return jsonResponse(200, {
           jsonrpc: "2.0",
           id: rpc.id,
@@ -553,10 +682,13 @@ export function buildDualEraHttpHandler(config: HttpServerConfig): DualEraMcpHan
       const clientCapabilities = metaCaps as ClientCapabilities;
 
       // Enforce OAuth scopes before resolving credentials, issuing tickets, or reserving receipts (AUTH-01)
+      const mutation = rejectMutation(rpc);
+      if (mutation) return mutation;
       const neededScope = requiredScopeForRpc(rpc.method, params);
       if (neededScope && !ctx.scopes.includes(neededScope)) {
-        return insufficientScopeResponse(neededScope);
+        return missingScope(rpc, neededScope);
       }
+      if (rpc.method.startsWith("events/")) return handleEvents(rpc, ctx, false);
 
       try {
         if (rpc.method === "tools/list") {
@@ -567,7 +699,7 @@ export function buildDualEraHttpHandler(config: HttpServerConfig): DualEraMcpHan
               resultType: "complete",
               ttlMs: 300_000,
               cacheScope: "private",
-              tools: buildFullToolCatalog(config.headerRoutedParams),
+              tools: listedTools,
             },
           });
         }
@@ -716,162 +848,6 @@ export function buildDualEraHttpHandler(config: HttpServerConfig): DualEraMcpHan
               content: outcome.content,
               structuredContent: outcome.structuredContent,
             },
-          });
-        }
-
-        if (rpc.method === "events/list") {
-          return jsonResponse(200, {
-            jsonrpc: "2.0",
-            id: rpc.id,
-            result: {
-              resultType: "complete",
-              events: eventsService.listEvents().events,
-            },
-          });
-        }
-
-        if (rpc.method === "events/poll") {
-          const parsed = PollEventsParamsSchema.safeParse(params);
-          if (!parsed.success) {
-            return rpcErrorResponse(
-              200,
-              rpc.id,
-              McpErrorCode.INVALID_PARAMS,
-              "Invalid poll params",
-            );
-          }
-          const result = await eventsService.poll(ctx, parsed.data);
-          return jsonResponse(200, { jsonrpc: "2.0", id: rpc.id, result });
-        }
-
-        if (rpc.method === "events/stream") {
-          const nameParsed = EventNameSchema.safeParse(params.name);
-          const argsParsed = EventFilterArgsSchema.optional().safeParse(params.arguments);
-          if (!nameParsed.success || !argsParsed.success) {
-            return rpcErrorResponse(
-              200,
-              rpc.id,
-              McpErrorCode.INVALID_PARAMS,
-              "Invalid events/stream params",
-            );
-          }
-          const subscriptionId = `sub_${randomUUID()}`;
-          const sseChunks: string[] = [];
-          let lastCursor: string | null = null;
-          for await (const frame of eventsService.stream(ctx, {
-            name: nameParsed.data,
-            ...(argsParsed.data !== undefined ? { arguments: argsParsed.data } : {}),
-            ...(typeof params.cursor === "string" || params.cursor === null
-              ? { cursor: params.cursor }
-              : {}),
-            ...(typeof params.maxAgeMs === "number" ? { maxAgeMs: params.maxAgeMs } : {}),
-            ...(typeof params.heartbeatMs === "number" ? { heartbeatMs: params.heartbeatMs } : {}),
-          })) {
-            // SEP-3415 flattened notification payload + subscriptionId correlation (EVENT-01)
-            let notificationParams: Record<string, unknown>;
-            if (frame.method === "notifications/events/event") {
-              notificationParams = {
-                subscriptionId,
-                eventId: frame.occurrence.eventId,
-                name: frame.occurrence.name,
-                timestamp: frame.occurrence.timestamp,
-                data: frame.occurrence.data,
-                ...(frame.occurrence.cursor !== undefined
-                  ? { cursor: frame.occurrence.cursor }
-                  : {}),
-              };
-            } else if (frame.method === "notifications/events/active") {
-              lastCursor = frame.cursor;
-              notificationParams = {
-                subscriptionId,
-                cursor: frame.cursor,
-                truncated: frame.truncated,
-                heartbeatMs: frame.heartbeatMs,
-              };
-            } else if (frame.method === "notifications/events/heartbeat") {
-              lastCursor = frame.cursor;
-              notificationParams = { subscriptionId, cursor: frame.cursor };
-            } else if (frame.method === "notifications/events/terminated") {
-              notificationParams = {
-                subscriptionId,
-                code: frame.code,
-                reason: frame.reason,
-              };
-            } else {
-              notificationParams = { subscriptionId, message: frame.message };
-            }
-            const payload = JSON.stringify({
-              jsonrpc: "2.0",
-              method: frame.method,
-              params: notificationParams,
-            });
-            sseChunks.push(`event: message\ndata: ${payload}\n\n`);
-          }
-          // Emit final correlated JSON-RPC result frame on graceful stream close (EVENT-01)
-          const finalFrame = JSON.stringify({
-            jsonrpc: "2.0",
-            ...(rpc.id !== undefined ? { id: rpc.id } : {}),
-            result: {
-              resultType: "complete",
-              subscriptionId,
-              cursor: lastCursor,
-            },
-          });
-          sseChunks.push(`event: message\ndata: ${finalFrame}\n\n`);
-          return {
-            status: 200,
-            headers: {
-              "content-type": "text/event-stream; charset=utf-8",
-              "cache-control": "no-cache",
-            },
-            body: sseChunks.join(""),
-          };
-        }
-
-        if (rpc.method === "events/subscribe") {
-          const parsed = WebhookSubscribeParamsSchema.safeParse(params);
-          if (!parsed.success) {
-            return rpcErrorResponse(
-              200,
-              rpc.id,
-              McpErrorCode.INVALID_PARAMS,
-              "Invalid webhook subscribe params",
-            );
-          }
-          const result = await eventsService.subscribeWebhook(ctx, parsed.data);
-          return jsonResponse(200, { jsonrpc: "2.0", id: rpc.id, result });
-        }
-
-        if (rpc.method === "events/unsubscribe") {
-          const delivery =
-            typeof params.delivery === "object" && params.delivery !== null
-              ? (params.delivery as { url?: string; mode?: "webhook" })
-              : undefined;
-          if (typeof params.name !== "string" || !delivery?.url) {
-            return rpcErrorResponse(
-              200,
-              rpc.id,
-              McpErrorCode.INVALID_PARAMS,
-              "Invalid unsubscribe params",
-            );
-          }
-          await eventsService.unsubscribeWebhook(ctx, {
-            name: params.name as Parameters<typeof eventsService.unsubscribeWebhook>[1]["name"],
-            arguments: (params.arguments ?? {}) as Parameters<
-              typeof eventsService.unsubscribeWebhook
-            >[1]["arguments"],
-            delivery: {
-              url: delivery.url,
-              ...(delivery.mode !== undefined ? { mode: delivery.mode } : {}),
-            },
-          });
-          if (config.eventsProfile === "chatgpt-events") {
-            return jsonResponse(200, { jsonrpc: "2.0", id: rpc.id, result: {} });
-          }
-          return jsonResponse(200, {
-            jsonrpc: "2.0",
-            id: rpc.id,
-            result: { resultType: "complete" },
           });
         }
 

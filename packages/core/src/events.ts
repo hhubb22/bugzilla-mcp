@@ -1,6 +1,7 @@
 import { randomBytes, timingSafeEqual } from "node:crypto";
-import type { UpstreamBugzillaOccurrence } from "@bugzilla-mcp/bugzilla-client";
+import type { BugzillaClient, UpstreamBugzillaOccurrence } from "@bugzilla-mcp/bugzilla-client";
 import {
+  eventFilterJsonSchema,
   McpErrorCode,
   WebhookSecretSchema,
   type EventFilterArgs,
@@ -24,6 +25,7 @@ import type {
   EventStreamFrame,
   SyntheticEventsService,
   WebhookPinnedResponse,
+  WebhookScanState,
 } from "./index.js";
 import { selectValidatedPublicIp, signStandardWebhook, validateWebhookUrl } from "./ssrf.js";
 
@@ -36,6 +38,8 @@ const ALL_EVENTS: readonly EventName[] = [
 
 const MAX_WEBHOOK_BYTES = 256 * 1024;
 const MAX_EXCERPT_BYTES = 64 * 1024;
+const DEFAULT_REPLAY_MS = 24 * 60 * 60 * 1000;
+const END_OF_TIMESTAMP = "\uffff";
 
 interface DecodedCursor {
   readonly v: number;
@@ -52,6 +56,8 @@ interface PendingWebhookItem {
   readonly tsMs: number;
   attempts: number;
   nextAttemptAtMs: number;
+  inFlight?: boolean;
+  outcome?: "acknowledged" | "suppressed" | "abandoned";
 }
 
 function truncateUtf8(text: string, maxBytes: number): { text: string; truncated: boolean } {
@@ -77,6 +83,7 @@ function buildScopeHash(
       issuer: ctx.issuer,
       principalId: ctx.principalId,
       instanceUrl: ctx.instanceUrl,
+      credentialGeneration: ctx.credentialGeneration,
       name,
       args: normalizeArgsForCanonical(args),
     }),
@@ -132,6 +139,30 @@ function occurrenceTieKey(occ: UpstreamBugzillaOccurrence): string {
   return `${bid}:${cid}:${occ.changeKey}`;
 }
 
+function comparePosition(
+  a: Pick<DecodedCursor, "ts" | "tie">,
+  b: Pick<DecodedCursor, "ts" | "tie">,
+) {
+  return a.ts - b.ts || (a.tie < b.tie ? -1 : a.tie > b.tie ? 1 : 0);
+}
+
+function scanIncomplete() {
+  return new McpDomainError(McpErrorCode.INTERNAL_ERROR, "Upstream scan incomplete", {
+    reason: "scan_incomplete",
+  });
+}
+
+function eventAccessRevoked() {
+  return new McpDomainError(McpErrorCode.SEP_EVENTS_FORBIDDEN, "Events access revoked");
+}
+
+function isRevoked(error: unknown) {
+  return (
+    (error instanceof McpDomainError && error.code === McpErrorCode.SEP_EVENTS_FORBIDDEN) ||
+    (error instanceof Error && error.name === "BugzillaCredentialRevokedError")
+  );
+}
+
 function buildOccurrencePayload(occ: UpstreamBugzillaOccurrence): EventOccurrence {
   const data: Record<string, unknown> = {
     bugId: occ.bugId,
@@ -169,18 +200,19 @@ function matchesFilter(
   if (occ.kind !== name) return false;
   if (args?.product && occ.product !== args.product) return false;
   if (args?.component && occ.component !== args.component) return false;
-  if (args?.bugIds && args.bugIds.length > 0 && !args.bugIds.includes(occ.bugId)) {
+  if (args?.severity && occ.severity !== args.severity) return false;
+  if (args?.bugIds && !args.bugIds.includes(occ.bugId)) {
     return false;
   }
-  if (args?.watchedFields && args.watchedFields.length > 0) {
-    const changed = occ.fieldsChanged ?? [];
-    if (!changed.some((field) => args.watchedFields!.includes(field))) {
-      return false;
-    }
+  const watched = args?.watchedFields;
+  if (watched && !occ.fieldsChanged?.some((field) => watched.includes(field))) {
+    return false;
   }
   if (args?.mentionMe && principalId) {
-    const hay = `${occ.commentText ?? ""} ${occ.summaryText ?? ""}`.toLowerCase();
-    if (!hay.includes(principalId.toLowerCase())) {
+    const words = (occ.commentText ?? "")
+      .toLowerCase()
+      .match(/[\p{L}\p{N}_+.-]+(?:@[\p{L}\p{N}_.-]+)?/gu);
+    if (!words?.some((word) => word.replace(/[.]$/, "") === principalId.toLowerCase())) {
       return false;
     }
   }
@@ -199,13 +231,152 @@ export function buildSyntheticEventsService(deps: CoreDependencies): SyntheticEv
   const schemaEpoch = deps.eventSchemaEpoch ?? 1;
   const maxRetries = deps.maxWebhookRetries ?? 3;
   const rotationGraceMs = deps.secretRotationGraceMs ?? 300_000;
+  const replayMs = deps.maxReplayWindowMs ?? DEFAULT_REPLAY_MS;
+  const verifiedPrefixes = new Map<string, number>();
 
-  // In-memory retry & terminal tracking keyed by subscription ID
-  const retryQueues = new Map<string, Map<string, PendingWebhookItem>>();
-  const abandonedEventIds = new Map<string, Set<string>>();
+  function rememberPrefix(scope: string, time: number) {
+    const previous = verifiedPrefixes.get(scope) ?? -Infinity;
+    if (time <= previous) return;
+    // This cache is only an optimization. A miss performs the verified first scan.
+    if (!verifiedPrefixes.has(scope) && verifiedPrefixes.size >= 1024) {
+      const oldest = verifiedPrefixes.keys().next().value;
+      if (oldest !== undefined) verifiedPrefixes.delete(oldest);
+    }
+    verifiedPrefixes.set(scope, time);
+  }
 
-  function subKey(sub: Pick<StoredWebhookSubscription, "id">): string {
-    return sub.id;
+  async function requireClient(ctx: PrincipalContext) {
+    if (!ctx.scopes.includes("bz:events")) throw eventAccessRevoked();
+    const client = await deps.resolveClient(ctx);
+    if (!client) throw eventAccessRevoked();
+    return client;
+  }
+
+  async function checkCredential(client: BugzillaClient) {
+    try {
+      return await client.probeCapabilities();
+    } catch (error) {
+      if (isRevoked(error)) throw eventAccessRevoked();
+      throw scanIncomplete();
+    }
+  }
+
+  const inMemoryQueues = new Map<string, Map<string, PendingWebhookItem>>();
+  const scanStates = new Map<string, WebhookScanState>();
+  const operations = new Map<string, Promise<void>>();
+
+  type SubscriptionKey = Pick<
+    StoredWebhookSubscription,
+    "issuer" | "principalId" | "instanceUrl" | "url" | "name" | "canonicalArgsJson"
+  >;
+
+  function subscriptionKey(
+    ctx: PrincipalContext,
+    name: EventName,
+    args: EventFilterArgs,
+    url: string,
+  ): SubscriptionKey {
+    return {
+      issuer: ctx.issuer,
+      principalId: ctx.principalId,
+      instanceUrl: ctx.instanceUrl,
+      url,
+      name,
+      canonicalArgsJson: canonicalJson(normalizeArgsForCanonical(args)),
+    };
+  }
+
+  async function serialize<T>(key: SubscriptionKey, task: () => Promise<T>): Promise<T> {
+    const id = JSON.stringify([
+      key.issuer,
+      key.principalId,
+      key.instanceUrl,
+      key.url,
+      key.name,
+      key.canonicalArgsJson,
+    ]);
+    const previous = operations.get(id);
+    const work = (previous ?? Promise.resolve()).then(task);
+    const completion = work.then(
+      () => {},
+      () => {},
+    );
+    operations.set(id, completion);
+    try {
+      return await work;
+    } finally {
+      if (operations.get(id) === completion) operations.delete(id);
+    }
+  }
+
+  function reportState(id: string, state: WebhookScanState) {
+    if (scanStates.get(id) === state) return;
+    scanStates.set(id, state);
+    deps.onWebhookScanState?.(id, state);
+  }
+
+  async function saveItem(subscriptionId: string, item: PendingWebhookItem) {
+    if (deps.storage.upsertWebhookRetryItem) {
+      await deps.storage.upsertWebhookRetryItem({
+        subscriptionId,
+        eventId: item.eventId,
+        payloadJson: JSON.stringify(item),
+        attempts: item.attempts,
+        nextAttemptAtMs: item.nextAttemptAtMs,
+      });
+      return;
+    }
+    const items = inMemoryQueues.get(subscriptionId) ?? new Map<string, PendingWebhookItem>();
+    items.set(item.eventId, item);
+    inMemoryQueues.set(subscriptionId, items);
+  }
+
+  async function loadItems(subscriptionId: string): Promise<PendingWebhookItem[]> {
+    if (!deps.storage.listWebhookRetryItems)
+      return [...(inMemoryQueues.get(subscriptionId)?.values() ?? [])];
+    const rows = await deps.storage.listWebhookRetryItems(subscriptionId);
+    return rows.map((row) => ({
+      ...(JSON.parse(row.payloadJson) as PendingWebhookItem),
+      attempts: row.attempts,
+      nextAttemptAtMs: row.nextAttemptAtMs,
+    }));
+  }
+
+  async function deleteItem(subscriptionId: string, eventId: string) {
+    if (deps.storage.deleteWebhookRetryItem)
+      return deps.storage.deleteWebhookRetryItem(subscriptionId, eventId);
+    const remaining = inMemoryQueues.get(subscriptionId);
+    remaining?.delete(eventId);
+    if (remaining?.size === 0) inMemoryQueues.delete(subscriptionId);
+  }
+
+  function storedGrant(ctx: PrincipalContext): PrincipalContext {
+    return {
+      issuer: ctx.issuer,
+      principalId: ctx.principalId,
+      instanceUrl: ctx.instanceUrl,
+      clientId: ctx.clientId,
+      credentialGeneration: ctx.credentialGeneration,
+      scopes: ctx.scopes,
+      deploymentMode: ctx.deploymentMode,
+    };
+  }
+
+  async function requireWebhookGrant(grant: PrincipalContext, fallback: PrincipalContext) {
+    const current = deps.revalidateWebhookGrant
+      ? await deps.revalidateWebhookGrant(grant)
+      : fallback;
+    if (
+      !current ||
+      current.issuer !== grant.issuer ||
+      current.principalId !== grant.principalId ||
+      current.instanceUrl !== grant.instanceUrl ||
+      current.credentialGeneration !== grant.credentialGeneration ||
+      !current.scopes.includes("bz:events")
+    ) {
+      throw eventAccessRevoked();
+    }
+    return current;
   }
 
   function activeSecrets(sub: StoredWebhookSubscription, nowMs: number): string[] {
@@ -225,6 +396,7 @@ export function buildSyntheticEventsService(deps: CoreDependencies): SyntheticEv
     args: EventFilterArgs | undefined,
     sinceMs: number,
     upperBoundMs: number,
+    resolvedClient?: BugzillaClient,
   ): Promise<{
     scanComplete: boolean;
     items: Array<{
@@ -234,10 +406,11 @@ export function buildSyntheticEventsService(deps: CoreDependencies): SyntheticEv
       eventId: string;
     }>;
   }> {
-    const client = await deps.resolveClient(ctx);
-    if (!client) {
-      throw new McpDomainError(McpErrorCode.INVALID_PARAMS, "CredentialBindingRequired");
-    }
+    const client = resolvedClient ?? (await requireClient(ctx));
+    const identity =
+      args?.mentionMe || args?.requestee?.toLowerCase() === "me"
+        ? (await checkCredential(client)).authenticatedUser
+        : undefined;
 
     const dedup = new Map<
       string,
@@ -256,15 +429,13 @@ export function buildSyntheticEventsService(deps: CoreDependencies): SyntheticEv
           offset,
         });
       } catch (err) {
-        if (err instanceof Error && err.name === "BugzillaCredentialRevokedError") {
-          throw new McpDomainError(McpErrorCode.SEP_EVENTS_FORBIDDEN, "Credential revoked");
-        }
-        throw err;
+        if (isRevoked(err)) throw eventAccessRevoked();
+        return { scanComplete: false, items: [] };
       }
       for (const occ of page.occurrences) {
-        if (!matchesFilter(occ, name, args, ctx.principalId)) continue;
+        if (!matchesFilter(occ, name, args, identity)) continue;
         const tsMs = Date.parse(occ.timestamp);
-        if (!Number.isFinite(tsMs) || tsMs > upperBoundMs) continue;
+        if (!Number.isFinite(tsMs) || tsMs < sinceMs || tsMs > upperBoundMs) continue;
         const eventId = occurrenceEventId(occ);
         if (!dedup.has(eventId)) {
           dedup.set(eventId, { occ, tsMs, tieKey: occurrenceTieKey(occ), eventId });
@@ -282,6 +453,7 @@ export function buildSyntheticEventsService(deps: CoreDependencies): SyntheticEv
       offset = nextOffset;
     }
 
+    if (!complete) return { scanComplete: false, items: [] };
     const items = [...dedup.values()].sort((a, b) => {
       if (a.tsMs !== b.tsMs) return a.tsMs - b.tsMs;
       return a.tieKey < b.tieKey ? -1 : a.tieKey > b.tieKey ? 1 : 0;
@@ -295,10 +467,16 @@ export function buildSyntheticEventsService(deps: CoreDependencies): SyntheticEv
     const filtered: typeof items = [];
     for (const entry of items) {
       const isSelf = await deps.storage.hasSelfWrite({
+        issuer: ctx.issuer,
+        principalId: ctx.principalId,
         instanceUrl: ctx.instanceUrl,
         bugId: entry.occ.bugId,
         ...(entry.occ.commentId !== undefined ? { commentId: entry.occ.commentId } : {}),
-        diffKey: entry.occ.changeKey,
+        ...(entry.occ.kind === "bugzilla.bug.created"
+          ? { diffKey: entry.occ.changeKey }
+          : entry.occ.confirmedHistoryKey
+            ? { diffKey: entry.occ.confirmedHistoryKey }
+            : {}),
       });
       if (!isSelf) {
         filtered.push(entry);
@@ -360,25 +538,392 @@ export function buildSyntheticEventsService(deps: CoreDependencies): SyntheticEv
       : McpErrorCode.SEP_EVENTS_CALLBACK_ERROR;
   }
 
+  function makePending(
+    entry: Awaited<ReturnType<typeof scanRange>>["items"][number],
+    nowMs: number,
+  ): PendingWebhookItem {
+    return {
+      eventId: entry.eventId,
+      webhookId:
+        deps.eventsProfile === "chatgpt-events"
+          ? entry.eventId
+          : `msg_evt_${randomBytes(16).toString("base64url")}`,
+      occurrence: entry.occ,
+      tieKey: entry.tieKey,
+      tsMs: entry.tsMs,
+      attempts: 0,
+      nextAttemptAtMs: nowMs,
+    };
+  }
+
+  async function prepareSubscription(
+    ctx: PrincipalContext,
+    params: WebhookSubscribeParams,
+    existing: StoredWebhookSubscription | null,
+    nowMs: number,
+  ) {
+    const scopeHash = buildScopeHash(ctx, params.name, params.arguments);
+    const requested =
+      params.cursor == null ? undefined : decodeCursor(params.cursor, scopeHash, schemaEpoch);
+    if (
+      existing?.revoked ||
+      (existing?.grant && existing.grant.credentialGeneration !== ctx.credentialGeneration)
+    ) {
+      throw eventAccessRevoked();
+    }
+    if (deps.revalidateWebhookGrant) await requireWebhookGrant(ctx, ctx);
+    const client = await requireClient(ctx);
+    if (
+      existing?.verified &&
+      existing.safeWatermark !== null &&
+      (existing.refreshBefore === null || nowMs <= Date.parse(existing.refreshBefore))
+    ) {
+      await checkCredential(client);
+      const gap = existing.lastGapCursor
+        ? decodeCursor(existing.lastGapCursor, scopeHash, schemaEpoch)
+        : undefined;
+      return {
+        live: existing,
+        startCursor: existing.recoveryCursor ?? existing.safeWatermark,
+        acquisitionCursor: existing.acquisitionCursor ?? existing.safeWatermark,
+        truncated: gap && requested ? comparePosition(requested, gap) < 0 : existing.gapPending,
+        acquired: [],
+      };
+    }
+
+    const safePrefixMs = nowMs - deps.lagWindowMs;
+    const known = verifiedPrefixes.get(scopeHash);
+    const boundary: DecodedCursor = {
+      v: schemaEpoch,
+      scope: scopeHash,
+      ts: safePrefixMs,
+      tie: END_OF_TIMESTAMP,
+    };
+    if (!requested && known !== undefined) {
+      await checkCredential(client);
+      const cursor = encodeCursor({ ...boundary, ts: known });
+      return {
+        live: null,
+        startCursor: cursor,
+        acquisitionCursor: cursor,
+        truncated: false,
+        acquired: [],
+      };
+    }
+
+    const floor = requested
+      ? Math.max(requested.ts, nowMs - replayMs, nowMs - (params.maxAgeMs ?? Infinity))
+      : Math.min(nowMs - replayMs, safePrefixMs);
+    const truncated = requested !== undefined && floor > requested.ts;
+    const scan = await scanRange(ctx, params.name, params.arguments, floor, safePrefixMs, client);
+    if (!scan.scanComplete) throw scanIncomplete();
+    rememberPrefix(scopeHash, safePrefixMs);
+    const start = requested
+      ? { ...requested, ts: floor, tie: truncated ? "" : requested.tie }
+      : boundary;
+    const acquired = requested
+      ? scan.items.filter(
+          (entry) => comparePosition({ ts: entry.tsMs, tie: entry.tieKey }, start) > 0,
+        )
+      : [];
+    return {
+      live: null,
+      startCursor: encodeCursor(start),
+      acquisitionCursor: encodeCursor(comparePosition(boundary, start) > 0 ? boundary : start),
+      truncated,
+      acquired,
+    };
+  }
+
+  function retryDelay(attempts: number): number {
+    return Math.min(10_000, 1_000 * 2 ** (attempts - 1));
+  }
+
+  async function settleAttempt(
+    sub: StoredWebhookSubscription,
+    item: PendingWebhookItem,
+    status?: number,
+  ) {
+    delete item.inFlight;
+    if (status !== undefined && status >= 200 && status < 300) {
+      item.outcome = "acknowledged";
+    } else if (status === 410 || status === 413 || item.attempts >= maxRetries + 1) {
+      item.outcome = "abandoned";
+    } else {
+      item.nextAttemptAtMs = clock() + retryDelay(item.attempts);
+    }
+    await saveItem(sub.id, item);
+  }
+
+  async function sendOccurrence(sub: StoredWebhookSubscription, item: PendingWebhookItem) {
+    const nowMs = clock();
+    const occurrence = buildOccurrencePayload(item.occurrence);
+    // A normal envelope never claims that its own unacknowledged delivery, or
+    // an earlier pending delivery or unannounced gap, can be skipped.
+    const cursor = sub.safeWatermark;
+    let body = JSON.stringify({ ...occurrence, cursor });
+    if (Buffer.byteLength(body) > MAX_WEBHOOK_BYTES) {
+      const { summaryText: _summary, commentText: _excerpt, ...fields } = occurrence.data;
+      body = JSON.stringify({
+        ...occurrence,
+        cursor,
+        data: { ...fields, excerptTruncated: true },
+      });
+    }
+    item.attempts += 1;
+    item.inFlight = true;
+    item.nextAttemptAtMs = nowMs + retryDelay(item.attempts);
+    await saveItem(sub.id, item);
+    const response = await sendSignedPinnedPost({
+      url: sub.url,
+      subscriptionId: sub.id,
+      webhookId: item.webhookId,
+      secrets: activeSecrets(sub, nowMs),
+      rawBody: body,
+      nowMs,
+    }).catch(() => null);
+    await settleAttempt(sub, item, response?.status);
+  }
+
+  async function revokeSubscription(sub: StoredWebhookSubscription, items: PendingWebhookItem[]) {
+    // Persist the stop before any network or cleanup work so reopening SQLite
+    // cannot resume a subscription whose authorization is known to be invalid.
+    await deps.storage.upsertWebhookSubscription({ ...sub, revoked: true });
+    reportState(sub.id, "authorization_revoked");
+    for (const item of items) await deleteItem(sub.id, item.eventId);
+    if (deps.eventsProfile !== "sep-3415") return;
+    const nowMs = clock();
+    await sendSignedPinnedPost({
+      url: sub.url,
+      subscriptionId: sub.id,
+      webhookId: `msg_terminated_${randomBytes(16).toString("base64url")}`,
+      secrets: activeSecrets(sub, nowMs),
+      nowMs,
+      rawBody: JSON.stringify({
+        type: "terminated",
+        error: { code: McpErrorCode.SEP_EVENTS_FORBIDDEN, message: "Events access revoked" },
+      }),
+    }).catch(() => null);
+  }
+
+  async function checkpoint(
+    sub: StoredWebhookSubscription,
+    ordered: PendingWebhookItem[],
+    acquisition: DecodedCursor,
+  ): Promise<StoredWebhookSubscription> {
+    const recoveryBefore = sub.recoveryCursor ?? sub.safeWatermark;
+    if (recoveryBefore === null) return sub;
+    let recovery = decodeCursor(recoveryBefore, acquisition.scope, schemaEpoch);
+    let latestGap = sub.lastGapCursor;
+    let blocked = false;
+    const settled: PendingWebhookItem[] = [];
+    for (const item of ordered) {
+      if (!item.outcome) {
+        blocked = true;
+        break;
+      }
+      settled.push(item);
+      // A suppressed item is resolved for delivery, but its identifiers must
+      // never become the tie-breaker of a cursor returned to the subscriber.
+      if (item.outcome === "suppressed") continue;
+      const position = { ...recovery, ts: item.tsMs, tie: item.tieKey };
+      if (comparePosition(position, recovery) <= 0) continue;
+      recovery = position;
+      if (item.outcome === "abandoned") latestGap = encodeCursor(position);
+    }
+    if (!blocked && comparePosition(acquisition, recovery) > 0) recovery = acquisition;
+    const recoveryCursor = encodeCursor(recovery);
+    const newGap = latestGap !== sub.lastGapCursor;
+    const { gapAttempt, ...rest } = sub;
+    const committed: StoredWebhookSubscription = {
+      ...rest,
+      recoveryCursor,
+      gapPending: sub.gapPending || newGap,
+      safeWatermark: sub.gapPending || newGap ? sub.safeWatermark : recoveryCursor,
+      ...(latestGap ? { lastGapCursor: latestGap } : {}),
+      ...(newGap ? { gapMessageId: `msg_gap_${randomBytes(16).toString("base64url")}` } : {}),
+      ...(!newGap && gapAttempt ? { gapAttempt } : {}),
+    };
+    if (
+      recoveryCursor !== recoveryBefore ||
+      committed.safeWatermark !== sub.safeWatermark ||
+      newGap
+    ) {
+      await deps.storage.upsertWebhookSubscription(committed);
+    }
+    // Record the committed cursor and gap before forgetting settled items.
+    for (const item of settled) await deleteItem(sub.id, item.eventId);
+    return committed;
+  }
+
+  async function sendGap(sub: StoredWebhookSubscription) {
+    if (deps.eventsProfile !== "sep-3415" || !sub.gapPending || !sub.recoveryCursor) return;
+    const nowMs = clock();
+    const prior = sub.gapAttempt;
+    if (prior && (prior.attempts >= maxRetries + 1 || prior.nextAttemptAtMs > nowMs)) return;
+    const gapMessageId = sub.gapMessageId ?? `msg_gap_${randomBytes(16).toString("base64url")}`;
+    const attempts = (prior?.attempts ?? 0) + 1;
+    const cursor = prior?.cursor ?? sub.recoveryCursor;
+    const next = {
+      ...sub,
+      gapMessageId,
+      gapAttempt: { cursor, attempts, nextAttemptAtMs: nowMs + retryDelay(attempts) },
+    };
+    await deps.storage.upsertWebhookSubscription(next);
+    const response = await sendSignedPinnedPost({
+      url: sub.url,
+      subscriptionId: sub.id,
+      webhookId: gapMessageId,
+      nowMs,
+      secrets: activeSecrets(sub, nowMs),
+      rawBody: JSON.stringify({ type: "gap", cursor }),
+    }).catch(() => null);
+    if (response && response.status >= 200 && response.status < 300) {
+      await deps.storage.upsertWebhookSubscription({
+        ...next,
+        gapPending: false,
+        safeWatermark: cursor,
+      });
+    } else {
+      await deps.storage.upsertWebhookSubscription({
+        ...next,
+        gapAttempt: {
+          cursor,
+          attempts:
+            response?.status === 410 || response?.status === 413 ? maxRetries + 1 : attempts,
+          nextAttemptAtMs: clock() + retryDelay(attempts),
+        },
+      });
+    }
+  }
+
+  async function sweepSubscription(
+    scope: PrincipalContext,
+    snapshot: StoredWebhookSubscription,
+    counters: { delivered: number; abandoned: number; terminated: number },
+    tenantClient?: BugzillaClient | null,
+  ) {
+    let sub = await deps.storage.getWebhookSubscription(snapshot);
+    const nowMs = clock();
+    if (
+      !sub?.verified ||
+      sub.revoked ||
+      sub.id !== snapshot.id ||
+      (sub.refreshBefore !== null && nowMs > Date.parse(sub.refreshBefore))
+    )
+      return;
+    const grant = sub.grant ?? scope;
+    const scopeHash = buildScopeHash(grant, sub.name, sub.args);
+    const acquisitionBefore = sub.acquisitionCursor ?? sub.safeWatermark;
+    if (acquisitionBefore === null) return;
+    let acquisition: DecodedCursor;
+    try {
+      // Invalid persisted cursors must not reach the network.
+      acquisition = decodeCursor(acquisitionBefore, scopeHash, schemaEpoch);
+      if (sub.safeWatermark !== null) decodeCursor(sub.safeWatermark, scopeHash, schemaEpoch);
+      if (sub.recoveryCursor) decodeCursor(sub.recoveryCursor, scopeHash, schemaEpoch);
+    } catch {
+      return;
+    }
+
+    const items = await loadItems(sub.id);
+    try {
+      if (
+        grant.issuer !== sub.issuer ||
+        grant.principalId !== sub.principalId ||
+        grant.instanceUrl !== sub.instanceUrl ||
+        tenantClient === null
+      ) {
+        throw eventAccessRevoked();
+      }
+      const ctx = await requireWebhookGrant(grant, scope);
+      const client = tenantClient ?? (await requireClient(ctx));
+      const safePrefixMs = nowMs - deps.lagWindowMs;
+      let scan: Awaited<ReturnType<typeof scanRange>>;
+      try {
+        scan = await scanRange(ctx, sub.name, sub.args, acquisition.ts, safePrefixMs, client);
+      } catch (error) {
+        if (isRevoked(error)) throw error;
+        scan = { scanComplete: false, items: [] };
+      }
+      if (scan.scanComplete) {
+        const existing = new Set(items.map((item) => item.eventId));
+        for (const entry of scan.items) {
+          if (
+            existing.has(entry.eventId) ||
+            comparePosition({ ts: entry.tsMs, tie: entry.tieKey }, acquisition) <= 0
+          )
+            continue;
+          const item = makePending(entry, nowMs);
+          await saveItem(sub.id, item);
+          items.push(item);
+        }
+        const verified = { ...acquisition, ts: safePrefixMs, tie: END_OF_TIMESTAMP };
+        if (comparePosition(verified, acquisition) > 0) {
+          acquisition = verified;
+          sub = { ...sub, acquisitionCursor: encodeCursor(acquisition) };
+          await deps.storage.upsertWebhookSubscription(sub);
+        }
+        rememberPrefix(scopeHash, safePrefixMs);
+      } else {
+        reportState(sub.id, "scan_incomplete");
+      }
+
+      items.sort((a, b) =>
+        comparePosition({ ts: a.tsMs, tie: a.tieKey }, { ts: b.tsMs, tie: b.tieKey }),
+      );
+      let active = false;
+      for (const item of items) {
+        if (item.outcome) continue;
+        const due =
+          item.inFlight || item.attempts >= maxRetries + 1 || item.nextAttemptAtMs <= clock();
+        if (due && deps.revalidateWebhookGrant) await requireWebhookGrant(grant, scope);
+        let visibility: Awaited<ReturnType<BugzillaClient["checkVisibility"]>>;
+        try {
+          visibility = await client.checkVisibility(
+            item.occurrence.bugId,
+            item.occurrence.commentId,
+          );
+        } catch (error) {
+          if (isRevoked(error)) throw error;
+          continue;
+        }
+        if (visibility === "credential_revoked") throw eventAccessRevoked();
+        if (visibility === "restricted_or_missing") {
+          item.outcome = "suppressed";
+          await saveItem(sub.id, item);
+          continue;
+        }
+        active = true;
+        if (scan.scanComplete) reportState(sub.id, "active");
+        if (item.inFlight || item.attempts >= maxRetries + 1) {
+          await settleAttempt(sub, item);
+        } else if (due) {
+          await sendOccurrence(sub, item);
+        }
+        const outcome = (item as PendingWebhookItem).outcome;
+        if (outcome === "acknowledged") counters.delivered += 1;
+        if (outcome === "abandoned") counters.abandoned += 1;
+      }
+      if (!active && scan.scanComplete) reportState(sub.id, "idle");
+      const committed = await checkpoint(sub, items, acquisition);
+      if (scan.scanComplete && committed.gapPending && deps.eventsProfile === "sep-3415") {
+        sub = committed;
+        if (deps.revalidateWebhookGrant) await requireWebhookGrant(grant, scope);
+        await sendGap(sub);
+      }
+    } catch (error) {
+      if (!isRevoked(error)) throw error;
+      await revokeSubscription(sub, items);
+      counters.terminated += 1;
+    }
+  }
+
   return {
     listEvents() {
-      const delivery =
-        deps.eventsProfile === "chatgpt-events"
-          ? (["webhook"] as const)
-          : (["poll", "push", "webhook"] as const);
-      const inputSchema = {
-        type: "object",
-        properties: {
-          product: { type: "string", minLength: 1 },
-          component: { type: "string", minLength: 1 },
-          bugIds: { type: "array", items: { type: "integer", minimum: 1 }, maxItems: 100 },
-          watchedFields: { type: "array", items: { type: "string" } },
-          mentionMe: { type: "boolean" },
-          requestee: { type: "string" },
-          includeSelf: { type: "boolean", default: false },
-        },
-        additionalProperties: false,
-      };
+      const delivery: ("poll" | "webhook")[] = [];
+      if (deps.eventsProfile === "sep-3415") delivery.push("poll");
+      if (deps.webhookEnabled ?? Boolean(deps.webhookTransport)) delivery.push("webhook");
       const payloadSchema = {
         type: "object",
         required: ["bugId", "product", "component", "actor", "untrustedUserContent"],
@@ -396,7 +941,12 @@ export function buildSyntheticEventsService(deps: CoreDependencies): SyntheticEv
       };
       return {
         profile: deps.eventsProfile,
-        events: ALL_EVENTS.map((name) => ({ name, delivery, inputSchema, payloadSchema })),
+        events: ALL_EVENTS.map((name) => ({
+          name,
+          delivery,
+          inputSchema: eventFilterJsonSchema(name),
+          payloadSchema,
+        })),
       };
     },
 
@@ -406,10 +956,31 @@ export function buildSyntheticEventsService(deps: CoreDependencies): SyntheticEv
       const scopeHash = buildScopeHash(ctx, params.name, params.arguments);
 
       if (params.cursor === undefined || params.cursor === null) {
+        const known = verifiedPrefixes.get(scopeHash);
+        const client = await requireClient(ctx);
+        if (known === undefined) {
+          const initial = await scanRange(
+            ctx,
+            params.name,
+            params.arguments,
+            Math.min(nowMs - replayMs, safePrefixMs),
+            safePrefixMs,
+            client,
+          );
+          if (!initial.scanComplete) throw scanIncomplete();
+          rememberPrefix(scopeHash, safePrefixMs);
+        } else {
+          await checkCredential(client);
+        }
         return {
           resultType: "complete",
           events: [],
-          cursor: encodeCursor({ v: schemaEpoch, scope: scopeHash, ts: safePrefixMs, tie: "" }),
+          cursor: encodeCursor({
+            v: schemaEpoch,
+            scope: scopeHash,
+            ts: known ?? safePrefixMs,
+            tie: END_OF_TIMESTAMP,
+          }),
           truncated: false,
           hasMore: false,
           nextPollMs: 5_000,
@@ -417,38 +988,23 @@ export function buildSyntheticEventsService(deps: CoreDependencies): SyntheticEv
       }
 
       const decoded = decodeCursor(params.cursor, scopeHash, schemaEpoch);
-      const replayFloorCandidates = [decoded.ts];
+      const replayFloorCandidates = [decoded.ts, nowMs - replayMs];
       if (params.maxAgeMs !== undefined) {
         replayFloorCandidates.push(nowMs - params.maxAgeMs);
-      }
-      if (deps.maxReplayWindowMs !== undefined) {
-        replayFloorCandidates.push(nowMs - deps.maxReplayWindowMs);
       }
       const effectiveFloorMs = Math.max(...replayFloorCandidates);
       const truncated = effectiveFloorMs > decoded.ts;
 
+      const client = await requireClient(ctx);
       const scan = await scanRange(
         ctx,
         params.name,
         params.arguments,
         effectiveFloorMs,
         safePrefixMs,
+        client,
       );
-      if (!scan.scanComplete) {
-        return {
-          resultType: "complete",
-          events: [],
-          cursor: params.cursor,
-          truncated: false,
-          hasMore: false,
-          nextPollMs: 5_000,
-        };
-      }
-
-      const client = await deps.resolveClient(ctx);
-      if (!client) {
-        throw new McpDomainError(McpErrorCode.INVALID_PARAMS, "CredentialBindingRequired");
-      }
+      if (!scan.scanComplete) throw scanIncomplete();
 
       const eligible: Array<{
         event: Omit<EventOccurrence, "cursor">;
@@ -462,10 +1018,13 @@ export function buildSyntheticEventsService(deps: CoreDependencies): SyntheticEv
           : entry.tsMs > decoded.ts || (entry.tsMs === decoded.ts && entry.tieKey > decoded.tie);
         if (!afterCursor) continue;
 
-        const vis = await client.checkVisibility(entry.occ.bugId, entry.occ.commentId);
-        if (vis === "credential_revoked") {
-          throw new McpDomainError(McpErrorCode.SEP_EVENTS_FORBIDDEN, "Credential revoked");
-        }
+        const vis = await client
+          .checkVisibility(entry.occ.bugId, entry.occ.commentId)
+          .catch((error: unknown) => {
+            if (isRevoked(error)) throw eventAccessRevoked();
+            throw scanIncomplete();
+          });
+        if (vis === "credential_revoked") throw eventAccessRevoked();
         if (vis !== "visible") continue;
 
         eligible.push({
@@ -486,17 +1045,13 @@ export function buildSyntheticEventsService(deps: CoreDependencies): SyntheticEv
           ? { v: schemaEpoch, scope: scopeHash, ts: last.tsMs, tie: last.tieKey }
           : decoded;
       } else {
-        const last = pageItems[pageItems.length - 1];
-        const nextTs = Math.max(
-          decoded.ts,
-          effectiveFloorMs,
-          safePrefixMs,
-          last?.tsMs ?? -Infinity,
-        );
-        const nextTie = last && last.tsMs >= nextTs ? last.tieKey : "";
-        nextCursor = { v: schemaEpoch, scope: scopeHash, ts: nextTs, tie: nextTie };
+        nextCursor =
+          safePrefixMs >= decoded.ts
+            ? { v: schemaEpoch, scope: scopeHash, ts: safePrefixMs, tie: END_OF_TIMESTAMP }
+            : decoded;
       }
 
+      rememberPrefix(scopeHash, safePrefixMs);
       return {
         resultType: "complete",
         events: pageItems.map((item) => item.event),
@@ -632,550 +1187,127 @@ export function buildSyntheticEventsService(deps: CoreDependencies): SyntheticEv
         );
       }
 
-      const nowMs = clock();
-      const safePrefixMs = nowMs - deps.lagWindowMs;
-      const normArgs = normalizeArgsForCanonical(params.arguments);
-      const canonicalArgsJson = canonicalJson(normArgs);
-      const scopeHash = buildScopeHash(ctx, params.name, params.arguments);
+      const key = subscriptionKey(ctx, params.name, params.arguments, params.delivery.url);
+      return serialize(key, async () => {
+        const nowMs = clock();
+        const existing = await deps.storage.getWebhookSubscription(key);
+        const { live, startCursor, acquisitionCursor, truncated, acquired } =
+          await prepareSubscription(ctx, params, existing, nowMs);
+        const subId = live?.id ?? `sub_${randomBytes(16).toString("base64url")}`;
 
-      const existing = await deps.storage.getWebhookSubscription({
-        issuer: ctx.issuer,
-        principalId: ctx.principalId,
-        instanceUrl: ctx.instanceUrl,
-        url: params.delivery.url,
-        name: params.name,
-        canonicalArgsJson,
-      });
+        if (!live) {
+          const challenge = randomBytes(16).toString("base64url");
+          const verifyWebhookId = `msg_verification_${randomBytes(12).toString("base64url")}`;
+          const verifyBody = JSON.stringify({ type: "verification", challenge });
+          let resp: WebhookPinnedResponse | null = null;
+          try {
+            resp = await sendSignedPinnedPost({
+              url: params.delivery.url,
+              subscriptionId: subId,
+              webhookId: verifyWebhookId,
+              secrets: [params.delivery.secret],
+              rawBody: verifyBody,
+              nowMs,
+            });
+          } catch {
+            throw new McpDomainError(
+              callbackErrorCode(),
+              "Callback verification transport failure",
+              {
+                reason: "connection_refused",
+              },
+            );
+          }
+          if (!resp || resp.status < 200 || resp.status >= 300) {
+            throw new McpDomainError(callbackErrorCode(), "Callback verification failed", {
+              reason: !resp ? "connection_refused" : "http_5xx",
+            });
+          }
+          let echoed: unknown;
+          try {
+            echoed = (JSON.parse(resp.body) as { challenge?: unknown }).challenge;
+          } catch {
+            echoed = undefined;
+          }
+          if (typeof echoed !== "string") {
+            throw new McpDomainError(callbackErrorCode(), "Callback challenge failed", {
+              reason: "challenge_failed",
+            });
+          }
+          const a = Buffer.from(echoed, "utf8");
+          const b = Buffer.from(challenge, "utf8");
+          if (a.length !== b.length || !timingSafeEqual(a, b)) {
+            throw new McpDomainError(callbackErrorCode(), "Callback challenge mismatch", {
+              reason: "challenge_failed",
+            });
+          }
+        }
 
-      const subId = existing?.id ?? `sub_${randomBytes(12).toString("base64url")}`;
-      let truncated = false;
-      let startCursor: string;
-
-      if (params.cursor !== undefined && params.cursor !== null) {
-        const decoded = decodeCursor(params.cursor, scopeHash, schemaEpoch);
-        const floorCandidates = [decoded.ts];
-        if (params.maxAgeMs !== undefined) floorCandidates.push(nowMs - params.maxAgeMs);
-        if (deps.maxReplayWindowMs !== undefined) {
-          floorCandidates.push(nowMs - deps.maxReplayWindowMs);
-        }
-        const floorMs = Math.max(...floorCandidates);
-        if (floorMs > decoded.ts) {
-          truncated = true;
-          startCursor = encodeCursor({ v: schemaEpoch, scope: scopeHash, ts: floorMs, tie: "" });
-        } else {
-          startCursor = params.cursor;
-        }
-      } else {
-        startCursor =
-          existing?.safeWatermark ??
-          encodeCursor({ v: schemaEpoch, scope: scopeHash, ts: safePrefixMs, tie: "" });
-      }
-
-      if (!existing?.verified) {
-        const challenge = randomBytes(16).toString("base64url");
-        const verifyWebhookId = `msg_verification_${randomBytes(12).toString("base64url")}`;
-        const verifyBody = JSON.stringify({ type: "verification", challenge });
-        let resp: WebhookPinnedResponse | null = null;
-        try {
-          resp = await sendSignedPinnedPost({
-            url: params.delivery.url,
-            subscriptionId: subId,
-            webhookId: verifyWebhookId,
-            secrets: [params.delivery.secret],
-            rawBody: verifyBody,
-            nowMs,
-          });
-        } catch {
-          throw new McpDomainError(callbackErrorCode(), "Callback verification transport failure", {
-            reason: "connection_refused",
-          });
-        }
-        if (!resp || resp.status < 200 || resp.status >= 300) {
-          throw new McpDomainError(callbackErrorCode(), "Callback verification failed", {
-            reason: !resp ? "connection_refused" : "http_5xx",
-          });
-        }
-        let echoed: unknown;
-        try {
-          echoed = (JSON.parse(resp.body) as { challenge?: unknown }).challenge;
-        } catch {
-          echoed = undefined;
-        }
-        if (typeof echoed !== "string") {
-          throw new McpDomainError(callbackErrorCode(), "Callback challenge failed", {
-            reason: "challenge_failed",
-          });
-        }
-        const a = Buffer.from(echoed, "utf8");
-        const b = Buffer.from(challenge, "utf8");
-        if (a.length !== b.length || !timingSafeEqual(a, b)) {
-          throw new McpDomainError(callbackErrorCode(), "Callback challenge mismatch", {
-            reason: "challenge_failed",
-          });
-        }
-      }
-
-      const refreshBefore =
-        params.ttlMs === null
-          ? null
-          : new Date(nowMs + (params.ttlMs ?? 24 * 60 * 60 * 1000)).toISOString();
-
-      const rotated = existing && existing.secret !== params.delivery.secret;
-      const reportTruncated =
-        truncated || (deps.eventsProfile === "chatgpt-events" && Boolean(existing?.gapPending));
-      const updatedSub: StoredWebhookSubscription = {
-        id: subId,
-        issuer: ctx.issuer,
-        principalId: ctx.principalId,
-        instanceUrl: ctx.instanceUrl,
-        name: params.name,
-        canonicalArgsJson,
-        args: params.arguments,
-        url: params.delivery.url,
-        secret: params.delivery.secret,
-        ...(rotated
-          ? { previousSecret: existing.secret, secretRotatedAt: new Date(nowMs).toISOString() }
-          : existing?.previousSecret !== undefined
-            ? {
-                previousSecret: existing.previousSecret,
-                ...(existing.secretRotatedAt !== undefined
-                  ? { secretRotatedAt: existing.secretRotatedAt }
-                  : {}),
-              }
+        const refreshBefore =
+          params.ttlMs === null
+            ? null
+            : params.ttlMs === undefined && live
+              ? live.refreshBefore
+              : new Date(nowMs + (params.ttlMs ?? DEFAULT_REPLAY_MS)).toISOString();
+        const rotated = live && live.secret !== params.delivery.secret;
+        const updatedSub: StoredWebhookSubscription = {
+          ...live,
+          ...key,
+          id: subId,
+          args: params.arguments,
+          grant: storedGrant(ctx),
+          secret: params.delivery.secret,
+          ...(rotated
+            ? { previousSecret: live.secret, secretRotatedAt: new Date(nowMs).toISOString() }
             : {}),
-        refreshBefore,
-        verified: true,
-        safeWatermark: startCursor,
-        // ChatGPT surfaces pending gap via truncated: true on refresh; SEP keeps gapPending until signed gap ACK
-        gapPending:
-          deps.eventsProfile === "chatgpt-events"
-            ? false
-            : truncated || Boolean(existing?.gapPending),
-      };
-
-      await deps.storage.upsertWebhookSubscription(updatedSub);
-
-      return {
-        resultType: "complete",
-        id: subId,
-        refreshBefore,
-        cursor: startCursor,
-        truncated: reportTruncated,
-      };
+          refreshBefore,
+          verified: true,
+          safeWatermark: live?.safeWatermark ?? startCursor,
+          recoveryCursor: startCursor,
+          acquisitionCursor,
+          gapPending: live?.gapPending ?? false,
+        };
+        // The verified replay is acquired once. Its original selection is not
+        // re-evaluated against later mutable source fields during delivery.
+        for (const entry of acquired) await saveItem(subId, makePending(entry, nowMs));
+        await deps.storage.upsertWebhookSubscription(updatedSub);
+        if (!live && existing) {
+          for (const item of await loadItems(existing.id))
+            await deleteItem(existing.id, item.eventId);
+          scanStates.delete(existing.id);
+        }
+        return { resultType: "complete", id: subId, refreshBefore, cursor: startCursor, truncated };
+      });
     },
 
     async unsubscribeWebhook(ctx, params) {
-      const canonicalArgsJson = canonicalJson(normalizeArgsForCanonical(params.arguments));
-      const deleted = await deps.storage.deleteWebhookSubscription({
-        issuer: ctx.issuer,
-        principalId: ctx.principalId,
-        instanceUrl: ctx.instanceUrl,
-        url: params.delivery.url,
-        name: params.name,
-        canonicalArgsJson,
+      const key = subscriptionKey(ctx, params.name, params.arguments, params.delivery.url);
+      await serialize(key, async () => {
+        const existing = await deps.storage.getWebhookSubscription(key);
+        if (!existing) return;
+        await deps.storage.deleteWebhookSubscription(key);
+        scanStates.delete(existing.id);
+        for (const item of await loadItems(existing.id))
+          await deleteItem(existing.id, item.eventId);
       });
-      if (!deleted && deps.eventsProfile === "sep-3415") {
-        throw new McpDomainError(McpErrorCode.SEP_EVENTS_NOT_FOUND, "Subscription not found", {
-          kind: "subscription",
-        });
-      }
       return { resultType: "complete" };
     },
 
     async deliverPendingWebhooks(ctx) {
-      const nowMs = clock();
-      const safePrefixMs = nowMs - deps.lagWindowMs;
-      const subs = await deps.storage.listWebhookSubscriptions({
-        issuer: ctx.issuer,
-        principalId: ctx.principalId,
-        instanceUrl: ctx.instanceUrl,
-      });
-      const client = await deps.resolveClient(ctx);
-
-      let delivered = 0;
-      let abandoned = 0;
-      let terminated = 0;
-
-      for (const sub of subs) {
-        if (!sub.verified) continue;
-        // Isolate subscriptions strictly to the active Bugzilla instance (EVENT-09)
-        if (sub.instanceUrl !== ctx.instanceUrl) continue;
-        // Enforce finite grant expiry before any outbound attempt (EVENT-08)
-        if (sub.refreshBefore !== null && nowMs > Date.parse(sub.refreshBefore)) {
-          continue;
-        }
-        const secrets = activeSecrets(sub, nowMs);
-        const scopeHash = buildScopeHash(ctx, sub.name, sub.args);
-        // Validate stored watermark BEFORE emitting any gap envelope or scanning so one invalid
-        // subscription can never emit corrupt cursors or starve healthy subscriptions (ISO-03)
-        let wm: DecodedCursor;
+      const counters = { delivered: 0, abandoned: 0, terminated: 0 };
+      const subscriptions = await deps.storage.listWebhookSubscriptions(ctx);
+      // Embedded workers supply their own principal list. Keep resolver failures
+      // visible to their per-principal error hook, even before a grant is stored.
+      const client = deps.revalidateWebhookGrant ? undefined : await deps.resolveClient(ctx);
+      for (const sub of subscriptions) {
         try {
-          wm =
-            sub.safeWatermark !== null
-              ? decodeCursor(sub.safeWatermark, scopeHash, schemaEpoch)
-              : { v: schemaEpoch, scope: scopeHash, ts: safePrefixMs, tie: "" };
+          await serialize(sub, () => sweepSubscription(ctx, sub, counters, client));
         } catch {
-          continue;
-        }
-        let liveGapPending = sub.gapPending;
-
-        // Emit pending SEP-3415 gap control envelope before event delivery (EVENT-11)
-        if (liveGapPending && deps.eventsProfile === "sep-3415") {
-          const gapCursor =
-            sub.safeWatermark ??
-            encodeCursor({ v: schemaEpoch, scope: scopeHash, ts: safePrefixMs, tie: "" });
-          const gapBody = JSON.stringify({ type: "gap", cursor: gapCursor });
-          let gapResp: WebhookPinnedResponse | null = null;
-          try {
-            gapResp = await sendSignedPinnedPost({
-              url: sub.url,
-              subscriptionId: sub.id,
-              webhookId: `msg_gap_${randomBytes(12).toString("base64url")}`,
-              secrets,
-              rawBody: gapBody,
-              nowMs,
-            });
-          } catch {
-            gapResp = null;
-          }
-          if (gapResp && gapResp.status >= 200 && gapResp.status < 300) {
-            liveGapPending = false;
-            const freshSub = await deps.storage.getWebhookSubscription({
-              issuer: sub.issuer,
-              principalId: sub.principalId,
-              instanceUrl: sub.instanceUrl,
-              url: sub.url,
-              name: sub.name,
-              canonicalArgsJson: sub.canonicalArgsJson,
-            });
-            if (freshSub && freshSub.id === sub.id) {
-              await deps.storage.upsertWebhookSubscription({ ...freshSub, gapPending: false });
-            }
-          }
-        }
-
-        if (!client) continue;
-
-        const key = subKey(sub);
-        let queue = retryQueues.get(key);
-        if (!queue) {
-          queue = new Map();
-          retryQueues.set(key, queue);
-          // Rehydrate durable retry queue across process restarts (EVENT-02, EVENT-05, EVENT-06)
-          if (deps.storage.listWebhookRetryItems) {
-            const persisted = await deps.storage.listWebhookRetryItems(key);
-            for (const row of persisted) {
-              try {
-                const parsed = JSON.parse(row.payloadJson) as PendingWebhookItem;
-                queue.set(row.eventId, {
-                  ...parsed,
-                  attempts: row.attempts,
-                  nextAttemptAtMs: row.nextAttemptAtMs,
-                });
-              } catch {
-                await deps.storage.deleteWebhookRetryItem?.(key, row.eventId);
-              }
-            }
-          }
-        }
-        let abandonedSet = abandonedEventIds.get(key);
-        if (!abandonedSet) {
-          abandonedSet = new Set();
-          abandonedEventIds.set(key, abandonedSet);
-        }
-
-        // Scan newly available occurrences since safeWatermark (propagating revocation -> terminate: REST-03)
-        let scan: Awaited<ReturnType<typeof scanRange>>;
-        try {
-          scan = await scanRange(ctx, sub.name, sub.args, wm.ts, safePrefixMs);
-        } catch (err) {
-          if (err instanceof McpDomainError && err.code === McpErrorCode.SEP_EVENTS_FORBIDDEN) {
-            terminated += 1;
-            queue.clear();
-            if (deps.eventsProfile === "sep-3415") {
-              const termBody = JSON.stringify({
-                type: "terminated",
-                error: { code: McpErrorCode.SEP_EVENTS_FORBIDDEN, message: "Credential revoked" },
-              });
-              try {
-                await sendSignedPinnedPost({
-                  url: sub.url,
-                  subscriptionId: sub.id,
-                  webhookId: `msg_terminated_${randomBytes(12).toString("base64url")}`,
-                  secrets,
-                  rawBody: termBody,
-                  nowMs,
-                });
-              } catch {
-                // Best-effort termination envelope
-              }
-            }
-            await deps.storage.deleteWebhookSubscription({
-              issuer: sub.issuer,
-              principalId: sub.principalId,
-              instanceUrl: sub.instanceUrl,
-              url: sub.url,
-              name: sub.name,
-              canonicalArgsJson: sub.canonicalArgsJson,
-            });
-            continue;
-          }
-          throw err;
-        }
-        if (scan.scanComplete) {
-          for (const entry of scan.items) {
-            const afterWm = entry.tsMs > wm.ts || (entry.tsMs === wm.ts && entry.tieKey > wm.tie);
-            if (!afterWm) continue;
-            if (queue.has(entry.eventId) || abandonedSet.has(entry.eventId)) continue;
-            const webhookId =
-              deps.eventsProfile === "chatgpt-events"
-                ? entry.eventId
-                : `msg_evt_${randomBytes(12).toString("base64url")}`;
-            const newItem: PendingWebhookItem = {
-              eventId: entry.eventId,
-              webhookId,
-              occurrence: entry.occ,
-              tieKey: entry.tieKey,
-              tsMs: entry.tsMs,
-              attempts: 0,
-              nextAttemptAtMs: nowMs,
-            };
-            queue.set(entry.eventId, newItem);
-            // Persist stable delivery webhookId BEFORE the first outbound attempt (EVENT-03)
-            await deps.storage.upsertWebhookRetryItem?.({
-              subscriptionId: key,
-              eventId: newItem.eventId,
-              payloadJson: JSON.stringify(newItem),
-              attempts: 0,
-              nextAttemptAtMs: nowMs,
-            });
-          }
-        }
-
-        let subTerminated = false;
-        let hasUnresolved = false;
-        let contiguousCursorStr =
-          sub.safeWatermark ??
-          encodeCursor({ v: schemaEpoch, scope: scopeHash, ts: safePrefixMs, tie: "" });
-        let highestProcessed: { ts: number; tie: string } | null = null;
-
-        // Always iterate in canonical (tsMs, tieKey) event order so cursor never skips earlier retries (EVENT-02)
-        const orderedQueue = Array.from(queue.values()).sort((a, b) => {
-          if (a.tsMs !== b.tsMs) return a.tsMs - b.tsMs;
-          return a.tieKey < b.tieKey ? -1 : a.tieKey > b.tieKey ? 1 : 0;
-        });
-
-        for (const item of orderedQueue) {
-          // Enforce retry backoff while blocking cursor advancement past unresolved earlier item (EVENT-05)
-          if (nowMs < item.nextAttemptAtMs) {
-            hasUnresolved = true;
-            continue;
-          }
-          // Re-verify per-occurrence visibility BEFORE every send or retry
-          let vis: "visible" | "restricted_or_missing" | "credential_revoked";
-          try {
-            vis = await client.checkVisibility(item.occurrence.bugId, item.occurrence.commentId);
-          } catch {
-            hasUnresolved = true;
-            continue;
-          }
-          if (vis === "credential_revoked") {
-            subTerminated = true;
-            terminated += 1;
-            queue.clear();
-            if (deps.eventsProfile === "sep-3415") {
-              const termBody = JSON.stringify({
-                type: "terminated",
-                error: { code: McpErrorCode.SEP_EVENTS_FORBIDDEN, message: "Credential revoked" },
-              });
-              try {
-                await sendSignedPinnedPost({
-                  url: sub.url,
-                  subscriptionId: sub.id,
-                  webhookId: `msg_terminated_${randomBytes(12).toString("base64url")}`,
-                  secrets,
-                  rawBody: termBody,
-                  nowMs,
-                });
-              } catch {
-                // Best-effort termination envelope
-              }
-            }
-            await deps.storage.deleteWebhookSubscription({
-              issuer: sub.issuer,
-              principalId: sub.principalId,
-              instanceUrl: sub.instanceUrl,
-              url: sub.url,
-              name: sub.name,
-              canonicalArgsJson: sub.canonicalArgsJson,
-            });
-            break;
-          }
-          if (vis !== "visible") {
-            queue.delete(item.eventId);
-            await deps.storage.deleteWebhookRetryItem?.(key, item.eventId);
-            continue;
-          }
-
-          // Publish contiguous safe cursor ONLY when no earlier event is unresolved (EVENT-05)
-          const itemCursor = encodeCursor({
-            v: schemaEpoch,
-            scope: scopeHash,
-            ts: item.tsMs,
-            tie: item.tieKey,
-          });
-          const bodyObj = {
-            ...buildOccurrencePayload(item.occurrence),
-            cursor: hasUnresolved ? contiguousCursorStr : itemCursor,
-          };
-          let rawBody = JSON.stringify(bodyObj);
-          if (Buffer.byteLength(rawBody, "utf8") > MAX_WEBHOOK_BYTES) {
-            // Re-trim data excerpt to guarantee final escaped JSON fits strictly <= 256 KiB (EVENT-15)
-            const minimalObj = {
-              eventId: bodyObj.eventId,
-              name: bodyObj.name,
-              timestamp: bodyObj.timestamp,
-              data: {
-                bugId: item.occurrence.bugId,
-                product: item.occurrence.product,
-                component: item.occurrence.component,
-                excerptTruncated: true,
-                untrustedUserContent: true,
-              },
-              cursor: bodyObj.cursor,
-            };
-            rawBody = JSON.stringify(minimalObj);
-          }
-
-          let resp: WebhookPinnedResponse | null = null;
-          try {
-            resp = await sendSignedPinnedPost({
-              url: sub.url,
-              subscriptionId: sub.id,
-              webhookId: item.webhookId,
-              secrets,
-              rawBody,
-              nowMs,
-            });
-          } catch {
-            resp = null;
-          }
-
-          if (!resp) {
-            // SSRF / DNS check or transport blocked — keep unresolved, do not advance watermark
-            hasUnresolved = true;
-            continue;
-          }
-
-          if (resp.status >= 200 && resp.status < 300) {
-            queue.delete(item.eventId);
-            await deps.storage.deleteWebhookRetryItem?.(key, item.eventId);
-            delivered += 1;
-            if (!hasUnresolved) {
-              contiguousCursorStr = itemCursor;
-              highestProcessed = { ts: item.tsMs, tie: item.tieKey };
-            }
-          } else if (resp.status === 410 || resp.status === 413) {
-            // Terminal for this delivery: NEVER retry; immediately persist durable gapPending (EVENT-06)
-            queue.delete(item.eventId);
-            await deps.storage.deleteWebhookRetryItem?.(key, item.eventId);
-            abandonedSet.add(item.eventId);
-            abandoned += 1;
-            liveGapPending = true;
-            if (!hasUnresolved) {
-              contiguousCursorStr = itemCursor;
-              highestProcessed = { ts: item.tsMs, tie: item.tieKey };
-            }
-            const freshSub = await deps.storage.getWebhookSubscription({
-              issuer: sub.issuer,
-              principalId: sub.principalId,
-              instanceUrl: sub.instanceUrl,
-              url: sub.url,
-              name: sub.name,
-              canonicalArgsJson: sub.canonicalArgsJson,
-            });
-            if (freshSub && freshSub.id === sub.id) {
-              await deps.storage.upsertWebhookSubscription({
-                ...freshSub,
-                safeWatermark: hasUnresolved ? freshSub.safeWatermark : contiguousCursorStr,
-                gapPending: true,
-              });
-            }
-          } else {
-            item.attempts += 1;
-            if (item.attempts >= maxRetries) {
-              queue.delete(item.eventId);
-              await deps.storage.deleteWebhookRetryItem?.(key, item.eventId);
-              abandonedSet.add(item.eventId);
-              abandoned += 1;
-              liveGapPending = true;
-              if (!hasUnresolved) {
-                contiguousCursorStr = itemCursor;
-                highestProcessed = { ts: item.tsMs, tie: item.tieKey };
-              }
-              const freshSub = await deps.storage.getWebhookSubscription({
-                issuer: sub.issuer,
-                principalId: sub.principalId,
-                instanceUrl: sub.instanceUrl,
-                url: sub.url,
-                name: sub.name,
-                canonicalArgsJson: sub.canonicalArgsJson,
-              });
-              if (freshSub && freshSub.id === sub.id) {
-                await deps.storage.upsertWebhookSubscription({
-                  ...freshSub,
-                  safeWatermark: hasUnresolved ? freshSub.safeWatermark : contiguousCursorStr,
-                  gapPending: true,
-                });
-              }
-            } else {
-              const backoffMs = Math.min(10_000, 1_000 * 2 ** (item.attempts - 1));
-              item.nextAttemptAtMs = nowMs + backoffMs;
-              await deps.storage.upsertWebhookRetryItem?.({
-                subscriptionId: key,
-                eventId: item.eventId,
-                payloadJson: JSON.stringify(item),
-                attempts: item.attempts,
-                nextAttemptAtMs: item.nextAttemptAtMs,
-              });
-              hasUnresolved = true;
-            }
-          }
-        }
-
-        // Only advance watermark if scan was complete, no unresolved items remain, AND live subscription still exists (EVENT-07, EVENT-08)
-        if (
-          !subTerminated &&
-          scan.scanComplete &&
-          !hasUnresolved &&
-          queue.size === 0 &&
-          highestProcessed
-        ) {
-          const freshSub = await deps.storage.getWebhookSubscription({
-            issuer: sub.issuer,
-            principalId: sub.principalId,
-            instanceUrl: sub.instanceUrl,
-            url: sub.url,
-            name: sub.name,
-            canonicalArgsJson: sub.canonicalArgsJson,
-          });
-          if (freshSub && freshSub.id === sub.id) {
-            const newWm = encodeCursor({
-              v: schemaEpoch,
-              scope: scopeHash,
-              ts: Math.max(highestProcessed.ts, safePrefixMs),
-              tie: highestProcessed.ts >= safePrefixMs ? highestProcessed.tie : "",
-            });
-            await deps.storage.upsertWebhookSubscription({
-              ...freshSub,
-              safeWatermark: newWm,
-              gapPending: freshSub.gapPending || liveGapPending,
-            });
-          }
+          // A transient failure in one subscription must not starve another.
+          reportState(sub.id, "scan_incomplete");
         }
       }
-
-      return { delivered, abandoned, terminated };
+      return counters;
     },
   };
 }

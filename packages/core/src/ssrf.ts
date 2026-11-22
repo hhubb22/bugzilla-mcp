@@ -23,6 +23,7 @@ function isNonPublicIpv4(octets: [number, number, number, number]): boolean {
   if (a === 172 && b >= 16 && b <= 31) return true; // 172.16.0.0/12
   if (a === 192 && b === 0 && c === 0) return true; // 192.0.0.0/24
   if (a === 192 && b === 0 && c === 2) return true; // TEST-NET-1
+  if (a === 192 && b === 88 && c === 99) return true; // deprecated 6to4 relay
   if (a === 192 && b === 168) return true; // 192.168.0.0/16
   if (a === 198 && (b === 18 || b === 19)) return true; // benchmarking
   if (a === 198 && b === 51 && c === 100) return true; // TEST-NET-2
@@ -95,6 +96,7 @@ export function isPublicIpAddress(ip: string): boolean {
     if (g0 === 0x2001 && g1 <= 0x01ff) return false;
     // Reject Documentation 2001:db8::/32
     if (g0 === 0x2001 && g1 === 0x0db8) return false;
+    if (g0 === 0x3fff && g1 <= 0x0fff) return false; // Documentation 3fff::/20
     // Reject 6to4 tunnel prefix 2002::/16 (can encapsulate private IPv4)
     if (g0 === 0x2002) return false;
     // Reject 3ffe::/16 (deprecated 6bone)

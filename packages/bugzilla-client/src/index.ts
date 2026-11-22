@@ -8,6 +8,7 @@ import type {
   IsoTimestamp,
   ProposalDiff,
 } from "@bugzilla-mcp/contracts";
+export { confirmedHistoryKey, type ConfirmedFieldChange } from "./history.js";
 
 export interface BugzillaClientConfig {
   readonly baseUrl: string;
@@ -52,6 +53,8 @@ export interface UpstreamBugzillaOccurrence {
   readonly product: string;
   readonly component: string;
   readonly actor: string;
+  readonly severity?: string;
+  readonly confirmedHistoryKey?: string;
   readonly requestee?: string;
   readonly fieldsChanged?: readonly string[];
   readonly summaryText?: string;
@@ -97,7 +100,11 @@ export interface BugzillaClient {
   applyBugUpdate(
     bugId: BugId,
     diff: ProposalDiff,
-  ): Promise<{ updatedLastChangeTime: IsoTimestamp; commentId?: number }>;
+  ): Promise<{
+    updatedLastChangeTime: IsoTimestamp;
+    commentId?: number;
+    confirmedHistoryKey?: string;
+  }>;
   createBug(input: Omit<BugzillaCreateBugInput, "idempotencyKey">): Promise<{ bugId: BugId }>;
   listChangesSince(params: { since: IsoTimestamp; limit: number; offset: number }): Promise<{
     occurrences: readonly UpstreamBugzillaOccurrence[];

@@ -1,10 +1,9 @@
 import { createServer, type IncomingMessage, type ServerResponse } from "node:http";
 import type { AddressInfo } from "node:net";
-import {
-  createDualEraHttpHandler,
-  type DualEraHttpRequest,
-  type HttpServerConfig,
-} from "./index.js";
+import { createSyntheticEventsService, startWebhookDeliveryLoop } from "@bugzilla-mcp/core";
+import { buildDualEraHttpHandler } from "./http-handler.js";
+import type { DualEraHttpRequest, HttpServerConfig } from "./index.js";
+import { httpsWebhookTransport } from "./webhook-transport.js";
 
 export interface RunningHttpServer {
   readonly port: number;
@@ -14,6 +13,70 @@ export interface RunningHttpServer {
 }
 
 const MAX_REQUEST_BODY_BYTES = 1024 * 1024; // 1 MiB
+const WEBHOOK_INTERVAL_MS = 250;
+
+async function configureWebhooks(config: HttpServerConfig): Promise<HttpServerConfig> {
+  if (config.webhookEnabled !== true) return { ...config, webhookEnabled: false };
+
+  const storage = config.core.storage;
+  const local = config.mode === "local-trusted-ide" && !config.authenticateBearerToken;
+  const authenticated = local
+    ? Boolean(config.localAuthToken?.trim())
+    : !!config.authenticateBearerToken;
+  const bindingAvailable = local
+    ? config.localPrincipal !== undefined &&
+      Boolean(await config.core.resolveClient(config.localPrincipal).catch(() => null))
+    : !!(config.resolveWebhookPrincipal || storage.getBoundCredential);
+  const transport = config.core.webhookTransport ?? httpsWebhookTransport;
+  const retryLimit = config.core.maxWebhookRetries ?? 3;
+  if (
+    !authenticated ||
+    !bindingAvailable ||
+    !storage.durableWebhooks ||
+    !storage.listWebhookGrants ||
+    !storage.listWebhookRetryItems ||
+    !storage.upsertWebhookRetryItem ||
+    !storage.deleteWebhookRetryItem ||
+    typeof transport.resolveHost !== "function" ||
+    typeof transport.postPinned !== "function" ||
+    !Number.isSafeInteger(retryLimit) ||
+    retryLimit < 0
+  ) {
+    throw Object.assign(
+      new Error(
+        "Webhook delivery requires authentication, current bindings, durable storage and an HTTPS sender",
+      ),
+      {
+        code: "WebhookConfigurationError",
+      },
+    );
+  }
+
+  return {
+    ...config,
+    core: {
+      ...config.core,
+      eventsProfile: config.eventsProfile,
+      webhookEnabled: true,
+      webhookTransport: transport,
+      async revalidateWebhookGrant(grant) {
+        if (config.resolveWebhookPrincipal) return config.resolveWebhookPrincipal(grant);
+        if (local) return config.localPrincipal ?? null;
+        const binding = await storage.getBoundCredential?.(
+          grant.issuer,
+          grant.principalId,
+          grant.instanceUrl,
+        );
+        return binding?.credentialGeneration === grant.credentialGeneration ? grant : null;
+      },
+      onWebhookScanState(subscriptionId, state) {
+        process.stderr.write(
+          `${JSON.stringify({ event: "mcp.events.scan", subscriptionId, state })}\n`,
+        );
+      },
+    },
+  };
+}
 
 function readBody(req: IncomingMessage): Promise<string> {
   return new Promise((resolve, reject) => {
@@ -63,7 +126,13 @@ export async function startMcpHttpServer(params: {
     );
   }
 
-  const handler = createDualEraHttpHandler(params.config);
+  const config = await configureWebhooks(params.config);
+  const events = createSyntheticEventsService({
+    ...config.core,
+    eventsProfile: config.eventsProfile,
+    webhookEnabled: config.webhookEnabled === true,
+  });
+  const handler = buildDualEraHttpHandler(config, events);
   const server = createServer((req: IncomingMessage, res: ServerResponse) => {
     void (async () => {
       try {
@@ -115,13 +184,24 @@ export async function startMcpHttpServer(params: {
 
   const addr = server.address() as AddressInfo;
   const actualPort = addr.port;
+  const delivery = config.webhookEnabled
+    ? startWebhookDeliveryLoop({
+        events,
+        listPrincipals: () => config.core.storage.listWebhookGrants!(),
+        intervalMs: WEBHOOK_INTERVAL_MS,
+      })
+    : undefined;
   return {
     port: actualPort,
     host,
     baseUrl: `http://${host}:${actualPort}`,
-    close: () =>
-      new Promise<void>((resolve, reject) => {
-        server.close((err) => (err ? reject(err) : resolve()));
-      }),
+    async close() {
+      await Promise.all([
+        delivery?.stop(),
+        new Promise<void>((resolve, reject) => {
+          server.close((err) => (err ? reject(err) : resolve()));
+        }),
+      ]);
+    },
   };
 }

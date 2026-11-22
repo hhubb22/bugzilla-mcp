@@ -6,6 +6,10 @@ export interface HttpServerConfig {
   readonly allowedOrigins: readonly string[];
   readonly allowAbsentOrigin?: boolean;
   readonly eventsProfile: EventsProfile;
+  readonly webhookEnabled?: boolean;
+  readonly readOnly?: boolean;
+  /** Revalidate an established Webhook grant against current authorization, without storing a bearer token. */
+  readonly resolveWebhookPrincipal?: (grant: PrincipalContext) => Promise<PrincipalContext | null>;
   /** Explicitly opt-in non-sensitive parameter names annotated with x-mcp-header per tool/event name */
   readonly headerRoutedParams?: Readonly<Record<string, readonly string[]>>;
   readonly core: CoreDependencies;

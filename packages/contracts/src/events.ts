@@ -27,6 +27,62 @@ export const EventFilterArgsSchema = z.object({
 });
 export type EventFilterArgs = z.infer<typeof EventFilterArgsSchema>;
 
+const watchedFields = ["status", "assigned_to", "priority", "flags"] as const;
+const filtersByEvent = {
+  "bugzilla.bug.created": EventFilterArgsSchema.pick({
+    product: true,
+    component: true,
+    severity: true,
+    includeSelf: true,
+  }).strict(),
+  "bugzilla.bug.updated": EventFilterArgsSchema.pick({
+    product: true,
+    bugIds: true,
+    includeSelf: true,
+  })
+    .extend({ watchedFields: z.array(z.enum(watchedFields)).optional() })
+    .strict(),
+  "bugzilla.bug.commented": EventFilterArgsSchema.pick({
+    product: true,
+    bugIds: true,
+    mentionMe: true,
+    includeSelf: true,
+  }).strict(),
+  "bugzilla.flag.needinfo": EventFilterArgsSchema.pick({
+    product: true,
+    requestee: true,
+    includeSelf: true,
+  }).strict(),
+} satisfies Record<EventName, object>;
+
+export function parseEventFilters(name: EventName, input: unknown) {
+  return filtersByEvent[name].safeParse(input === undefined ? {} : input);
+}
+
+export function eventFilterJsonSchema(name: EventName) {
+  const string = { type: "string", minLength: 1 };
+  const fields: Record<keyof EventFilterArgs, object> = {
+    product: string,
+    component: string,
+    severity: string,
+    bugIds: { type: "array", items: { type: "integer", minimum: 1 }, maxItems: 100 },
+    watchedFields: { type: "array", items: { type: "string", enum: watchedFields } },
+    mentionMe: { type: "boolean" },
+    requestee: string,
+    includeSelf: { type: "boolean", default: false },
+  };
+  return {
+    type: "object",
+    additionalProperties: false,
+    properties: Object.fromEntries(
+      Object.keys(filtersByEvent[name].shape).map((key) => [
+        key,
+        fields[key as keyof EventFilterArgs],
+      ]),
+    ),
+  };
+}
+
 export const EventOccurrenceSchema = z.object({
   eventId: z.string().min(1),
   name: EventNameSchema,

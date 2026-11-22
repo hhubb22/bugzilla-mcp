@@ -7,6 +7,7 @@ import type {
   IsoTimestamp,
   ProposalDiff,
 } from "@bugzilla-mcp/contracts";
+import { confirmedHistoryKey } from "./history.js";
 import {
   BugzillaAccessDeniedError,
   BugzillaCredentialRevokedError,
@@ -203,6 +204,9 @@ export function createRestBugzillaClient(config: BugzillaClientConfig): Bugzilla
         name?: string;
         groups?: Array<{ name: string }>;
       }>("/whoami");
+      if (whoamiResp.status === 401 || [300, 306].includes(whoamiResp.bzErrorCode ?? 0)) {
+        throw new BugzillaCredentialRevokedError();
+      }
       if (whoamiResp.status === 200 && whoamiResp.data?.name) {
         let groups = whoamiResp.data.groups;
         if (!groups && whoamiResp.data.id !== undefined) {
@@ -234,6 +238,9 @@ export function createRestBugzillaClient(config: BugzillaClientConfig): Bugzilla
             saved_reports?: unknown[];
           }>;
         }>("/user", { query: [["match", "*"]] });
+        if (usersResp.status === 401 || [300, 306].includes(usersResp.bzErrorCode ?? 0)) {
+          throw new BugzillaCredentialRevokedError();
+        }
         if (usersResp.status === 200 && usersResp.data?.users) {
           // Strict self-identification only: never guess from a sole directory match (REST-04)
           const selfUser = usersResp.data.users.find(
@@ -509,12 +516,33 @@ export function createRestBugzillaClient(config: BugzillaClientConfig): Bugzilla
       }
       if (diff.flags !== undefined) body.flags = diff.flags;
       const resp = await requestJson<{
-        bugs?: Array<{ id?: number; last_change_time?: IsoTimestamp }>;
+        bugs?: Array<{
+          id?: number;
+          last_change_time?: IsoTimestamp;
+          changes?: Record<string, { removed?: unknown; added?: unknown }>;
+        }>;
       }>(`/bug/${bugId}`, { method: "PUT", body });
       if (resp.status >= 400 || !resp.parseOk) {
         throw new Error(`Bugzilla update failed (${resp.status})`);
       }
-      let updatedLastChangeTime = resp.data?.bugs?.[0]?.last_change_time;
+      const acknowledgement = resp.data?.bugs?.[0];
+      const changes = Object.entries(acknowledgement?.changes ?? {});
+      const confirmed =
+        acknowledgement?.id === bugId &&
+        acknowledgement.last_change_time &&
+        changes.every(
+          ([, change]) => typeof change?.removed === "string" && typeof change?.added === "string",
+        )
+          ? confirmedHistoryKey(
+              acknowledgement.last_change_time,
+              changes.map(([field, change]) => ({
+                field,
+                removed: String(change.removed),
+                added: String(change.added),
+              })),
+            )
+          : undefined;
+      let updatedLastChangeTime = acknowledgement?.last_change_time;
       if (!updatedLastChangeTime && resp.data?.bugs?.[0]?.id !== undefined) {
         const refreshed = await requestJson<{ bugs?: RawBug[] }>(`/bug/${bugId}`, {
           query: [["include_fields", "last_change_time"]],
@@ -524,7 +552,7 @@ export function createRestBugzillaClient(config: BugzillaClientConfig): Bugzilla
       if (!updatedLastChangeTime) {
         throw new Error("Bugzilla update response missing last_change_time acknowledgement");
       }
-      return { updatedLastChangeTime };
+      return { updatedLastChangeTime, ...(confirmed ? { confirmedHistoryKey: confirmed } : {}) };
     },
 
     async createBug(input: Omit<BugzillaCreateBugInput, "idempotencyKey">) {
@@ -571,10 +599,18 @@ export function createRestBugzillaClient(config: BugzillaClientConfig): Bugzilla
         ["last_change_time", overlapSince],
       ];
       const bugListResp = await requestJson<{ bugs?: RawBug[] }>("/bug", { query });
-      if (bugListResp.bzErrorCode === 306 || bugListResp.bzErrorCode === 300) {
+      if (
+        bugListResp.status === 401 ||
+        bugListResp.bzErrorCode === 306 ||
+        bugListResp.bzErrorCode === 300
+      ) {
         throw new BugzillaCredentialRevokedError();
       }
-      if (bugListResp.status >= 400 || !bugListResp.parseOk || !bugListResp.data) {
+      if (
+        bugListResp.status >= 400 ||
+        !bugListResp.parseOk ||
+        !Array.isArray(bugListResp.data?.bugs)
+      ) {
         return { occurrences: [], scanComplete: false };
       }
       const rawBugs = bugListResp.data.bugs ?? [];
@@ -591,26 +627,43 @@ export function createRestBugzillaClient(config: BugzillaClientConfig): Bugzilla
             product: bug.product,
             component: bug.component,
             actor: rawBug.creator ?? bug.assignedTo,
+            ...(typeof rawBug.severity === "string" ? { severity: rawBug.severity } : {}),
             summaryText: bug.summary,
           });
         }
         const commentsResp = await requestJson<{
           bugs?: Record<string, { comments?: RawComment[] }>;
         }>(`/bug/${bug.id}/comment`, { query: [["new_since", overlapSince]] });
-        if (commentsResp.bzErrorCode === 306 || commentsResp.bzErrorCode === 300) {
+        if (
+          commentsResp.status === 401 ||
+          commentsResp.bzErrorCode === 306 ||
+          commentsResp.bzErrorCode === 300
+        ) {
           throw new BugzillaCredentialRevokedError();
         }
         const historyResp = await requestJson<{
           bugs?: Array<{ history?: RawHistoryEntry[] }>;
         }>(`/bug/${bug.id}/history`, { query: [["new_since", overlapSince]] });
-        if (historyResp.bzErrorCode === 306 || historyResp.bzErrorCode === 300) {
+        if (
+          historyResp.status === 401 ||
+          historyResp.bzErrorCode === 306 ||
+          historyResp.bzErrorCode === 300
+        ) {
           throw new BugzillaCredentialRevokedError();
         }
+        // A candidate disappearing mid-scan must not be released. Other detail failures
+        // leave the prefix unverified rather than silently looking like an empty history.
         if (
-          commentsResp.status >= 500 ||
-          !commentsResp.parseOk ||
-          historyResp.status >= 500 ||
-          !historyResp.parseOk
+          [commentsResp, historyResp].some(({ bzErrorCode }) =>
+            [101, 102, 110, 111, 505].includes(bzErrorCode ?? 0),
+          )
+        )
+          continue;
+        if (
+          commentsResp.status >= 400 ||
+          historyResp.status >= 400 ||
+          !Array.isArray(commentsResp.data?.bugs?.[String(bug.id)]?.comments) ||
+          !Array.isArray(historyResp.data?.bugs?.[0]?.history)
         ) {
           return { occurrences: [], scanComplete: false };
         }
@@ -629,32 +682,57 @@ export function createRestBugzillaClient(config: BugzillaClientConfig): Bugzilla
           });
         }
         const historyEntries = historyResp.data?.bugs?.[0]?.history ?? [];
-        for (const entry of historyEntries) {
-          const fieldsChanged = entry.changes.map((ch) => ch.field_name);
+        const rows = historyEntries.map((entry) => ({
+          entry,
+          key: confirmedHistoryKey(
+            entry.when,
+            entry.changes.map(({ field_name, removed, added }) => ({
+              field: field_name,
+              removed,
+              added,
+            })),
+          ),
+        }));
+        const counts = new Map<string, number>();
+        const positions = new Map<string, number>();
+        for (const { key } of rows) if (key) counts.set(key, (counts.get(key) ?? 0) + 1);
+        for (const { entry, key } of rows) {
+          if (!key) continue;
+          // Identical deltas in one REST history represent separate occurrences, not
+          // duplicate observations of the same page.
+          const position = (positions.get(key) ?? 0) + 1;
+          positions.set(key, position);
+          const rowKey = `${key}:${position}`;
+          const proof = counts.get(key) === 1 ? { confirmedHistoryKey: key } : {};
+          const fieldsChanged = entry.changes.map((ch) =>
+            ch.field_name === "flagtypes.name" ? "flags" : ch.field_name,
+          );
           occurrences.push({
             kind: "bugzilla.bug.updated",
             bugId: bug.id,
-            changeKey: `history-${entry.when}-${entry.who}-${fieldsChanged.join(",")}`,
+            changeKey: rowKey,
             timestamp: entry.when,
             product: bug.product,
             component: bug.component,
             actor: entry.who,
             fieldsChanged,
             summaryText: bug.summary,
+            ...proof,
           });
-          for (const ch of entry.changes) {
+          for (const [index, ch] of entry.changes.entries()) {
             if (ch.field_name === "flagtypes.name" && ch.added.includes("needinfo?")) {
               const reqMatch = /needinfo\?\(([^)]+)\)/.exec(ch.added);
               occurrences.push({
                 kind: "bugzilla.flag.needinfo",
                 bugId: bug.id,
-                changeKey: `needinfo-${entry.when}-${entry.who}-${reqMatch?.[1] ?? ""}`,
+                changeKey: `${rowKey}:needinfo:${index}`,
                 timestamp: entry.when,
                 product: bug.product,
                 component: bug.component,
                 actor: entry.who,
                 ...(reqMatch?.[1] ? { requestee: reqMatch[1] } : {}),
                 summaryText: bug.summary,
+                ...proof,
               });
             }
           }

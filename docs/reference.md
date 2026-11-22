@@ -18,6 +18,9 @@ Entry point: `bun run packages/server/src/cli.ts [--transport=stdio|http] [--hos
 | `BUGZILLA_PRINCIPAL_ID`         | `local-user`                        | Local principal identifier for `local-trusted-ide` mode.                                                                                            |
 | `MCP_DEPLOYMENT_MODE`           | `local-trusted-ide`                 | Deployment mode (`local-trusted-ide` or `cloud-multi-user`; cloud mode requires programmatic `startMcpHttpServer`).                                 |
 | `MCP_EVENTS_PROFILE`            | `sep-3415`                          | Events dialect: `sep-3415` (standard MCP Events) or `chatgpt-events` (ChatGPT Events adapter).                                                      |
+| `MCP_WEBHOOK_ENABLED`           | `false`                             | Enable Webhook delivery in HTTP mode. Requires authentication, a Bugzilla credential binding, and file-backed SQLite.                               |
+| `MCP_READ_ONLY`                 | `false`                             | List only read tools and reject direct calls to write tools in HTTP mode.                                                                           |
+| `MCP_MAX_WEBHOOK_RETRIES`       | `3`                                 | Additional attempts after the first Webhook send. Nonnegative integer.                                                                              |
 | `MCP_LOCAL_TOKEN`               | Random 24-byte base64url            | Per-installation bearer token required for local Streamable HTTP requests.                                                                          |
 | `MCP_ALLOWED_ORIGINS`           | `http://127.0.0.1,http://localhost` | Comma-separated CORS/Origin allowlist for HTTP requests.                                                                                            |
 | `MCP_SIGNING_SECRET`            | Random 32-byte hex                  | HMAC-SHA256 signing secret for approval tokens and binding tickets. Set a persistent secret in production.                                          |
@@ -60,28 +63,34 @@ Entry point: `bun run packages/server/src/cli.ts [--transport=stdio|http] [--hos
 
 ### Event Types
 
-| Event Name               | Trigger                        | Filter Arguments                                                       |
-| :----------------------- | :----------------------------- | :--------------------------------------------------------------------- |
-| `bugzilla.bug.created`   | New bug matching filters       | `product`, `component`, `bugIds` (`<= 100`), `severity`, `includeSelf` |
-| `bugzilla.bug.updated`   | Field changes on matching bugs | Above + `watchedFields`                                                |
-| `bugzilla.bug.commented` | New visible comment            | Above + `mentionMe`                                                    |
-| `bugzilla.flag.needinfo` | `needinfo` flag set/changed    | Above + `requestee` (`"me"` or email)                                  |
+| Event Name               | Trigger                        | Filter Arguments                                                  |
+| :----------------------- | :----------------------------- | :---------------------------------------------------------------- |
+| `bugzilla.bug.created`   | New bug matching filters       | `product`, `component`, `severity`, `includeSelf`                 |
+| `bugzilla.bug.updated`   | Field changes on matching bugs | `product`, `bugIds` (`<= 100`), `watchedFields`, `includeSelf`    |
+| `bugzilla.bug.commented` | New visible comment            | `product`, `bugIds` (`<= 100`), `mentionMe`, `includeSelf`        |
+| `bugzilla.flag.needinfo` | `needinfo` flag set/changed    | `product`, `requestee` (`"me"` or a Bugzilla user), `includeSelf` |
 
 ### Cursor & Delivery Guarantees
 
-- **Lag Window**: Events newer than `now - lagWindowMs` are held back until stable so late-committing DB transactions are never silently skipped.
-- **Scope-Bound Cursors**: Cursors encode `{ v, scope, ts, tie }` where `scope` hashes `(issuer, principalId, instanceUrl, eventName, canonicalArgs)`. Cross-issuer, cross-instance, cross-filter, or out-of-range (`|ts| > 8.64e15`) cursors are rejected with `-32602 InvalidParams`.
-- **Self-Write Suppression**: By default (`includeSelf: false`), writes performed by `bugzilla-mcp` on the same `(instanceUrl, bugId)` are suppressed via `self_writes` provenance to prevent infinite agent loops.
+- **Lag Window**: Events newer than `now - lagWindowMs` are held back. The window covers upstream changes that become visible within it, not arbitrarily late changes. An incomplete scan returns `-32603` with `data.reason: "scan_incomplete"` and no replacement cursor.
+- **Scope-Bound Cursors**: Use a cursor only with the same tenant, Bugzilla credential generation, event and filters. A malformed or foreign cursor returns `-32602`; an outdated schema epoch returns `-32026` with `data.reason: "schema_changed"`.
+- **Self-Write Suppression**: With `includeSelf: false` (default), an event is suppressed only when confirmed write provenance uniquely identifies it for that tenant. The server preserves events with ambiguous history and doesn't match by comment text or author.
+- **Severity**: Creation filters compare the exact severity at collection. Retries keep that selection.
 - **Standard Webhooks Security**:
   - Subscription secrets must match `^whsec_[A-Za-z0-9+/=]{32,88}$` (24–64 random bytes).
-  - Outbound callbacks resolve DNS upfront, reject private/loopback/link-local/CGNAT IPs (SSRF protection), pin the resolved IP + `Host` + TLS SNI, and disable HTTP redirects (`followRedirects: false`).
+  - Before each outbound connection, the sender validates all DNS results, pins a public IP while preserving `Host` and TLS SNI, and does not follow redirects.
   - Signatures use Standard Webhooks HMAC-SHA256 (`webhook-id`, `webhook-timestamp`, `webhook-signature`) with dual-secret rotation grace window.
   - Subscriptions are partitioned by `(issuer, principalId, instanceUrl, url, name, canonicalArgsJson)` with durable SQLite retry queues and per-principal / per-subscription fault isolation.
 
 ### Dialect Profiles
 
-- **`sep-3415`** (default): Standard MCP Events (`events/list`, `events/poll`, `events/subscribe`, `events/unsubscribe`, `gap` and `terminated` control envelopes).
-- **`chatgpt-events`**: ChatGPT Events dialect compatibility adapter over the same underlying cursor & visibility engine.
+- **`sep-3415`** (default): `events/list` and `events/poll`. When Webhook delivery is enabled, supports subscribe and unsubscribe, plus signed `gap` and `terminated` messages.
+- **`chatgpt-events`**: Webhook-only on both HTTP protocol revisions. With Webhook delivery off, the server does not advertise Events. It reports a delivery gap with `truncated: true` on refresh, not with a control message.
+
+Neither profile advertises `push`. A callback `2xx` acknowledges receipt, not host
+triage completion. Check the HTTP process's `stderr` for one `mcp.events.scan` JSON
+record per state transition, with an opaque `subscriptionId` and a `state` of
+`idle`, `active`, `scan_incomplete`, or `authorization_revoked`.
 
 ## HTTP Endpoints
 

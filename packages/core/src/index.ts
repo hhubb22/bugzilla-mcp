@@ -105,12 +105,17 @@ export interface CoreDependencies {
   readonly secretRotationGraceMs?: number;
   readonly clock?: () => number;
   readonly webhookTransport?: WebhookOutboundTransport;
+  readonly webhookEnabled?: boolean;
+  readonly revalidateWebhookGrant?: (grant: PrincipalContext) => Promise<PrincipalContext | null>;
+  readonly onWebhookScanState?: (subscriptionId: string, state: WebhookScanState) => void;
   readonly cloudApprovalService?: CloudApprovalTokenService;
   readonly isPolicyGranted?: (
     ctx: PrincipalContext,
     input: BugzillaProposeUpdateInput,
   ) => Promise<boolean>;
 }
+
+export type WebhookScanState = "idle" | "active" | "scan_incomplete" | "authorization_revoked";
 
 export interface WriteGuardService {
   postAnalysis(ctx: PrincipalContext, input: BugzillaPostAnalysisInput): Promise<WriteGuardOutcome>;
@@ -205,13 +210,12 @@ export function startWebhookDeliveryLoop(params: {
   listPrincipals: () => Promise<readonly PrincipalContext[]>;
   intervalMs: number;
   onError?: (err: unknown) => void;
-}): { stop(): void } {
+}): { stop(): Promise<void> } {
   let stopped = false;
-  let running = false;
+  let running: Promise<void> | undefined;
   const timer = setInterval(() => {
     if (stopped || running) return;
-    running = true;
-    void (async () => {
+    running = (async () => {
       try {
         const principals = await params.listPrincipals();
         for (const ctx of principals) {
@@ -225,7 +229,7 @@ export function startWebhookDeliveryLoop(params: {
       } catch (err) {
         params.onError?.(err);
       } finally {
-        running = false;
+        running = undefined;
       }
     })();
   }, params.intervalMs);
@@ -233,9 +237,10 @@ export function startWebhookDeliveryLoop(params: {
     timer.unref();
   }
   return {
-    stop() {
+    async stop() {
       stopped = true;
       clearInterval(timer);
+      await running;
     },
   };
 }

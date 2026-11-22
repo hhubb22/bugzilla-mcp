@@ -71,6 +71,10 @@ bun run packages/server/src/cli.ts --transport=http --host=127.0.0.1 --port=3878
 
 Clients connect to `http://127.0.0.1:3878/mcp` with header `Authorization: Bearer <MCP_LOCAL_TOKEN>`.
 
+HTTP starts with Webhook delivery off. Set `MCP_WEBHOOK_ENABLED=true` to enable it
+with a bound Bugzilla credential and a file-backed `BUGZILLA_DB_PATH`. Set
+`MCP_READ_ONLY=true` on a connector used for read-only triage.
+
 ## 3. Cloud Multi-User Embedding
 
 In `cloud-multi-user` mode, the CLI intentionally fails fast because production cloud deployments **must** supply:
@@ -84,11 +88,7 @@ In `cloud-multi-user` mode, the CLI intentionally fails fast because production 
 ```ts
 import { createBugzillaClient } from "@bugzilla-mcp/bugzilla-client";
 import type { PrincipalContext } from "@bugzilla-mcp/contracts";
-import {
-  createCloudApprovalTokenService,
-  createSyntheticEventsService,
-  startWebhookDeliveryLoop,
-} from "@bugzilla-mcp/core";
+import { createCloudApprovalTokenService } from "@bugzilla-mcp/core";
 import {
   createEncryptedCredentialVault,
   startMcpHttpServer,
@@ -105,7 +105,7 @@ const cloudApprovalService = createCloudApprovalTokenService(
 
 const core = {
   storage,
-  eventsProfile: "sep-3415" as const,
+  eventsProfile: "chatgpt-events" as const,
   lagWindowMs: 3_000,
   causalBudgetPerBug: 5,
   causalBudgetWindowMs: 300_000,
@@ -129,7 +129,9 @@ const config: HttpServerConfig = {
   mode: "cloud-multi-user",
   publicBaseUrl: "https://bugzilla-mcp.example.com",
   allowedOrigins: ["https://chatgpt.com", "https://claude.ai"],
-  eventsProfile: "sep-3415",
+  eventsProfile: "chatgpt-events",
+  webhookEnabled: true,
+  readOnly: true,
   bindingSecret: process.env.BINDING_SIGNING_SECRET!,
   core,
   authenticateBearerToken: async (token) => {
@@ -147,15 +149,18 @@ const config: HttpServerConfig = {
 
 const running = await startMcpHttpServer({ config, host: "0.0.0.0", port: 8443 });
 
-// Optional: background webhook delivery loop (fault-isolated per principal and per subscription)
-const events = createSyntheticEventsService(core);
-const deliveryLoop = startWebhookDeliveryLoop({
-  events,
-  listPrincipals: listActiveWebhookPrincipals,
-  intervalMs: 15_000,
-  onError: (err) => console.error("[webhook-loop]", err),
-});
+// On shutdown, await running.close() to stop HTTP and the delivery loop.
 ```
+
+The HTTP runtime supplies the HTTPS sender and delivery loop. Use a file-backed
+SQLite database for subscriptions and retries. `WebhookConfigurationError` means
+the server did not start listening.
+
+When your authorization provider can revoke a grant independently of its
+Bugzilla credential, configure `resolveWebhookPrincipal` to load the current
+principal and scopes for the stored grant, or return `null` when revoked. The
+default cloud resolver checks the current stored credential generation. It does
+not retain or replay the client's OAuth bearer token.
 
 ### Multi-Issuer Guarantees
 

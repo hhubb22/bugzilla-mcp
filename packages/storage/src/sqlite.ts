@@ -48,6 +48,16 @@ const SCHEMA_SQL = `
     diff_key TEXT
   );
 
+  CREATE TABLE IF NOT EXISTS tenant_self_writes (
+    issuer TEXT NOT NULL,
+    principal_id TEXT NOT NULL,
+    instance_url TEXT NOT NULL,
+    bug_id INTEGER NOT NULL,
+    artifact_key TEXT NOT NULL
+  );
+  CREATE INDEX IF NOT EXISTS idx_tenant_self_writes
+    ON tenant_self_writes (issuer, principal_id, instance_url, bug_id, artifact_key);
+
   CREATE TABLE IF NOT EXISTS write_audits (
     audit_id TEXT NOT NULL,
     issuer TEXT NOT NULL,
@@ -535,6 +545,8 @@ export function openSqliteStorage(dbPath: string): StoragePorts {
   db.exec(SCHEMA_SQL);
   migrateLegacyTenantTables(db);
   db.exec(POST_MIGRATION_INDEX_SQL);
+  const databases = db.prepare("PRAGMA database_list").all() as { name: string; file: string }[];
+  const durableWebhooks = databases.some((entry) => entry.name === "main" && entry.file !== "");
 
   function readRawReceiptRow(scope: IdempotencyScope):
     | { readonly exists: false }
@@ -569,6 +581,20 @@ export function openSqliteStorage(dbPath: string): StoragePorts {
   }
 
   return {
+    durableWebhooks,
+    async listWebhookGrants() {
+      const rows = db.prepare("SELECT sub_json FROM webhook_subscriptions").all() as {
+        sub_json: string;
+      }[];
+      const tenants = new Map<string, NonNullable<StoredWebhookSubscription["grant"]>>();
+      for (const row of rows) {
+        const sub = JSON.parse(row.sub_json) as StoredWebhookSubscription;
+        if (!sub.verified || sub.revoked || !sub.grant) continue;
+        const key = JSON.stringify([sub.issuer, sub.principalId, sub.instanceUrl]);
+        tenants.set(key, sub.grant);
+      }
+      return [...tenants.values()];
+    },
     async getReceipt(scope) {
       const lookup = readRawReceiptRow(scope);
       return lookup.exists ? lookup.receipt : null;
@@ -654,29 +680,32 @@ export function openSqliteStorage(dbPath: string): StoragePorts {
     },
 
     async recordSelfWrite(entry: SelfWriteProvenance) {
-      db.prepare(
-        `INSERT INTO self_writes (instance_url, bug_id, comment_id, diff_key) VALUES (?, ?, ?, ?)`,
-      ).run(entry.instanceUrl, entry.bugId, entry.commentId ?? null, entry.diffKey ?? null);
+      // Legacy instance-only rows cannot establish tenant ownership.
+      if (!entry.issuer || !entry.principalId) return;
+      const insert = db.prepare(
+        `INSERT INTO tenant_self_writes (issuer, principal_id, instance_url, bug_id, artifact_key)
+         VALUES (?, ?, ?, ?, ?)`,
+      );
+      for (const key of [
+        entry.commentId === undefined ? undefined : `comment:${entry.commentId}`,
+        entry.diffKey,
+      ]) {
+        if (key !== undefined)
+          insert.run(entry.issuer, entry.principalId, entry.instanceUrl, entry.bugId, key);
+      }
     },
 
     async hasSelfWrite(entry: SelfWriteProvenance) {
-      if (entry.commentId !== undefined) {
-        const row = db
-          .prepare(
-            `SELECT 1 FROM self_writes WHERE instance_url = ? AND bug_id = ? AND comment_id = ? LIMIT 1`,
-          )
-          .get(entry.instanceUrl, entry.bugId, entry.commentId);
-        if (row) return true;
-      }
-      if (entry.diffKey !== undefined) {
-        const row = db
-          .prepare(
-            `SELECT 1 FROM self_writes WHERE instance_url = ? AND bug_id = ? AND diff_key = ? LIMIT 1`,
-          )
-          .get(entry.instanceUrl, entry.bugId, entry.diffKey);
-        if (row) return true;
-      }
-      return false;
+      if (!entry.issuer || !entry.principalId) return false;
+      const key = entry.commentId === undefined ? entry.diffKey : `comment:${entry.commentId}`;
+      if (!key) return false;
+      const rows = db
+        .prepare(
+          `SELECT 1 FROM tenant_self_writes WHERE issuer = ? AND principal_id = ?
+         AND instance_url = ? AND bug_id = ? AND artifact_key = ? LIMIT 2`,
+        )
+        .all(entry.issuer, entry.principalId, entry.instanceUrl, entry.bugId, key);
+      return key.startsWith("history:") ? rows.length === 1 : rows.length > 0;
     },
 
     async recordWriteAudit(entry: WriteAuditEntry) {

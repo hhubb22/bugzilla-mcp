@@ -7,6 +7,7 @@ import type {
   IdempotencyKey,
   InternalNote,
   IsoTimestamp,
+  PrincipalContext,
   ProposalDiff,
 } from "@bugzilla-mcp/contracts";
 
@@ -50,6 +51,8 @@ export interface StoredDraft {
 }
 
 export interface SelfWriteProvenance {
+  readonly issuer?: string;
+  readonly principalId?: string;
   readonly instanceUrl: string;
   readonly bugId: BugId;
   readonly commentId?: number;
@@ -86,6 +89,13 @@ export interface StoredWebhookSubscription {
   readonly verified: boolean;
   readonly safeWatermark: string | null;
   readonly gapPending: boolean;
+  readonly grant?: PrincipalContext;
+  readonly acquisitionCursor?: string;
+  readonly recoveryCursor?: string;
+  readonly lastGapCursor?: string;
+  readonly gapMessageId?: string;
+  readonly gapAttempt?: { cursor: string; attempts: number; nextAttemptAtMs: number };
+  readonly revoked?: boolean;
 }
 
 export interface StoredBindingTicket {
@@ -137,6 +147,8 @@ export interface StoredWebhookRetryItem {
 }
 
 export interface StoragePorts {
+  readonly durableWebhooks?: boolean;
+  listWebhookGrants?(): Promise<PrincipalContext[]>;
   getReceipt(scope: IdempotencyScope): Promise<StoredReceipt | null>;
   reservePending(scope: IdempotencyScope, intentHash: string): Promise<"reserved" | StoredReceipt>;
   finalizeReceipt(scope: IdempotencyScope, receipt: StoredReceipt): Promise<void>;

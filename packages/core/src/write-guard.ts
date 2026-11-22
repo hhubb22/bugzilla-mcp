@@ -192,6 +192,8 @@ export function buildWriteGuardService(deps: CoreDependencies): WriteGuardServic
 
         const artifactId = `comment:${res.commentId}`;
         await deps.storage.recordSelfWrite({
+          issuer: ctx.issuer,
+          principalId: ctx.principalId,
           instanceUrl: ctx.instanceUrl,
           bugId: validInput.bugId,
           commentId: res.commentId,
@@ -337,10 +339,12 @@ export function buildWriteGuardService(deps: CoreDependencies): WriteGuardServic
           recordedAt: nowIso(clock),
         });
         await deps.storage.recordSelfWrite({
+          issuer: ctx.issuer,
+          principalId: ctx.principalId,
           instanceUrl: ctx.instanceUrl,
           bugId: input.bugId,
           ...(updated.commentId !== undefined ? { commentId: updated.commentId } : {}),
-          diffKey: sha256Hex(canonicalJson(input.diff)),
+          ...(updated.confirmedHistoryKey ? { diffKey: updated.confirmedHistoryKey } : {}),
         });
         await deps.storage.finalizeReceipt(scope, {
           status: "applied",
@@ -391,9 +395,11 @@ export function buildWriteGuardService(deps: CoreDependencies): WriteGuardServic
         const created = await client.createBug(payload);
         const artifactId = `bug:${created.bugId}`;
         await deps.storage.recordSelfWrite({
+          issuer: ctx.issuer,
+          principalId: ctx.principalId,
           instanceUrl: ctx.instanceUrl,
           bugId: created.bugId,
-          diffKey: `create:${created.bugId}`,
+          diffKey: `created-${created.bugId}`,
         });
         await deps.storage.finalizeReceipt(scope, {
           status: "applied",
@@ -690,10 +696,12 @@ export function buildWriteGuardService(deps: CoreDependencies): WriteGuardServic
             recordedAt: nowIso(clock),
           });
           await deps.storage.recordSelfWrite({
+            issuer: ctx.issuer,
+            principalId: ctx.principalId,
             instanceUrl: ctx.instanceUrl,
             bugId: proposal.bugId,
             ...(updated.commentId !== undefined ? { commentId: updated.commentId } : {}),
-            diffKey: sha256Hex(canonicalJson(proposal.diff)),
+            ...(updated.confirmedHistoryKey ? { diffKey: updated.confirmedHistoryKey } : {}),
           });
           await deps.storage.finalizeReceipt(scope, {
             status: "applied",
