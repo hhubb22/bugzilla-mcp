@@ -561,7 +561,7 @@ const eventArgs = { includeSelf: false };
 const eventPoll = (extra: Record<string, unknown> = {}, options: RequestOptions = {}) =>
   modern("events/poll", { name: eventName, arguments: eventArgs, ...extra }, options);
 
-// EVIDENCE-OF: R-d7d0a2
+// EVIDENCE-OF: R-c83005
 test("cursor errors distinguish malformed, foreign and obsolete schema epochs through HTTP", async () => {
   const deps = dependencies(bugzilla().client, { eventSchemaEpoch: 1 });
   const { handler } = server({
@@ -590,7 +590,7 @@ test("cursor errors distinguish malformed, foreign and obsolete schema epochs th
   expect(expectError(response, -32026)?.data).toMatchObject({ reason: "schema_changed" });
 });
 
-// EVIDENCE-OF: R-f03918
+// EVIDENCE-OF: R-cad0d6
 test("poll reports Forbidden when the bound upstream credential is revoked", async () => {
   const clock = manualClock();
   const timestamp = iso(clock.now() + 1_000);
@@ -613,7 +613,7 @@ test("poll reports Forbidden when the bound upstream credential is revoked", asy
   expect(response.body).not.toContain("comment text 73");
 });
 
-// EVIDENCE-OF: R-cd4f75
+// EVIDENCE-OF: R-3be334, R-9f1561
 test("ChatGPT discovery, webhook unsubscribe and callback errors use ChatGPT wire shapes", async () => {
   const { handler } = server({
     eventsProfile: "chatgpt-events",
@@ -644,6 +644,6 @@ test("ChatGPT discovery, webhook unsubscribe and callback errors use ChatGPT wir
   expectError(response, -32015);
   for (const id of [51, 52]) {
     const envelope = rpc(await handler.handleHttp(modern("events/unsubscribe", params, { id })));
-    expect(envelope).toEqual({ jsonrpc: "2.0", id, result: {} });
+    expect(envelope).toEqual({ jsonrpc: "2.0", id, result: { resultType: "complete" } });
   }
 });

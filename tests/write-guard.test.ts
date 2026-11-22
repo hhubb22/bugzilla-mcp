@@ -308,7 +308,7 @@ test("an external edit makes a signed proposal stale and only a newly authorized
   ]);
 });
 
-// EVIDENCE-OF: R-006bf9
+// EVIDENCE-OF: R-462339
 test("new keys and event IDs cannot evade a per-bug budget, which becomes available again after its window", async () => {
   await fc.assert(
     fc.asyncProperty(fc.uniqueArray(fc.uuid(), { minLength: 4, maxLength: 7 }), async (keys) => {

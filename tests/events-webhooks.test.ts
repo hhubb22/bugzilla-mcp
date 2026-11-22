@@ -89,8 +89,7 @@ function cursor(result: Pick<PollEventsResult, "cursor">) {
   return result.cursor;
 }
 
-// EVIDENCE-OF: R-08abaf
-// EVIDENCE-OF: R-d7d0a2
+// EVIDENCE-OF: R-1006f2, R-c83005
 test.each([undefined, null])(
   "fresh cursor (%s) skips history and preserves commits that become visible inside the lag window",
   async (initial) => {
@@ -120,7 +119,6 @@ test.each([undefined, null])(
   },
 );
 
-// EVIDENCE-OF: R-d7d0a2
 test("an incomplete scan cannot skip a subsequently visible occurrence at its resume boundary", async () => {
   const env = fixture();
   const service = env.create();
@@ -140,7 +138,7 @@ test("an incomplete scan cannot skip a subsequently visible occurrence at its re
   ).toEqual([iso(epoch + 1_000)]);
 });
 
-// EVIDENCE-OF: R-d7d0a2
+// EVIDENCE-OF: R-c83005
 test("generated timestamp buckets page exactly once and agree under reversed scans with overlap", async () => {
   const generated = fc.uniqueArray(
     fc.record({
@@ -186,7 +184,7 @@ test("generated timestamp buckets page exactly once and agree under reversed sca
   );
 });
 
-// EVIDENCE-OF: R-d7d0a2
+// EVIDENCE-OF: R-c83005
 test.each(["maxAgeMs", "configured replay window"])(
   "old cursors report truncation at the %s boundary",
   async (boundary) => {
@@ -208,9 +206,8 @@ test.each(["maxAgeMs", "configured replay window"])(
   },
 );
 
-// EVIDENCE-OF: R-f03918
-// EVIDENCE-OF: R-006bf9
-test("only trusted self provenance and current per-comment visibility suppress same-second poll occurrences", async () => {
+// EVIDENCE-OF: R-cad0d6
+test("current per-comment visibility governs pagination through same-second occurrences", async () => {
   const env = fixture();
   const service = env.create();
   const normal = cursor(await service.poll(principal, poll()));
@@ -218,16 +215,6 @@ test("only trusted self provenance and current per-comment visibility suppress s
   const all = cursor(await service.poll(principal, poll({ arguments: includeSelf })));
   const timestamp = iso(epoch + 1_000);
   const identicalText = "Human quotation of the automated analysis footer";
-  await env.deps.storage.recordSelfWrite({
-    instanceUrl: principal.instanceUrl,
-    bugId: 41,
-    commentId: 91,
-  });
-  await env.deps.storage.recordSelfWrite({
-    instanceUrl: "https://another.example",
-    bugId: 41,
-    commentId: 92,
-  });
   for (const id of [91, 92, 93])
     env.add(
       comment(id, timestamp, {
@@ -240,16 +227,16 @@ test("only trusted self provenance and current per-comment visibility suppress s
   const visible = await service.poll(principal, poll({ cursor: normal, maxEvents: 1 }));
   const selfIncluded = await service.poll(principal, poll({ cursor: all, arguments: includeSelf }));
   expect(visible.events).toHaveLength(1);
-  expect(visible.hasMore).toBe(false);
+  expect(visible.hasMore).toBe(true);
   expect(selfIncluded.events).toHaveLength(2);
   expect(selfIncluded.events).toEqual(expect.arrayContaining(visible.events));
   expect(JSON.stringify(selfIncluded)).not.toContain("restricted-comment-marker");
   env.visibility.set(92, "restricted_or_missing");
+  env.visibility.set(91, "restricted_or_missing");
   const revokedVisibility = await service.poll(principal, poll({ cursor: normal }));
   expect(revokedVisibility).toMatchObject({ events: [], hasMore: false });
 });
 
-// EVIDENCE-OF: R-08abaf
 test("a new stream emits an active frame with a safe starting cursor before historical data", async () => {
   const env = fixture();
   env.add(comment(1, iso(epoch - 60_000)));
@@ -271,8 +258,6 @@ test("a new stream emits an active frame with a safe starting cursor before hist
   }
 });
 
-// EVIDENCE-OF: R-d7d0a2
-// EVIDENCE-OF: R-f03918
 test("a stream declares a truncated resume before terminating on revoked visibility", async () => {
   const env = fixture({ maxReplayWindowMs: 10_000 });
   const service = env.create();
@@ -378,7 +363,7 @@ function expectSignature(request: WebhookPinnedRequest, signingKey: string) {
   expect(header(request, "webhook-signature")?.split(/\s+/)).toContain(`v1,${digest}`);
 }
 
-// EVIDENCE-OF: R-81d5f2
+// EVIDENCE-OF: R-81b530
 test.each([null, 90 * 24 * 60 * 60 * 1000])(
   "a verified grant with ttlMs=%s survives in a fresh Bun process",
   async (ttlMs) => {
@@ -421,8 +406,7 @@ test.each([null, 90 * 24 * 60 * 60 * 1000])(
   },
 );
 
-// EVIDENCE-OF: R-08abaf
-// EVIDENCE-OF: R-28f5c2
+// EVIDENCE-OF: R-1006f2, R-28f5c2
 test("webhook challenge uses a pinned HTTPS connection and a fresh subscription starts after history", async () => {
   const receiver = callbackSpy();
   const env = fixture({ webhookTransport: receiver.transport });
@@ -510,8 +494,7 @@ test.each([false, true])(
   },
 );
 
-// EVIDENCE-OF: R-28f5c2
-// EVIDENCE-OF: R-82de80
+// EVIDENCE-OF: R-28f5c2, R-79300a
 test("retries pin the current DNS answer and sign the exact bytes with stable delivery IDs", async () => {
   const receiver = callbackSpy();
   const env = fixture({ webhookTransport: receiver.transport, maxWebhookRetries: 5 });
@@ -551,7 +534,7 @@ test("retries pin the current DNS answer and sign the exact bytes with stable de
   }
 });
 
-// EVIDENCE-OF: R-82de80
+// EVIDENCE-OF: R-cebf76
 test.each([410, 413])(
   "terminal callback %s never retries or silently advances past undelivered history",
   async (status) => {
@@ -576,7 +559,7 @@ test.each([410, 413])(
     });
     const gap = receiver.requests.find((request) => request.rawBody.includes('"gap"'));
     if (gap) expectSignature(gap, secret);
-    if (status === 413) expect(persisted).toHaveLength(1);
+    expect(persisted).toHaveLength(1);
     for (const current of persisted) {
       if (!current.gapPending && !gap) {
         const resume = cursor({ cursor: current.safeWatermark });
@@ -587,7 +570,7 @@ test.each([410, 413])(
   },
 );
 
-// EVIDENCE-OF: R-82de80
+// EVIDENCE-OF: R-79300a, R-100db5
 test("SEP envelopes are byte-bounded and delivery identifiers are independent across occurrences and subscriptions", async () => {
   const receiver = callbackSpy();
   const env = fixture({ webhookTransport: receiver.transport });
@@ -613,7 +596,7 @@ test("SEP envelopes are byte-bounded and delivery identifiers are independent ac
   }
 });
 
-// EVIDENCE-OF: R-f03918
+// EVIDENCE-OF: R-cad0d6
 test.each(["sep-3415", "chatgpt-events"] as const)(
   "rechecks restricted comments at retry and terminates revoked %s subscriptions",
   async (eventsProfile) => {
@@ -654,9 +637,7 @@ test.each(["sep-3415", "chatgpt-events"] as const)(
   },
 );
 
-// EVIDENCE-OF: R-cd4f75
-// EVIDENCE-OF: R-82de80
-// EVIDENCE-OF: R-28f5c2
+// EVIDENCE-OF: R-3be334, R-836a57, R-28f5c2
 test.each(["sep-3415", "chatgpt-events"] as const)(
   "%s exposes callback history loss through its own dialect",
   async (eventsProfile) => {
@@ -665,6 +646,7 @@ test.each(["sep-3415", "chatgpt-events"] as const)(
       webhookTransport: receiver.transport,
       eventsProfile,
       maxReplayWindowMs: 10_000,
+      maxWebhookRetries: 0,
     });
     const service = env.create();
     expect(service.listEvents()).toMatchObject({ profile: eventsProfile });
@@ -681,12 +663,13 @@ test.each(["sep-3415", "chatgpt-events"] as const)(
     ]);
     for (const event of service.listEvents().events) {
       expect([...event.delivery].sort()).toEqual(
-        eventsProfile === "sep-3415" ? ["poll", "push", "webhook"] : ["webhook"],
+        eventsProfile === "sep-3415" ? ["poll", "webhook"] : ["webhook"],
       );
     }
     const sub = await service.subscribeWebhook(principal, subscribe());
     env.add(comment(60, iso(epoch + 1_000)));
     env.clock.advance(6_000);
+    receiver.outcomes.push(503);
     await service.deliverPendingWebhooks(principal);
     const [event] = receiver.events();
     if (!event) throw new Error("Expected a callback for the retained occurrence");
@@ -716,7 +699,7 @@ test.each(["sep-3415", "chatgpt-events"] as const)(
   },
 );
 
-// EVIDENCE-OF: R-81d5f2
+// EVIDENCE-OF: R-81b530
 test("canonical refresh preserves identity and no-expiry verification and dual-signs during rotation", async () => {
   const receiver = callbackSpy();
   const env = fixture({ webhookTransport: receiver.transport, secretRotationGraceMs: 20_000 });
