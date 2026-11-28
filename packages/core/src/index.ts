@@ -1,8 +1,4 @@
-import type { BugzillaClient } from "@bugzilla-mcp/bugzilla-client";
-import { buildCloudApprovalTokenService } from "./approval.js";
-import { buildSyntheticEventsService } from "./events.js";
-import { buildWriteGuardService } from "./write-guard.js";
-export { McpDomainError, canonicalJson, sha256Hex } from "./canonical.js";
+import type { BugzillaClient, BugzillaClientEffect } from "@bugzilla-mcp/bugzilla-client";
 import type {
   AppResolveProposalInput,
   AppSaveDraftInput,
@@ -24,7 +20,89 @@ import type {
   WebhookSubscribeResult,
   WriteGuardOutcome,
 } from "@bugzilla-mcp/contracts";
-import type { StoragePorts, StoredDraft } from "@bugzilla-mcp/storage";
+import {
+  makeStorageLayer,
+  type StoragePorts,
+  type StorageService,
+  type StoredDraft,
+} from "@bugzilla-mcp/storage";
+import { Effect, Exit, Layer, ManagedRuntime, Scope } from "effect";
+import { asEffectBugzillaClient, runCoreEffect } from "./canonical.js";
+import { buildCloudApprovalTokenService } from "./approval.js";
+import {
+  buildSyntheticEventsService,
+  createSyntheticEventsEngine,
+  makeSyntheticEventsLayer,
+  SyntheticEventsTag,
+  type SyntheticEventsEngine,
+} from "./events.js";
+import {
+  createMetadataCacheEffect,
+  MetadataCacheTag,
+  type MetadataCacheEffect,
+  type MetadataCacheService,
+} from "./metadata-cache.js";
+import {
+  createSqliteWebhookScheduler,
+  WebhookSchedulerPort,
+  type WebhookSchedulerService,
+} from "./webhook-scheduler.js";
+import {
+  buildWriteGuardService,
+  createGuardedMutationEngine,
+  makeWriteGuardLayer,
+  WriteGuardTag,
+  type GuardedMutationEngine,
+} from "./write-guard.js";
+
+export {
+  asEffectBugzillaClient,
+  canonicalJson,
+  domainErrorToMcpDomainError,
+  McpDomainError,
+  normalizeArgsForCanonical,
+  runCoreEffect,
+  sha256Hex,
+  toMcpDomainError,
+  type AnyBugzillaClient,
+} from "./canonical.js";
+export {
+  createMetadataCache,
+  createMetadataCacheEffect,
+  DEFAULT_FIELD_METADATA_TTL_MS,
+  DEFAULT_MAX_FIELD_HINT_ITEMS,
+  DEFAULT_METADATA_MAX_ENTRIES,
+  DEFAULT_PRODUCT_METADATA_TTL_MS,
+  makeMetadataCacheLayer,
+  MetadataCacheTag,
+  type CreateBugPreflightResult,
+  type MetadataCacheConfig,
+  type MetadataCacheEffect,
+  type MetadataCacheService,
+} from "./metadata-cache.js";
+export {
+  createGuardedMutationEngine,
+  makeWriteGuardLayer,
+  WriteGuardTag,
+  type GuardedMutationEngine,
+  type WriteGuardError,
+} from "./write-guard.js";
+export {
+  createSqliteWebhookScheduler,
+  sqliteWebhookSchedulerLayer,
+  WebhookSchedulerPort,
+  type WebhookLoopParams,
+  type WebhookSchedulerService,
+} from "./webhook-scheduler.js";
+export {
+  createSyntheticEventsEngine,
+  makeSyntheticEventsLayer,
+  SyntheticEventsTag,
+  type EventsEngineError,
+  type SyntheticEventsEngine,
+  type WebhookPostFailureReason,
+  type WebhookPostResult,
+} from "./events.js";
 
 export interface WebhookPinnedRequest {
   readonly resolvedIp: string;
@@ -60,17 +138,20 @@ export interface CloudApprovalExpected {
   readonly nowMs: number;
 }
 
+export type CloudApprovalFailureReason =
+  | "invalid_signature"
+  | "expired"
+  | "replayed"
+  | "binding_mismatch"
+  | "visibility_mismatch";
+
+export type CloudApprovalPrecheckResult =
+  | { readonly valid: true; readonly jti: string; readonly expiresAtMs: number }
+  | { readonly valid: false; readonly reason: CloudApprovalFailureReason };
+
 export type CloudApprovalVerificationResult =
   | { readonly valid: true }
-  | {
-      readonly valid: false;
-      readonly reason:
-        | "invalid_signature"
-        | "expired"
-        | "replayed"
-        | "binding_mismatch"
-        | "visibility_mismatch";
-    };
+  | { readonly valid: false; readonly reason: CloudApprovalFailureReason };
 
 export interface CloudApprovalTokenService {
   issue(params: {
@@ -86,6 +167,13 @@ export interface CloudApprovalTokenService {
     readonly ttlMs: number;
     readonly nowMs: number;
   }): Promise<{ readonly token: string; readonly expiresAt: IsoTimestamp }>;
+  /** Stage 1 non-consuming verification of HMAC signature, TTL, visibility, and payload binding. */
+  verifySignatureAndBinding?(
+    token: string,
+    expected: CloudApprovalExpected,
+  ): Promise<CloudApprovalPrecheckResult>;
+  /** Stage 3 commit-threshold DB-first single-use JTI consumption. */
+  consumeVerifiedJti?(jti: string, expiresAtMs: number, nowMs: number): Promise<boolean>;
   verifyAndConsume(
     token: string,
     expected: CloudApprovalExpected,
@@ -94,16 +182,21 @@ export interface CloudApprovalTokenService {
 
 export interface CoreDependencies {
   readonly storage: StoragePorts;
-  readonly resolveClient: (ctx: PrincipalContext) => Promise<BugzillaClient | null>;
+  readonly resolveClient: (
+    ctx: PrincipalContext,
+  ) => Promise<BugzillaClient | BugzillaClientEffect | null>;
   readonly eventsProfile: EventsProfile;
   readonly eventSchemaEpoch?: number;
   readonly causalBudgetPerBug: number;
   readonly causalBudgetWindowMs?: number;
+  readonly receiptLeaseMs?: number;
   readonly lagWindowMs: number;
   readonly maxReplayWindowMs?: number;
   readonly maxWebhookRetries?: number;
   readonly secretRotationGraceMs?: number;
   readonly clock?: () => number;
+  readonly metadataCache?: MetadataCacheEffect;
+  readonly webhookScheduler?: WebhookSchedulerService;
   readonly webhookTransport?: WebhookOutboundTransport;
   readonly webhookEnabled?: boolean;
   readonly revalidateWebhookGrant?: (grant: PrincipalContext) => Promise<PrincipalContext | null>;
@@ -115,7 +208,13 @@ export interface CoreDependencies {
   ) => Promise<boolean>;
 }
 
-export type WebhookScanState = "idle" | "active" | "scan_incomplete" | "authorization_revoked";
+export type WebhookScanState =
+  | "idle"
+  | "active"
+  | "scan_incomplete"
+  | "authorization_revoked"
+  | "gap_delivery_stalled"
+  | "schema_epoch_mismatch";
 
 export interface WriteGuardService {
   postAnalysis(ctx: PrincipalContext, input: BugzillaPostAnalysisInput): Promise<WriteGuardOutcome>;
@@ -190,6 +289,107 @@ export interface SyntheticEventsService {
   ): Promise<{ delivered: number; abandoned: number; terminated: number }>;
 }
 
+export type CoreServices =
+  | StorageService
+  | MetadataCacheTag
+  | WebhookSchedulerPort
+  | WriteGuardTag
+  | SyntheticEventsTag;
+
+export interface CoreRuntime {
+  readonly runtime: ManagedRuntime.ManagedRuntime<CoreServices, never>;
+  readonly writeGuardEffect: GuardedMutationEngine;
+  readonly eventsEffect: SyntheticEventsEngine;
+  readonly metadataCacheEffect: MetadataCacheEffect;
+  readonly webhookScheduler: WebhookSchedulerService;
+  readonly writeGuard: WriteGuardService;
+  readonly events: SyntheticEventsService;
+  readonly metadataCache: MetadataCacheService;
+  dispose(): Promise<void>;
+}
+
+export function createCoreLayer(deps: CoreDependencies): Layer.Layer<CoreServices> {
+  const metadataCache =
+    deps.metadataCache ?? createMetadataCacheEffect(deps.clock ? { clock: deps.clock } : {});
+  const webhookScheduler = deps.webhookScheduler ?? createSqliteWebhookScheduler();
+  const normalizedDeps: CoreDependencies = {
+    ...deps,
+    metadataCache,
+    webhookScheduler,
+  };
+  return Layer.mergeAll(
+    makeStorageLayer(normalizedDeps.storage),
+    Layer.succeed(MetadataCacheTag, metadataCache),
+    Layer.succeed(WebhookSchedulerPort, webhookScheduler),
+    makeWriteGuardLayer(normalizedDeps),
+    makeSyntheticEventsLayer(normalizedDeps),
+  );
+}
+
+export function createCoreRuntime(deps: CoreDependencies): CoreRuntime {
+  const metadataCacheEffect =
+    deps.metadataCache ?? createMetadataCacheEffect(deps.clock ? { clock: deps.clock } : {});
+  const webhookScheduler = deps.webhookScheduler ?? createSqliteWebhookScheduler();
+  const normalizedDeps: CoreDependencies = {
+    ...deps,
+    metadataCache: metadataCacheEffect,
+    webhookScheduler,
+  };
+  const writeGuardEffect = createGuardedMutationEngine(normalizedDeps);
+  const eventsEffect = createSyntheticEventsEngine(normalizedDeps);
+  const layer: Layer.Layer<CoreServices> = Layer.mergeAll(
+    makeStorageLayer(normalizedDeps.storage),
+    Layer.succeed(MetadataCacheTag, metadataCacheEffect),
+    Layer.succeed(WebhookSchedulerPort, webhookScheduler),
+    Layer.succeed(WriteGuardTag, writeGuardEffect),
+    Layer.succeed(SyntheticEventsTag, eventsEffect),
+  );
+  const runtime = ManagedRuntime.make(layer);
+  const writeGuard: WriteGuardService = {
+    postAnalysis: (ctx, input) => runCoreEffect(writeGuardEffect.postAnalysis(ctx, input)),
+    proposeUpdate: (ctx, input) => runCoreEffect(writeGuardEffect.proposeUpdate(ctx, input)),
+    createBug: (ctx, input) => runCoreEffect(writeGuardEffect.createBug(ctx, input)),
+    resolveProposal: (ctx, input) => runCoreEffect(writeGuardEffect.resolveProposal(ctx, input)),
+    saveDraft: (ctx, input) => runCoreEffect(writeGuardEffect.saveDraft(ctx, input)),
+    getDraft: (ctx, params) => runCoreEffect(writeGuardEffect.getDraft(ctx, params)),
+  };
+  const events: SyntheticEventsService = {
+    listEvents: () => eventsEffect.listEvents(),
+    poll: (ctx, params) => runCoreEffect(eventsEffect.poll(ctx, params)),
+    stream: (ctx, params, signal) => eventsEffect.stream(ctx, params, signal),
+    subscribeWebhook: (ctx, params) => runCoreEffect(eventsEffect.subscribeWebhook(ctx, params)),
+    unsubscribeWebhook: (ctx, params) =>
+      runCoreEffect(eventsEffect.unsubscribeWebhook(ctx, params)),
+    deliverPendingWebhooks: (ctx) => runCoreEffect(eventsEffect.deliverPendingWebhooks(ctx)),
+  };
+  const metadataCache: MetadataCacheService = {
+    listEnterableProducts: (ctx, client) =>
+      runCoreEffect(metadataCacheEffect.listEnterableProducts(ctx, asEffectBugzillaClient(client))),
+    getProductMetadata: (ctx, client, productName) =>
+      runCoreEffect(
+        metadataCacheEffect.getProductMetadata(ctx, asEffectBugzillaClient(client), productName),
+      ),
+    getBugFields: (ctx, client) =>
+      runCoreEffect(metadataCacheEffect.getBugFields(ctx, asEffectBugzillaClient(client))),
+    preflightCreateBug: (ctx, client, input) =>
+      runCoreEffect(
+        metadataCacheEffect.preflightCreateBug(ctx, asEffectBugzillaClient(client), input),
+      ),
+    invalidateTenant: (ctx) => metadataCacheEffect.invalidateTenant(ctx),
+  };
+  return {
+    runtime,
+    writeGuardEffect,
+    eventsEffect,
+    metadataCacheEffect,
+    webhookScheduler,
+    writeGuard,
+    events,
+    metadataCache,
+    dispose: () => runtime.dispose(),
+  };
+}
+
 export function createWriteGuardService(deps: CoreDependencies): WriteGuardService {
   return buildWriteGuardService(deps);
 }
@@ -210,37 +410,48 @@ export function startWebhookDeliveryLoop(params: {
   listPrincipals: () => Promise<readonly PrincipalContext[]>;
   intervalMs: number;
   onError?: (err: unknown) => void;
+  scheduler?: WebhookSchedulerService;
 }): { stop(): Promise<void> } {
+  const scheduler = params.scheduler ?? createSqliteWebhookScheduler();
+  const scope = Effect.runSync(Scope.make());
   let stopped = false;
-  let running: Promise<void> | undefined;
-  const timer = setInterval(() => {
-    if (stopped || running) return;
-    running = (async () => {
-      try {
-        const principals = await params.listPrincipals();
-        for (const ctx of principals) {
-          if (stopped) break;
-          try {
-            await params.events.deliverPendingWebhooks(ctx);
-          } catch (err) {
-            params.onError?.(err);
-          }
-        }
-      } catch (err) {
-        params.onError?.(err);
-      } finally {
-        running = undefined;
+
+  const tick = () =>
+    Effect.gen(function* () {
+      const principals = yield* Effect.tryPromise({
+        try: () => params.listPrincipals(),
+        catch: (err) => err,
+      });
+      for (const ctx of principals) {
+        if (stopped) break;
+        yield* Effect.tryPromise({
+          try: () => params.events.deliverPendingWebhooks(ctx),
+          catch: (err) => err,
+        }).pipe(
+          Effect.catch((err) =>
+            Effect.sync(() => {
+              params.onError?.(err);
+            }),
+          ),
+        );
       }
-    })();
-  }, params.intervalMs);
-  if (typeof timer.unref === "function") {
-    timer.unref();
-  }
+    });
+
+  Effect.runSync(
+    scheduler
+      .startLoop({
+        intervalMs: params.intervalMs,
+        tick,
+        ...(params.onError !== undefined ? { onError: params.onError } : {}),
+      })
+      .pipe(Effect.provideService(Scope.Scope, scope)),
+  );
+
   return {
     async stop() {
+      if (stopped) return;
       stopped = true;
-      clearInterval(timer);
-      await running;
+      await Effect.runPromise(Scope.close(scope, Exit.void));
     },
   };
 }
