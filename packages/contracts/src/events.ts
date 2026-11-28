@@ -1,142 +1,216 @@
-import { z } from "zod";
-import { BugIdSchema, IsoTimestampSchema } from "./domain.js";
+import { Effect, type JsonSchema, Result, Schema } from "effect";
+import { BugIdSchema, IsoTimestampSchema, NonEmptyTrimmedStringSchema } from "./domain.js";
+import { formatSchemaIssues, STRICT_PARSE_OPTIONS } from "./errors.js";
+import { HttpsUrlSchema, type SchemaValidationIssue } from "./mcp-wire.js";
 
-export const EventsProfileSchema = z.enum(["sep-3415", "chatgpt-events"]);
-export type EventsProfile = z.infer<typeof EventsProfileSchema>;
+export const EventsProfileSchema = Schema.Literals(["sep-3415", "chatgpt-events"]);
+export type EventsProfile = typeof EventsProfileSchema.Type;
 
-export const EventNameSchema = z.enum([
+export const EventNameSchema = Schema.Literals([
   "bugzilla.bug.created",
   "bugzilla.bug.updated",
   "bugzilla.bug.commented",
   "bugzilla.flag.needinfo",
 ]);
-export type EventName = z.infer<typeof EventNameSchema>;
+export type EventName = typeof EventNameSchema.Type;
 
-export const DeliveryModeSchema = z.enum(["poll", "push", "webhook"]);
-export type DeliveryMode = z.infer<typeof DeliveryModeSchema>;
+export const DeliveryModeSchema = Schema.Literals(["poll", "push", "webhook"]);
+export type DeliveryMode = typeof DeliveryModeSchema.Type;
 
-export const EventFilterArgsSchema = z.object({
-  product: z.string().min(1).optional(),
-  component: z.string().min(1).optional(),
-  bugIds: z.array(BugIdSchema).max(100).optional(),
-  severity: z.string().min(1).optional(),
-  watchedFields: z.array(z.string().min(1)).optional(),
-  mentionMe: z.boolean().optional(),
-  requestee: z.string().min(1).optional(),
-  includeSelf: z.boolean().default(false),
+export const WATCHED_FIELDS = ["status", "assigned_to", "priority", "flags"] as const;
+export const WatchedFieldSchema = Schema.Literals(WATCHED_FIELDS);
+export type WatchedField = typeof WatchedFieldSchema.Type;
+
+const IncludeSelfField = Schema.Boolean.pipe(
+  Schema.withDecodingDefaultKey(Effect.succeed(false)),
+  Schema.annotateEncoded({ default: false }),
+);
+
+export const BugCreatedFilterArgsSchema = Schema.Struct({
+  product: Schema.optionalKey(NonEmptyTrimmedStringSchema),
+  component: Schema.optionalKey(NonEmptyTrimmedStringSchema),
+  severity: Schema.optionalKey(NonEmptyTrimmedStringSchema),
+  includeSelf: IncludeSelfField,
 });
-export type EventFilterArgs = z.infer<typeof EventFilterArgsSchema>;
+export type BugCreatedFilterArgs = typeof BugCreatedFilterArgsSchema.Type;
 
-const watchedFields = ["status", "assigned_to", "priority", "flags"] as const;
-const filtersByEvent = {
-  "bugzilla.bug.created": EventFilterArgsSchema.pick({
-    product: true,
-    component: true,
-    severity: true,
-    includeSelf: true,
-  }).strict(),
-  "bugzilla.bug.updated": EventFilterArgsSchema.pick({
-    product: true,
-    bugIds: true,
-    includeSelf: true,
-  })
-    .extend({ watchedFields: z.array(z.enum(watchedFields)).optional() })
-    .strict(),
-  "bugzilla.bug.commented": EventFilterArgsSchema.pick({
-    product: true,
-    bugIds: true,
-    mentionMe: true,
-    includeSelf: true,
-  }).strict(),
-  "bugzilla.flag.needinfo": EventFilterArgsSchema.pick({
-    product: true,
-    requestee: true,
-    includeSelf: true,
-  }).strict(),
-} satisfies Record<EventName, object>;
+export const BugUpdatedFilterArgsSchema = Schema.Struct({
+  product: Schema.optionalKey(NonEmptyTrimmedStringSchema),
+  bugIds: Schema.optionalKey(Schema.Array(BugIdSchema).check(Schema.isMaxLength(100))),
+  watchedFields: Schema.optionalKey(Schema.Array(WatchedFieldSchema)),
+  includeSelf: IncludeSelfField,
+});
+export type BugUpdatedFilterArgs = typeof BugUpdatedFilterArgsSchema.Type;
 
-export function parseEventFilters(name: EventName, input: unknown) {
-  return filtersByEvent[name].safeParse(input === undefined ? {} : input);
-}
+export const BugCommentedFilterArgsSchema = Schema.Struct({
+  product: Schema.optionalKey(NonEmptyTrimmedStringSchema),
+  bugIds: Schema.optionalKey(Schema.Array(BugIdSchema).check(Schema.isMaxLength(100))),
+  mentionMe: Schema.optionalKey(Schema.Boolean),
+  includeSelf: IncludeSelfField,
+});
+export type BugCommentedFilterArgs = typeof BugCommentedFilterArgsSchema.Type;
 
-export function eventFilterJsonSchema(name: EventName) {
-  const string = { type: "string", minLength: 1 };
-  const fields: Record<keyof EventFilterArgs, object> = {
-    product: string,
-    component: string,
-    severity: string,
-    bugIds: { type: "array", items: { type: "integer", minimum: 1 }, maxItems: 100 },
-    watchedFields: { type: "array", items: { type: "string", enum: watchedFields } },
-    mentionMe: { type: "boolean" },
-    requestee: string,
-    includeSelf: { type: "boolean", default: false },
-  };
+export const FlagNeedinfoFilterArgsSchema = Schema.Struct({
+  product: Schema.optionalKey(NonEmptyTrimmedStringSchema),
+  requestee: Schema.optionalKey(NonEmptyTrimmedStringSchema),
+  includeSelf: IncludeSelfField,
+});
+export type FlagNeedinfoFilterArgs = typeof FlagNeedinfoFilterArgsSchema.Type;
+
+/** Superset filter type used across storage and internal event matching. */
+export const EventFilterArgsSchema = Schema.Struct({
+  product: Schema.optionalKey(NonEmptyTrimmedStringSchema),
+  component: Schema.optionalKey(NonEmptyTrimmedStringSchema),
+  bugIds: Schema.optionalKey(Schema.Array(BugIdSchema).check(Schema.isMaxLength(100))),
+  severity: Schema.optionalKey(NonEmptyTrimmedStringSchema),
+  watchedFields: Schema.optionalKey(Schema.Array(WatchedFieldSchema)),
+  mentionMe: Schema.optionalKey(Schema.Boolean),
+  requestee: Schema.optionalKey(NonEmptyTrimmedStringSchema),
+  includeSelf: IncludeSelfField,
+});
+export type EventFilterArgs = typeof EventFilterArgsSchema.Type;
+
+export const EVENT_FILTER_SCHEMAS = {
+  "bugzilla.bug.created": BugCreatedFilterArgsSchema,
+  "bugzilla.bug.updated": BugUpdatedFilterArgsSchema,
+  "bugzilla.bug.commented": BugCommentedFilterArgsSchema,
+  "bugzilla.flag.needinfo": FlagNeedinfoFilterArgsSchema,
+} as const;
+
+export type EventFilterByName = {
+  readonly "bugzilla.bug.created": BugCreatedFilterArgs;
+  readonly "bugzilla.bug.updated": BugUpdatedFilterArgs;
+  readonly "bugzilla.bug.commented": BugCommentedFilterArgs;
+  readonly "bugzilla.flag.needinfo": FlagNeedinfoFilterArgs;
+};
+
+export type ParseEventFiltersResult<N extends EventName> =
+  | { readonly success: true; readonly data: EventFilterByName[N] }
+  | {
+      readonly success: false;
+      readonly error: Schema.SchemaError;
+      readonly issues: readonly SchemaValidationIssue[];
+    };
+
+export function parseEventFilters<N extends EventName>(
+  name: N,
+  input: unknown,
+): ParseEventFiltersResult<N> {
+  const schema = EVENT_FILTER_SCHEMAS[name];
+  const decoded = Schema.decodeUnknownResult(
+    schema,
+    STRICT_PARSE_OPTIONS,
+  )(input === undefined ? {} : input);
+  if (Result.isFailure(decoded)) {
+    return {
+      success: false,
+      error: decoded.failure,
+      issues: formatSchemaIssues(decoded.failure),
+    };
+  }
   return {
-    type: "object",
-    additionalProperties: false,
-    properties: Object.fromEntries(
-      Object.keys(filtersByEvent[name].shape).map((key) => [
-        key,
-        fields[key as keyof EventFilterArgs],
-      ]),
-    ),
+    success: true,
+    data: decoded.success as EventFilterByName[N],
   };
 }
 
-export const EventOccurrenceSchema = z.object({
-  eventId: z.string().min(1),
+export function eventFilterJsonSchema(name: EventName): JsonSchema.JsonSchema {
+  const doc = Schema.toJsonSchemaDocument(EVENT_FILTER_SCHEMAS[name], {
+    onExcessProperty: "error",
+  });
+  return doc.schema;
+}
+
+export const EventOccurrenceSchema = Schema.Struct({
+  eventId: Schema.NonEmptyString,
   name: EventNameSchema,
   timestamp: IsoTimestampSchema,
-  data: z.record(z.unknown()),
-  cursor: z.string().nullable().optional(),
+  data: Schema.Record(Schema.String, Schema.Unknown),
+  cursor: Schema.optionalKey(Schema.NullOr(Schema.String)),
 });
-export type EventOccurrence = z.infer<typeof EventOccurrenceSchema>;
+export type EventOccurrence = typeof EventOccurrenceSchema.Type;
 
-export const PollEventsParamsSchema = z.object({
+const EventOccurrenceWithoutCursorSchema = Schema.Struct({
+  eventId: Schema.NonEmptyString,
   name: EventNameSchema,
-  arguments: EventFilterArgsSchema.default({}),
-  cursor: z.string().nullable().optional(),
-  maxAgeMs: z.number().int().positive().optional(),
-  maxEvents: z.number().int().min(1).max(100).optional(),
+  timestamp: IsoTimestampSchema,
+  data: Schema.Record(Schema.String, Schema.Unknown),
 });
-export type PollEventsParams = z.infer<typeof PollEventsParamsSchema>;
 
-export const PollEventsResultSchema = z.object({
-  resultType: z.literal("complete"),
-  events: z.array(EventOccurrenceSchema.omit({ cursor: true })),
-  cursor: z.string().nullable(),
-  truncated: z.boolean(),
-  hasMore: z.boolean(),
-  nextPollMs: z.number().int().min(1000),
+function makePollBranch<N extends EventName>(name: N) {
+  const filterSchema = EVENT_FILTER_SCHEMAS[name];
+  return Schema.Struct({
+    name: Schema.Literal(name),
+    arguments: filterSchema.pipe(
+      Schema.withDecodingDefaultKey(Effect.succeed({})),
+      Schema.annotateEncoded({ default: {} }),
+    ),
+    cursor: Schema.optionalKey(Schema.NullOr(Schema.String)),
+    maxAgeMs: Schema.optionalKey(Schema.Int.check(Schema.isGreaterThanOrEqualTo(1))),
+    maxEvents: Schema.optionalKey(Schema.Int.check(Schema.isBetween({ minimum: 1, maximum: 100 }))),
+  });
+}
+
+export const PollEventsParamsSchema = Schema.Union([
+  makePollBranch("bugzilla.bug.created"),
+  makePollBranch("bugzilla.bug.updated"),
+  makePollBranch("bugzilla.bug.commented"),
+  makePollBranch("bugzilla.flag.needinfo"),
+]);
+export type PollEventsParams = typeof PollEventsParamsSchema.Type;
+
+export const PollEventsResultSchema = Schema.Struct({
+  resultType: Schema.Literal("complete"),
+  events: Schema.Array(EventOccurrenceWithoutCursorSchema),
+  cursor: Schema.NullOr(Schema.String),
+  truncated: Schema.Boolean,
+  hasMore: Schema.Boolean,
+  nextPollMs: Schema.Int.check(Schema.isGreaterThanOrEqualTo(1000)),
 });
-export type PollEventsResult = z.infer<typeof PollEventsResultSchema>;
+export type PollEventsResult = typeof PollEventsResultSchema.Type;
 
-export const WebhookSecretSchema = z
-  .string()
-  .regex(
-    /^whsec_[A-Za-z0-9+/=]{32,88}$/,
-    "Must be whsec_ followed by base64 of 24-64 random bytes",
-  );
-
-export const WebhookSubscribeParamsSchema = z.object({
-  name: EventNameSchema,
-  arguments: EventFilterArgsSchema.default({}),
-  delivery: z.object({
-    mode: z.literal("webhook"),
-    url: z.string().url(),
-    secret: WebhookSecretSchema,
+export const WebhookSecretSchema = Schema.String.check(
+  Schema.isPattern(/^whsec_[A-Za-z0-9+/=]{32,88}$/, {
+    message: "Must be whsec_ followed by base64 of 24-64 random bytes",
   }),
-  cursor: z.string().nullable().optional(),
-  maxAgeMs: z.number().int().positive().optional(),
-  ttlMs: z.number().int().positive().nullable().optional(),
-});
-export type WebhookSubscribeParams = z.infer<typeof WebhookSubscribeParamsSchema>;
+);
+export type WebhookSecret = typeof WebhookSecretSchema.Type;
 
-export const WebhookSubscribeResultSchema = z.object({
-  resultType: z.literal("complete"),
-  id: z.string().min(1),
-  refreshBefore: IsoTimestampSchema.nullable(),
-  cursor: z.string().nullable(),
-  truncated: z.boolean(),
+export const WebhookDeliveryConfigSchema = Schema.Struct({
+  mode: Schema.Literal("webhook"),
+  url: HttpsUrlSchema,
+  secret: WebhookSecretSchema,
 });
-export type WebhookSubscribeResult = z.infer<typeof WebhookSubscribeResultSchema>;
+export type WebhookDeliveryConfig = typeof WebhookDeliveryConfigSchema.Type;
+
+function makeWebhookSubscribeBranch<N extends EventName>(name: N) {
+  const filterSchema = EVENT_FILTER_SCHEMAS[name];
+  return Schema.Struct({
+    name: Schema.Literal(name),
+    arguments: filterSchema.pipe(
+      Schema.withDecodingDefaultKey(Effect.succeed({})),
+      Schema.annotateEncoded({ default: {} }),
+    ),
+    delivery: WebhookDeliveryConfigSchema,
+    cursor: Schema.optionalKey(Schema.NullOr(Schema.String)),
+    maxAgeMs: Schema.optionalKey(Schema.Int.check(Schema.isGreaterThanOrEqualTo(1))),
+    ttlMs: Schema.optionalKey(Schema.NullOr(Schema.Int.check(Schema.isGreaterThanOrEqualTo(1)))),
+  });
+}
+
+export const WebhookSubscribeParamsSchema = Schema.Union([
+  makeWebhookSubscribeBranch("bugzilla.bug.created"),
+  makeWebhookSubscribeBranch("bugzilla.bug.updated"),
+  makeWebhookSubscribeBranch("bugzilla.bug.commented"),
+  makeWebhookSubscribeBranch("bugzilla.flag.needinfo"),
+]);
+export type WebhookSubscribeParams = typeof WebhookSubscribeParamsSchema.Type;
+
+export const WebhookSubscribeResultSchema = Schema.Struct({
+  resultType: Schema.Literal("complete"),
+  id: Schema.NonEmptyString,
+  refreshBefore: Schema.NullOr(IsoTimestampSchema),
+  cursor: Schema.NullOr(Schema.String),
+  truncated: Schema.Boolean,
+});
+export type WebhookSubscribeResult = typeof WebhookSubscribeResultSchema.Type;

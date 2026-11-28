@@ -7,12 +7,16 @@
     ".": {
       "types": "./src/index.ts",
       "default": "./src/index.ts"
+    },
+    "./tool-registry": {
+      "types": "./src/tool-registry.ts",
+      "default": "./src/tool-registry.ts"
     }
   },
   "scripts": {
     "typecheck": "tsc --noEmit"
   },
   "dependencies": {
-    "zod": "^3.24.4"
+    "effect": "^4.1.7"
   }
 }
