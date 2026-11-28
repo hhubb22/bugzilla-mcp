@@ -272,15 +272,23 @@ test("acknowledged draft revisions survive reopening SQLite and reject out-of-or
             });
             latest.set(update.scope, input);
           }
-          expect(await view.getDraft(target.principal, input)).toMatchObject(
-            latest.get(update.scope) ?? {},
-          );
+          expect(
+            await view.getDraft(target.principal, {
+              bugId: input.bugId,
+              draftKind: input.draftKind,
+            }),
+          ).toMatchObject(latest.get(update.scope) ?? {});
         }
         const reopened = openView();
         for (const [scope, input] of latest) {
           const target = independentScopes[scope];
           if (!target) throw new Error("Expected a saved draft scope");
-          expect(await reopened.getDraft(target.principal, input)).toMatchObject(input);
+          expect(
+            await reopened.getDraft(target.principal, {
+              bugId: input.bugId,
+              draftKind: input.draftKind,
+            }),
+          ).toMatchObject(input);
         }
       }),
       { seed: 316609, numRuns: 15 },

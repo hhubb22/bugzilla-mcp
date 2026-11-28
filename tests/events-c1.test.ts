@@ -634,7 +634,7 @@ test("410 and 413 end only their deliveries, and a SEP recovery cursor respects 
 // EVIDENCE-OF: R-1006f2, R-c83005, R-39bcf8, R-a36d59
 test("first acquisition fails closed, then null anchors and bounded new Webhook replays select different prefixes", async () => {
   const r = await setup({ profile: sep, webhookEnabled: true, epoch: 1 }, false);
-  const bug = r.bz.addBug("normal", r.now - 6000);
+  const bug = r.bz.addBug("normal", r.now - 3000);
   r.bz.unreadableDetailsFor.add(bug.id);
   await r.start();
   failure(await r.rpc("events/poll", { name: commented, cursor: null }), -32603, "scan_incomplete");
@@ -768,18 +768,23 @@ test("changing the write key cannot replenish a bug's event-triggered budget", a
   r.tick(2000);
   const triggers = ids(await r.poll(created, {}, cursor));
   expect(triggers).toHaveLength(2);
-  async function write(bugId: number, causalEventId: string) {
-    return r.tool("bugzilla_post_analysis", {
-      bugId,
-      causalEventId,
-      idempotencyKey: randomUUID(),
-      analysisMarkdown: "Event-triggered fixture note",
-      isPrivate: true,
-    });
+  async function write(bugId: number, causalEventId: string, expectToolError = false) {
+    return r.tool(
+      "bugzilla_post_analysis",
+      {
+        bugId,
+        causalEventId,
+        idempotencyKey: randomUUID(),
+        analysisMarkdown: "Event-triggered fixture note",
+        isPrivate: true,
+      },
+      {},
+      { allowError: expectToolError },
+    );
   }
   expect((await write(a.id, triggers[0]!)).outcome).toBe("Applied");
   expect((await write(a.id, triggers[0]!)).outcome).toBe("Applied");
-  expect((await write(a.id, triggers[0]!)).outcome).toBe("CausalBudgetExhausted");
+  expect((await write(a.id, triggers[0]!, true)).outcome).toBe("CausalBudgetExhausted");
   expect((await write(b.id, triggers[1]!)).outcome).toBe("Applied");
   expect(r.bz.comments.map((c) => c.bug_id)).toEqual([a.id, a.id, b.id]);
 }, 40_000);

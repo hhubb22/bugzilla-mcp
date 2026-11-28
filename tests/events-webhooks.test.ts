@@ -12,7 +12,10 @@ import type {
   PollEventsResult,
   WebhookSubscribeParams,
 } from "../packages/contracts/src/index.js";
-import { PollEventsResultSchema } from "../packages/contracts/src/index.js";
+import {
+  decodeOrInvalidInputResult,
+  PollEventsResultSchema,
+} from "../packages/contracts/src/index.js";
 import { createSyntheticEventsService } from "../packages/core/src/index.js";
 import type {
   CoreDependencies,
@@ -161,7 +164,7 @@ test("generated timestamp buckets page exactly once and agree under reversed sca
       let resume = start;
       while (actual.length < expectedTimes.length) {
         const page = await service.poll(principal, poll({ cursor: resume, maxEvents }));
-        expect(PollEventsResultSchema.safeParse(page).success).toBe(true);
+        expect(decodeOrInvalidInputResult(PollEventsResultSchema, page)._tag).toBe("Success");
         expect(page.events.map((event) => event.timestamp)).toEqual(
           expectedTimes.slice(actual.length, actual.length + maxEvents),
         );
@@ -229,7 +232,7 @@ test("current per-comment visibility governs pagination through same-second occu
   expect(visible.events).toHaveLength(1);
   expect(visible.hasMore).toBe(true);
   expect(selfIncluded.events).toHaveLength(2);
-  expect(selfIncluded.events).toEqual(expect.arrayContaining(visible.events));
+  expect(selfIncluded.events).toEqual(expect.arrayContaining([...visible.events]));
   expect(JSON.stringify(selfIncluded)).not.toContain("restricted-comment-marker");
   env.visibility.set(92, "restricted_or_missing");
   env.visibility.set(91, "restricted_or_missing");

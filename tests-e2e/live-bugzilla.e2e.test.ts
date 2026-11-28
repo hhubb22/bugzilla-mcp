@@ -349,8 +349,64 @@ describe("Live OrbStack Bugzilla 5.2 Zero-Mock E2E", () => {
     expect(reporterAfter?.recentComments.length).toBe(countBefore);
   }, 20_000);
 
-  it("creates a bug idempotently, executes Guarded-Write via /approve token, persists JTI across restart, and detects real StaleBugConflict", async () => {
+  it("creates a bug idempotently, rejects missing fields and HTTP 400 without key poisoning, executes Guarded-Write via /approve token, persists JTI across restart, and detects real StaleBugConflict", async () => {
+    // Missing required component/version MUST return isError: true with structured issues (0 upstream writes)
+    const missingFieldRes = await rpcCall(
+      "tok-admin",
+      "tools/call",
+      {
+        name: "bugzilla_create_bug",
+        arguments: {
+          idempotencyKey: `idem-missing-${randomUUID()}`,
+          product: "PICOS",
+          summary: "Missing component and version",
+          description: "Should fail validation before calling Bugzilla",
+        },
+      },
+      "bugzilla_create_bug",
+    );
+    expect(missingFieldRes.status).toBe(200);
+    const missingRpc = JSON.parse(missingFieldRes.text) as {
+      result: {
+        isError: boolean;
+        structuredContent: { code: string; issues: Array<{ path: string }> };
+      };
+    };
+    expect(missingRpc.result.isError).toBe(true);
+    expect(missingRpc.result.structuredContent.code).toBe("invalid_tool_input");
+    const missingPaths = missingRpc.result.structuredContent.issues.map((i) => i.path);
+    expect(missingPaths).toContain("component");
+    expect(missingPaths).toContain("version");
+
+    // Upstream HTTP 400 (nonexistent component) MUST return UpstreamRejected (isError: true)
+    // and allow reusing the exact same idempotencyKey after fixing the field
     const createKey = `idem-create-${randomUUID()}`;
+    const badCreateRes = await rpcCall(
+      "tok-admin",
+      "tools/call",
+      {
+        name: "bugzilla_create_bug",
+        arguments: {
+          idempotencyKey: createKey,
+          product: "PICOS",
+          component: "NonExistentComponentXYZ",
+          version: "1.0",
+          summary: "Invalid component 400 test",
+          description: "Bugzilla rejects with HTTP 400; key must remain reusable",
+        },
+      },
+      "bugzilla_create_bug",
+    );
+    expect(badCreateRes.status).toBe(200);
+    const badCreateRpc = JSON.parse(badCreateRes.text) as {
+      result: { isError: boolean; structuredContent: { outcome: string; effectCertainty: string } };
+    };
+    expect(badCreateRpc.result.isError).toBe(true);
+    expect(badCreateRpc.result.structuredContent).toMatchObject({
+      outcome: "UpstreamRejected",
+      effectCertainty: "none",
+    });
+
     const createArgs = {
       idempotencyKey: createKey,
       product: "PICOS",

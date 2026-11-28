@@ -5,6 +5,7 @@ import { DatabaseSync } from "node:sqlite";
 import { afterEach, describe, expect, test } from "vite-plus/test";
 import { normalizeBoardTenantKey, resolveBoardTenantKey } from "../packages/app-ui/src/index.js";
 import {
+  decodeOrInvalidInputResult,
   MCP_PROTOCOL_LEGACY,
   PrincipalContextSchema,
   RESERVED_LEGACY_ISSUER,
@@ -171,7 +172,7 @@ describe("R-970164 multi-issuer tenant isolation and SQLite migration", () => {
         decision: "approve",
         approval: { kind: "cloud_signed_token", token: grantForB.token },
       }),
-    ).rejects.toMatchObject({ code: -32602 });
+    ).rejects.toMatchObject({ _tag: "InvalidToolInput", rpcCode: -32602 });
 
     // Issuer A resolves its own proposal and records an audit only under Issuer A
     const grantForA = await approvalService.issue({
@@ -1276,8 +1277,11 @@ describe("R-970164 multi-issuer tenant isolation and SQLite migration", () => {
 
     // ISO-08: PrincipalContextSchema, HTTP auth, and stdio reject RESERVED_LEGACY_ISSUER
     expect(
-      PrincipalContextSchema.safeParse({ ...principalA, issuer: RESERVED_LEGACY_ISSUER }).success,
-    ).toBe(false);
+      decodeOrInvalidInputResult(PrincipalContextSchema, {
+        ...principalA,
+        issuer: RESERVED_LEGACY_ISSUER,
+      })._tag,
+    ).toBe("Failure");
     const upstream = bugzilla();
     expect(() =>
       createStdioRpcProcessor({

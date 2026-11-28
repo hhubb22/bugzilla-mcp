@@ -206,7 +206,18 @@ test("public visibility on Safe-Auto is rejected at the HTTP input boundary", as
       arguments: { ...writeParams.arguments, isPrivate: false },
     }),
   );
-  expectError(response, -32602);
+  expect(response.status).toBe(200);
+  expect(rpc(response)).toMatchObject({
+    jsonrpc: "2.0",
+    result: {
+      isError: true,
+      resultType: "complete",
+      structuredContent: {
+        error: true,
+        code: "invalid_tool_input",
+      },
+    },
+  });
   expect(upstream.mutations).toEqual([]);
 });
 

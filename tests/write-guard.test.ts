@@ -395,6 +395,8 @@ test("matches a receipt history by principal, instance, key and canonical intent
           accepted.push({ request: operation, artifact: outcome.artifactId });
           expect(
             await storage.hasSelfWrite({
+              issuer: ctx.issuer,
+              principalId: ctx.principalId,
               instanceUrl: ctx.instanceUrl,
               bugId,
               commentId: 99 + accepted.length,

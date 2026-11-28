@@ -303,9 +303,13 @@ export class Rig {
       ),
     );
   }
-  async tool(name: string, args: Obj, caller: Caller = {}) {
+  async tool(name: string, args: Obj, caller: Caller = {}, opts?: { allowError?: boolean }) {
     const result = success(await this.rpc("tools/call", { name, arguments: args }, caller));
-    expect(result.isError).not.toBe(true);
+    if (opts?.allowError) {
+      expect(result.isError).toBe(true);
+    } else {
+      expect(result.isError).not.toBe(true);
+    }
     if (result.structuredContent !== undefined) return obj(result.structuredContent);
     const text = rows(result.content).find((item) => item.type === "text")?.text;
     return obj(JSON.parse(str(text)));
