@@ -477,6 +477,32 @@ body {
   color: var(--color-text-danger, var(--bz-danger-text));
 }
 
+.top-alert {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 8px;
+  margin: 10px 16px 0;
+}
+
+.reconciliation-card {
+  padding: 12px 14px;
+  border-radius: 8px;
+  margin-top: 12px;
+  background: var(--color-background-warning, var(--bz-warn-bg));
+  color: var(--color-text-primary, var(--bz-text-primary));
+  border: 1px solid var(--color-border-primary, var(--bz-border));
+}
+
+.reconciliation-banner {
+  margin: 10px 16px 0;
+}
+
+.draft-error {
+  margin-top: 8px;
+  font-size: 12px;
+}
+
 .conflict-grid {
   width: 100%;
   border-collapse: collapse;

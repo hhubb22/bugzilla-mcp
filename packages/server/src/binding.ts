@@ -1,8 +1,11 @@
 import { createHmac, randomBytes, timingSafeEqual } from "node:crypto";
 import { RESERVED_LEGACY_ISSUER, type PrincipalContext } from "@bugzilla-mcp/contracts";
+import { StorageError } from "@bugzilla-mcp/storage";
 import type { DualEraHttpRequest, DualEraHttpResponse, HttpServerConfig } from "./index.js";
 
 const TICKET_TTL_MS = 10 * 60 * 1000;
+const MAX_IN_MEMORY_TICKETS = 4096;
+const MAX_CONSUMED_STATES = 8192;
 
 interface TicketRecord {
   readonly ticketId: string;
@@ -49,14 +52,49 @@ function escapeAttr(value: string): string {
   });
 }
 
+function isSafeHttpUrl(raw: string): boolean {
+  try {
+    const parsed = new URL(raw);
+    return parsed.protocol === "http:" || parsed.protocol === "https:";
+  } catch {
+    return false;
+  }
+}
+
 export function createBindingManager(config: HttpServerConfig) {
   const secret = config.bindingSecret ?? randomBytes(32).toString("hex");
   const clock = config.core.clock ?? (() => Date.now());
   const publicBaseUrl = (config.publicBaseUrl ?? "https://mcp.example").replace(/\/+$/, "");
 
   const tickets = new Map<string, TicketRecord>();
-  const consumedStates = new Set<string>();
+  const consumedStates = new Map<string, number>();
   const storage = config.core.storage;
+
+  function pruneTickets(nowMs: number): void {
+    for (const [id, ticket] of tickets) {
+      if (nowMs >= ticket.expiresAtMs) {
+        tickets.delete(id);
+      }
+    }
+    while (tickets.size >= MAX_IN_MEMORY_TICKETS) {
+      const oldest = tickets.keys().next().value;
+      if (oldest === undefined) break;
+      tickets.delete(oldest);
+    }
+  }
+
+  function pruneConsumedStates(nowMs: number): void {
+    for (const [stateId, expiresAtMs] of consumedStates) {
+      if (nowMs >= expiresAtMs) {
+        consumedStates.delete(stateId);
+      }
+    }
+    while (consumedStates.size >= MAX_CONSUMED_STATES) {
+      const oldest = consumedStates.keys().next().value;
+      if (oldest === undefined) break;
+      consumedStates.delete(oldest);
+    }
+  }
 
   async function loadTicket(ticketId: string): Promise<TicketRecord | undefined> {
     // Always prefer durable SQLite state across workers when available (AUTH-01)
@@ -83,6 +121,7 @@ export function createBindingManager(config: HttpServerConfig) {
   return {
     async issueChallenge(ctx: PrincipalContext, toolName: string, paramsHash: string) {
       const nowMs = clock();
+      pruneTickets(nowMs);
       const expiresAtMs = nowMs + TICKET_TTL_MS;
       const ticketId = randomBytes(18).toString("base64url");
       const csrfToken = randomBytes(18).toString("base64url");
@@ -133,165 +172,215 @@ export function createBindingManager(config: HttpServerConfig) {
     },
 
     async handleBindGet(req: DualEraHttpRequest): Promise<DualEraHttpResponse> {
-      const url = new URL(req.path, publicBaseUrl);
-      const ticketId = url.searchParams.get("t");
-      if (!ticketId) {
-        return { status: 400, headers: { "content-type": "text/plain" }, body: "Missing ticket" };
-      }
-      const ticket = await loadTicket(ticketId);
-      if (!ticket || clock() >= ticket.expiresAtMs || ticket.completed) {
-        return {
-          status: 410,
-          headers: { "content-type": "text/plain" },
-          body: "Binding ticket expired or already used",
-        };
-      }
-      if (!config.verifyBindingOpenerSession) {
-        return {
-          status: 403,
-          headers: { "content-type": "text/plain" },
-          body: "Opener verification unavailable",
-        };
-      }
-      const opener = await config.verifyBindingOpenerSession(req);
-      if (
-        !opener ||
-        opener.issuer === RESERVED_LEGACY_ISSUER ||
-        opener.issuer !== ticket.issuer ||
-        opener.principalId !== ticket.principalId
-      ) {
-        return {
-          status: 403,
-          headers: { "content-type": "text/plain" },
-          body: "Opener identity does not match initiating principal",
-        };
-      }
+      try {
+        const url = new URL(req.path, publicBaseUrl);
+        const ticketId = url.searchParams.get("t");
+        if (!ticketId) {
+          return { status: 400, headers: { "content-type": "text/plain" }, body: "Missing ticket" };
+        }
+        const ticket = await loadTicket(ticketId);
+        if (!ticket || clock() >= ticket.expiresAtMs || ticket.completed) {
+          return {
+            status: 410,
+            headers: { "content-type": "text/plain" },
+            body: "Binding ticket expired or already used",
+          };
+        }
+        if (!config.verifyBindingOpenerSession) {
+          return {
+            status: 403,
+            headers: { "content-type": "text/plain" },
+            body: "Opener verification unavailable",
+          };
+        }
+        const opener = await config.verifyBindingOpenerSession(req);
+        if (
+          !opener ||
+          opener.issuer === RESERVED_LEGACY_ISSUER ||
+          opener.issuer !== ticket.issuer ||
+          opener.principalId !== ticket.principalId
+        ) {
+          return {
+            status: 403,
+            headers: { "content-type": "text/plain" },
+            body: "Opener identity does not match initiating principal",
+          };
+        }
 
-      const apiKeyHelpUrl = `${ticket.instanceUrl.replace(/\/+$/, "")}/userprefs.cgi?tab=apikey`;
-      const html = [
-        "<!doctype html>",
-        '<html lang="en"><head><meta charset="utf-8"><meta name="color-scheme" content="light dark">',
-        "<title>Bind Bugzilla API Key</title></head><body>",
-        "<h1>Bind Bugzilla API Key</h1>",
-        `<p>Instance: <code>${escapeAttr(ticket.instanceUrl)}</code> · <a href="${escapeAttr(apiKeyHelpUrl)}" rel="noopener noreferrer" target="_blank">Generate API key in Bugzilla</a></p>`,
-        `<form method="POST" action="/bind?t=${escapeAttr(ticketId)}">`,
-        `<input type="hidden" name="t" value="${escapeAttr(ticketId)}" />`,
-        `<input type="hidden" name="csrf" value="${escapeAttr(ticket.csrfToken)}" />`,
-        `<label for="api_key">Bugzilla API Key</label>`,
-        `<input id="api_key" type="password" name="api_key" required />`,
-        `<button type="submit">Bind API Key</button>`,
-        "</form>",
-        "</body></html>",
-      ].join("");
+        const safeInstanceUrl = isSafeHttpUrl(ticket.instanceUrl);
+        const apiKeyHelpUrl = safeInstanceUrl
+          ? `${ticket.instanceUrl.replace(/\/+$/, "")}/userprefs.cgi?tab=apikey`
+          : null;
+        const helpLinkHtml = apiKeyHelpUrl
+          ? ` · <a href="${escapeAttr(apiKeyHelpUrl)}" rel="noopener noreferrer" target="_blank">Generate API key in Bugzilla</a>`
+          : "";
 
-      return {
-        status: 200,
-        headers: {
-          "content-type": "text/html; charset=utf-8",
-          "cache-control": "no-store",
-        },
-        body: html,
-      };
+        const html = [
+          "<!doctype html>",
+          '<html lang="en"><head><meta charset="utf-8"><meta name="color-scheme" content="light dark">',
+          "<title>Bind Bugzilla API Key</title></head><body>",
+          "<h1>Bind Bugzilla API Key</h1>",
+          `<p>Instance: <code>${escapeAttr(ticket.instanceUrl)}</code>${helpLinkHtml}</p>`,
+          `<form method="POST" action="/bind?t=${escapeAttr(encodeURIComponent(ticketId))}">`,
+          `<input type="hidden" name="t" value="${escapeAttr(ticketId)}" />`,
+          `<input type="hidden" name="csrf" value="${escapeAttr(ticket.csrfToken)}" />`,
+          `<label for="api_key">Bugzilla API Key</label>`,
+          `<input id="api_key" type="password" name="api_key" required />`,
+          `<button type="submit">Bind API Key</button>`,
+          "</form>",
+          "</body></html>",
+        ].join("");
+
+        return {
+          status: 200,
+          headers: {
+            "content-type": "text/html; charset=utf-8",
+            "cache-control": "no-store",
+          },
+          body: html,
+        };
+      } catch {
+        return {
+          status: 500,
+          headers: { "content-type": "text/plain; charset=utf-8", "cache-control": "no-store" },
+          body: "Failed to load binding page",
+        };
+      }
     },
 
     async handleBindPost(req: DualEraHttpRequest): Promise<DualEraHttpResponse> {
-      const expectedOrigin = new URL(publicBaseUrl).origin;
-      const reqOrigin = Object.entries(req.headers).find(
-        ([k]) => k.toLowerCase() === "origin",
-      )?.[1];
-      if (
-        (reqOrigin !== undefined && reqOrigin !== expectedOrigin) ||
-        (reqOrigin === undefined && config.allowAbsentOrigin === false)
-      ) {
-        return {
-          status: 403,
-          headers: { "content-type": "text/plain" },
-          body: "Forbidden or missing origin on binding submission",
-        };
-      }
-      const url = new URL(req.path, publicBaseUrl);
-      const form = new URLSearchParams(req.rawBody);
-      const ticketId = form.get("t") ?? url.searchParams.get("t");
-      const csrf = form.get("csrf");
-      const apiKey = form.get("api_key");
+      try {
+        const expectedOrigin = new URL(publicBaseUrl).origin;
+        const reqOrigin = Object.entries(req.headers).find(
+          ([k]) => k.toLowerCase() === "origin",
+        )?.[1];
+        if (
+          (reqOrigin !== undefined && reqOrigin !== expectedOrigin) ||
+          (reqOrigin === undefined && config.allowAbsentOrigin === false)
+        ) {
+          return {
+            status: 403,
+            headers: { "content-type": "text/plain" },
+            body: "Forbidden or missing origin on binding submission",
+          };
+        }
+        const url = new URL(req.path, publicBaseUrl);
+        const form = new URLSearchParams(req.rawBody);
+        const ticketId = form.get("t") ?? url.searchParams.get("t");
+        const csrf = form.get("csrf");
+        const apiKey = form.get("api_key");
 
-      if (!ticketId || !csrf || !apiKey) {
-        return {
-          status: 400,
-          headers: { "content-type": "text/plain" },
-          body: "Missing required binding fields",
-        };
-      }
-      const ticket = await loadTicket(ticketId);
-      if (!ticket || clock() >= ticket.expiresAtMs || ticket.completed) {
-        return {
-          status: 410,
-          headers: { "content-type": "text/plain" },
-          body: "Binding ticket expired or already consumed",
-        };
-      }
-      const csrfA = Buffer.from(csrf, "utf8");
-      const csrfB = Buffer.from(ticket.csrfToken, "utf8");
-      if (csrfA.length !== csrfB.length || !timingSafeEqual(csrfA, csrfB)) {
-        return { status: 403, headers: { "content-type": "text/plain" }, body: "Invalid CSRF" };
-      }
-
-      if (!config.verifyBindingOpenerSession || !config.storeBoundApiKey) {
-        return {
-          status: 500,
-          headers: { "content-type": "text/plain" },
-          body: "Binding callbacks not configured",
-        };
-      }
-      const opener = await config.verifyBindingOpenerSession(req);
-      if (
-        !opener ||
-        opener.issuer === RESERVED_LEGACY_ISSUER ||
-        opener.issuer !== ticket.issuer ||
-        opener.principalId !== ticket.principalId
-      ) {
-        return {
-          status: 403,
-          headers: { "content-type": "text/plain" },
-          body: "Opener identity mismatch",
-        };
-      }
-
-      // Atomic check-and-claim AFTER async opener verification prevents concurrent double-submit (AUTH-01, AUTH-04)
-      const nowMs = clock();
-      if (nowMs >= ticket.expiresAtMs || ticket.completed) {
-        return {
-          status: 410,
-          headers: { "content-type": "text/plain" },
-          body: "Binding ticket expired or already consumed",
-        };
-      }
-      const inMemoryTicket = tickets.get(ticketId);
-      if (inMemoryTicket) {
-        if (inMemoryTicket.completed) {
+        if (!ticketId || !csrf || !apiKey) {
+          return {
+            status: 400,
+            headers: { "content-type": "text/plain" },
+            body: "Missing required binding fields",
+          };
+        }
+        const ticket = await loadTicket(ticketId);
+        if (!ticket || clock() >= ticket.expiresAtMs || ticket.completed) {
           return {
             status: 410,
             headers: { "content-type": "text/plain" },
             body: "Binding ticket expired or already consumed",
           };
         }
-        inMemoryTicket.completed = true;
-      }
-      try {
-        const stored = await config.storeBoundApiKey(
-          {
-            issuer: ticket.issuer,
-            principalId: ticket.principalId,
-            instanceUrl: ticket.instanceUrl,
-          },
-          apiKey,
-        );
-        if (storage.markBindingTicketCompleted) {
-          const claimed = await storage.markBindingTicketCompleted(
-            ticketId,
-            stored.credentialGeneration,
-            nowMs,
+        const csrfA = Buffer.from(csrf, "utf8");
+        const csrfB = Buffer.from(ticket.csrfToken, "utf8");
+        if (csrfA.length !== csrfB.length || !timingSafeEqual(csrfA, csrfB)) {
+          return { status: 403, headers: { "content-type": "text/plain" }, body: "Invalid CSRF" };
+        }
+
+        if (!config.verifyBindingOpenerSession || !config.storeBoundApiKey) {
+          return {
+            status: 500,
+            headers: { "content-type": "text/plain" },
+            body: "Binding callbacks not configured",
+          };
+        }
+        const opener = await config.verifyBindingOpenerSession(req);
+        if (
+          !opener ||
+          opener.issuer === RESERVED_LEGACY_ISSUER ||
+          opener.issuer !== ticket.issuer ||
+          opener.principalId !== ticket.principalId
+        ) {
+          return {
+            status: 403,
+            headers: { "content-type": "text/plain" },
+            body: "Opener identity mismatch",
+          };
+        }
+
+        // Atomic check-and-claim AFTER async opener verification prevents concurrent double-submit (AUTH-01, AUTH-04)
+        const nowMs = clock();
+        if (nowMs >= ticket.expiresAtMs || ticket.completed) {
+          return {
+            status: 410,
+            headers: { "content-type": "text/plain" },
+            body: "Binding ticket expired or already consumed",
+          };
+        }
+        const inMemoryTicket = tickets.get(ticketId);
+        if (inMemoryTicket) {
+          if (inMemoryTicket.completed) {
+            return {
+              status: 410,
+              headers: { "content-type": "text/plain" },
+              body: "Binding ticket expired or already consumed",
+            };
+          }
+          inMemoryTicket.completed = true;
+        }
+
+        // Split API key verification/storage from durable ticket completion so storage failures
+        // are not misreported as invalid Bugzilla API keys.
+        let stored: { credentialGeneration: number };
+        try {
+          stored = await config.storeBoundApiKey(
+            {
+              issuer: ticket.issuer,
+              principalId: ticket.principalId,
+              instanceUrl: ticket.instanceUrl,
+            },
+            apiKey,
           );
+        } catch (err) {
+          if (inMemoryTicket) {
+            inMemoryTicket.completed = false;
+          }
+          if (err instanceof StorageError) {
+            return {
+              status: 500,
+              headers: { "content-type": "text/plain", "cache-control": "no-store" },
+              body: "Failed to persist bound Bugzilla API key",
+            };
+          }
+          return {
+            status: 400,
+            headers: { "content-type": "text/plain", "cache-control": "no-store" },
+            body: "Failed to verify Bugzilla API key",
+          };
+        }
+
+        if (storage.markBindingTicketCompleted) {
+          let claimed: boolean;
+          try {
+            claimed = await storage.markBindingTicketCompleted(
+              ticketId,
+              stored.credentialGeneration,
+              nowMs,
+            );
+          } catch {
+            if (inMemoryTicket) {
+              inMemoryTicket.completed = false;
+            }
+            return {
+              status: 500,
+              headers: { "content-type": "text/plain", "cache-control": "no-store" },
+              body: "Failed to finalize binding ticket",
+            };
+          }
           if (!claimed) {
             return {
               status: 410,
@@ -300,28 +389,26 @@ export function createBindingManager(config: HttpServerConfig) {
             };
           }
         }
+
         if (inMemoryTicket) {
           inMemoryTicket.completedGeneration = stored.credentialGeneration;
         }
-      } catch {
-        if (inMemoryTicket) {
-          inMemoryTicket.completed = false;
-        }
+
         return {
-          status: 400,
-          headers: { "content-type": "text/plain" },
-          body: "Failed to verify Bugzilla API key",
+          status: 200,
+          headers: {
+            "content-type": "text/html; charset=utf-8",
+            "cache-control": "no-store",
+          },
+          body: "<!doctype html><html><body><p>Bugzilla API key bound successfully. You may return to your MCP client.</p></body></html>",
+        };
+      } catch {
+        return {
+          status: 500,
+          headers: { "content-type": "text/plain; charset=utf-8", "cache-control": "no-store" },
+          body: "Failed to process binding submission",
         };
       }
-
-      return {
-        status: 200,
-        headers: {
-          "content-type": "text/html; charset=utf-8",
-          "cache-control": "no-store",
-        },
-        body: "<!doctype html><html><body><p>Bugzilla API key bound successfully. You may return to your MCP client.</p></body></html>",
-      };
     },
 
     async verifyAndConsumeRetryState(
@@ -350,6 +437,7 @@ export function createBindingManager(config: HttpServerConfig) {
       }
 
       const nowMs = clock();
+      pruneConsumedStates(nowMs);
       if (nowMs >= payload.expiresAtMs) return false;
       if (
         payload.issuer !== ctx.issuer ||
@@ -366,9 +454,16 @@ export function createBindingManager(config: HttpServerConfig) {
       if (consumedStates.has(payload.stateId)) {
         return false;
       }
-      consumedStates.add(payload.stateId);
+      consumedStates.set(payload.stateId, payload.expiresAtMs);
 
-      const ticket = await loadTicket(payload.ticketId);
+      let ticket: TicketRecord | undefined;
+      try {
+        ticket = await loadTicket(payload.ticketId);
+      } catch (err) {
+        consumedStates.delete(payload.stateId);
+        throw err;
+      }
+
       if (
         !ticket ||
         !ticket.completed ||
@@ -380,7 +475,14 @@ export function createBindingManager(config: HttpServerConfig) {
       }
 
       if (storage.consumeRetryState) {
-        const fresh = await storage.consumeRetryState(payload.stateId, payload.expiresAtMs, nowMs);
+        let fresh: boolean;
+        try {
+          fresh = await storage.consumeRetryState(payload.stateId, payload.expiresAtMs, nowMs);
+        } catch (err) {
+          // Roll back in-memory consumed marker if durable storage threw (#13 C.3)
+          consumedStates.delete(payload.stateId);
+          throw err;
+        }
         if (!fresh) {
           return false;
         }

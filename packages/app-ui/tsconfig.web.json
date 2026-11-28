@@ -12,6 +12,8 @@
     "src/web/**/*.tsx",
     "src/types.ts",
     "src/sanitize.ts",
-    "src/controller.ts"
+    "src/controller.ts",
+    "src/tenant-key.ts",
+    "src/tool-result.ts"
   ]
 }

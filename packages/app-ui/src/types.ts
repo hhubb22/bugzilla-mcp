@@ -1,4 +1,5 @@
 import type { BugId } from "@bugzilla-mcp/contracts";
+import type { UnwrappedToolResult } from "./tool-result.js";
 
 export type HostSurface = "aux_pane" | "global" | "inline";
 
@@ -35,6 +36,11 @@ export interface McpAppHostPort {
   updateModelContext(params: {
     readonly content: readonly { readonly type: "resource_link"; readonly uri: string }[];
   }): Promise<void>;
+  openExternalLink?(params: { readonly url: string }): Promise<void>;
+  callServerTool?(params: {
+    readonly name: string;
+    readonly arguments: Record<string, unknown>;
+  }): Promise<unknown>;
 }
 
 export interface TriageAppController {
@@ -43,4 +49,10 @@ export interface TriageAppController {
   triggerReEvaluateAfterConflict(input: UntrustedBugzillaDisplayInput): Promise<void>;
   attachSelectionToModelContext(bugs: readonly UntrustedBugzillaDisplayInput[]): Promise<void>;
   clearModelContext(): Promise<void>;
+  parseToolResult<T = Record<string, unknown>>(raw: unknown): UnwrappedToolResult<T>;
+  callTool<T = Record<string, unknown>>(
+    name: string,
+    args: Record<string, unknown>,
+  ): Promise<UnwrappedToolResult<T>>;
+  openExternalLink(url: string): Promise<void>;
 }

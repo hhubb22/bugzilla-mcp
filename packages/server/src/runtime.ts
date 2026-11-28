@@ -1,6 +1,6 @@
 import { createServer, type IncomingMessage, type ServerResponse } from "node:http";
 import type { AddressInfo } from "node:net";
-import { createSyntheticEventsService, startWebhookDeliveryLoop } from "@bugzilla-mcp/core";
+import { createCoreRuntime, startWebhookDeliveryLoop } from "@bugzilla-mcp/core";
 import { buildDualEraHttpHandler } from "./http-handler.js";
 import type { DualEraHttpRequest, HttpServerConfig } from "./index.js";
 import { httpsWebhookTransport } from "./webhook-transport.js";
@@ -108,6 +108,7 @@ function normalizeHeaders(req: IncomingMessage): Record<string, string | undefin
 /**
  * Starts a real Streamable HTTP MCP server bound to loopback by default in local mode.
  * Works natively in both Bun 1.4+ and Node 24/26 via node:http.
+ * Owns a scoped Effect `CoreRuntime` (`ManagedRuntime`) and disposes it cleanly on `close()`.
  */
 export async function startMcpHttpServer(params: {
   config: HttpServerConfig;
@@ -127,12 +128,12 @@ export async function startMcpHttpServer(params: {
   }
 
   const config = await configureWebhooks(params.config);
-  const events = createSyntheticEventsService({
+  const coreRuntime = createCoreRuntime({
     ...config.core,
     eventsProfile: config.eventsProfile,
     webhookEnabled: config.webhookEnabled === true,
   });
-  const handler = buildDualEraHttpHandler(config, events);
+  const handler = buildDualEraHttpHandler(config, coreRuntime);
   const server = createServer((req: IncomingMessage, res: ServerResponse) => {
     void (async () => {
       try {
@@ -174,34 +175,48 @@ export async function startMcpHttpServer(params: {
     })();
   });
 
-  await new Promise<void>((resolve, reject) => {
-    server.once("error", reject);
-    server.listen(params.port ?? 0, host, () => {
-      server.off("error", reject);
-      resolve();
+  try {
+    await new Promise<void>((resolve, reject) => {
+      server.once("error", reject);
+      server.listen(params.port ?? 0, host, () => {
+        server.off("error", reject);
+        resolve();
+      });
     });
-  });
+  } catch (err) {
+    await coreRuntime.dispose();
+    throw err;
+  }
 
   const addr = server.address() as AddressInfo;
   const actualPort = addr.port;
   const delivery = config.webhookEnabled
     ? startWebhookDeliveryLoop({
-        events,
-        listPrincipals: () => config.core.storage.listWebhookGrants!(),
+        events: coreRuntime.events,
+        listPrincipals: () => config.core.storage.listWebhookGrants(),
         intervalMs: WEBHOOK_INTERVAL_MS,
+        scheduler: coreRuntime.webhookScheduler,
       })
     : undefined;
+
+  let closed = false;
   return {
     port: actualPort,
     host,
     baseUrl: `http://${host}:${actualPort}`,
     async close() {
-      await Promise.all([
-        delivery?.stop(),
-        new Promise<void>((resolve, reject) => {
-          server.close((err) => (err ? reject(err) : resolve()));
-        }),
-      ]);
+      if (closed) return;
+      closed = true;
+      try {
+        await Promise.all([
+          delivery?.stop(),
+          new Promise<void>((resolve, reject) => {
+            server.close((err) => (err ? reject(err) : resolve()));
+          }),
+        ]);
+      } finally {
+        await coreRuntime.dispose();
+      }
     },
   };
 }

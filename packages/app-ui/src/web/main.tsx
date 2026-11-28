@@ -3,6 +3,7 @@ import { StrictMode, useEffect, useMemo, useState } from "react";
 import { createRoot } from "react-dom/client";
 import { createController } from "../controller.js";
 import { normalizeBoardTenantKey } from "../tenant-key.js";
+import { isSafeHttpUrl, unwrapToolResult } from "../tool-result.js";
 import type { McpAppHostCapabilities, McpAppHostPort } from "../types.js";
 import { createRpcGate } from "./concurrency.js";
 import { type TriageBoardPayload, TriageWorkbench } from "./TriageWorkbench.js";
@@ -10,6 +11,7 @@ import "./styles.css";
 
 function McpAppRoot() {
   const [payload, setPayload] = useState<TriageBoardPayload | null>(null);
+  const [initialError, setInitialError] = useState<string | null>(null);
   const [loading, setLoading] = useState(true);
   const [capabilities, setCapabilities] = useState<McpAppHostCapabilities>({
     message: false,
@@ -41,6 +43,15 @@ function McpAppRoot() {
           })),
         });
       },
+      openExternalLink: async ({ url }) => {
+        if (!isSafeHttpUrl(url)) {
+          throw new Error(
+            "Blocked unsafe external URL: only http:// and https:// links are allowed.",
+          );
+        }
+        await app.openLink({ url });
+      },
+      callServerTool: ({ name, arguments: args }) => app.callServerTool({ name, arguments: args }),
     }),
     [app, capabilities],
   );
@@ -53,14 +64,48 @@ function McpAppRoot() {
 
     // Register ALL lifecycle handlers BEFORE app.connect() so no initial notification is missed
     app.ontoolinput = () => {
-      if (active) setLoading(true);
+      if (active) {
+        setLoading(true);
+        setInitialError(null);
+      }
     };
 
     app.ontoolresult = (result) => {
       if (!active) return;
       setLoading(false);
-      const sc = result.structuredContent as Record<string, unknown> | undefined;
-      if (!sc || typeof sc !== "object") return;
+      const unwrapped = unwrapToolResult<Record<string, unknown>>(result);
+      if (!unwrapped.ok) {
+        if (
+          unwrapped.kind === "credential_binding_required" ||
+          unwrapped.kind === "credential_revoked"
+        ) {
+          setInitialError(null);
+          setPayload(
+            normalizeBoardTenantKey(
+              {
+                instanceUrl: "",
+                instanceLabel: "Bugzilla",
+                principalId: "",
+                deploymentMode: "cloud-multi-user" as const,
+                fetchedAt: new Date().toISOString(),
+                bugs: [],
+                proposals: [],
+                unbound: true,
+                authErrorKind: unwrapped.kind,
+                authErrorMessage: unwrapped.message,
+                ...(unwrapped.bindUrl !== undefined ? { bindingUrl: unwrapped.bindUrl } : {}),
+              },
+              () => `anon-unbound-${++anonymousViewSeq}`,
+            ),
+          );
+          return;
+        }
+        setInitialError(unwrapped.message);
+        return;
+      }
+
+      setInitialError(null);
+      const sc = unwrapped.data;
       if (Array.isArray(sc.bugs)) {
         const incoming = sc as unknown as TriageBoardPayload;
         setPayload(normalizeBoardTenantKey(incoming, () => `anon-board-${++anonymousViewSeq}`));
@@ -136,12 +181,18 @@ function McpAppRoot() {
   return (
     <TriageWorkbench
       initialPayload={payload}
+      initialError={initialError}
       loading={loading}
       capabilities={capabilities}
       controller={controller}
       gate={gate}
       callServerTool={(name, args) => app.callServerTool({ name, arguments: args })}
       openExternalLink={async (url) => {
+        if (!isSafeHttpUrl(url)) {
+          throw new Error(
+            "Blocked unsafe external URL: only http:// and https:// links are allowed.",
+          );
+        }
         await app.openLink({ url });
       }}
     />

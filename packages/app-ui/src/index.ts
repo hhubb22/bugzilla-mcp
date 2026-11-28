@@ -55,4 +55,22 @@ export {
   resolveBoardTenantKey,
   resolveVerifiedTenantKey,
 } from "./tenant-key.js";
+export {
+  createBoundedIdempotencyKey,
+  extractErrorMessage,
+  extractLatestSnapshotView,
+  extractWriteGuardOutcome,
+  formatUpstreamRejectedMessage,
+  isSafeHttpUrl,
+  MAX_IDEMPOTENCY_KEY_LENGTH,
+  normalizeSafeBugUrl,
+  unwrapToolResult,
+} from "./tool-result.js";
+export type {
+  AuthErrorKind,
+  LatestBugSnapshotView,
+  McpToolContentItem,
+  RawMcpToolResult,
+  UnwrappedToolResult,
+} from "./tool-result.js";
 export { loadTriageAppHtml };

@@ -17,6 +17,7 @@
     "@bugzilla-mcp/bugzilla-client": "workspace:*",
     "@bugzilla-mcp/contracts": "workspace:*",
     "@bugzilla-mcp/core": "workspace:*",
-    "@bugzilla-mcp/storage": "workspace:*"
+    "@bugzilla-mcp/storage": "workspace:*",
+    "effect": "^4.1.7"
   }
 }

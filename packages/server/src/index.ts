@@ -45,6 +45,7 @@ export interface DualEraHttpResponse {
 
 export interface DualEraMcpHandler {
   handleHttp(req: DualEraHttpRequest): Promise<DualEraHttpResponse>;
+  dispose?(): Promise<void>;
 }
 
 import { buildDualEraHttpHandler } from "./http-handler.js";
@@ -53,6 +54,21 @@ export function createDualEraHttpHandler(config: HttpServerConfig): DualEraMcpHa
   return buildDualEraHttpHandler(config);
 }
 
+export { acceptsHtmlPreference } from "./approval-page.js";
 export { createEncryptedCredentialVault, type EncryptedCredentialVault } from "./crypto-store.js";
+export {
+  INDISTINGUISHABLE_RESOURCE_ERROR,
+  type ResourceReadOutcome,
+  type ToolDispatchOutcome,
+} from "./error-projector.js";
+export { createMcpRequestPipeline, type McpRequestPipeline } from "./pipeline.js";
 export { type RunningHttpServer, startMcpHttpServer } from "./runtime.js";
-export { createStdioRpcProcessor, runStdioServer } from "./stdio.js";
+export { createStdioRpcProcessor, runStdioServer, type StdioRpcProcessor } from "./stdio.js";
+export {
+  buildFullToolCatalog,
+  buildResourceCatalog,
+  DOSSIER_CARD_URI,
+  SCHEMA_FIELDS_URI,
+  SCHEMA_PRODUCTS_URI,
+  TRIAGE_APP_URI,
+} from "./tool-dispatch.js";

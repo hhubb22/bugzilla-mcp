@@ -7,15 +7,10 @@ import {
   RESERVED_LEGACY_ISSUER,
   type PrincipalContext,
 } from "@bugzilla-mcp/contracts";
-import { createWriteGuardService, McpDomainError } from "@bugzilla-mcp/core";
-import { createApprovalPageManager } from "./approval-page.js";
+import { createCoreRuntime, type CoreRuntime } from "@bugzilla-mcp/core";
+import { projectTopLevelRpcError } from "./error-projector.js";
 import type { HttpServerConfig } from "./index.js";
-import {
-  buildFullToolCatalog,
-  buildResourceCatalog,
-  dispatchToolCall,
-  readMcpResource,
-} from "./tool-dispatch.js";
+import { createMcpRequestPipeline } from "./pipeline.js";
 
 interface StdioRpcRequest {
   jsonrpc?: string;
@@ -24,42 +19,30 @@ interface StdioRpcRequest {
   params?: Record<string, unknown>;
 }
 
-function requiredScopeForStdioRpc(
-  method: string,
-  params: Record<string, unknown>,
-): PrincipalContext["scopes"][number] | null {
-  if (method === "resources/read") return "bz:read";
-  if (method === "tools/call") {
-    const name = typeof params.name === "string" ? params.name : "";
-    if (name === "bugzilla_post_analysis") return "bz:write:safe";
-    if (
-      name === "bugzilla_propose_update" ||
-      name === "bugzilla_create_bug" ||
-      name === "app_resolve_proposal"
-    ) {
-      return "bz:write:guarded";
-    }
-    return "bz:read";
-  }
-  return null;
-}
+export type StdioRpcProcessor = ((line: string) => Promise<string | null>) & {
+  dispose(): Promise<void>;
+};
 
 /**
  * Newline-delimited JSON-RPC 2.0 stdio transport for local IDEs / Antigravity / Claude Desktop.
- * Supports both MCP 2025-11-25 initialize handshake and MCP 2026-07-28 server/discover.
+ * Supports both MCP 2025-11-25 initialize handshake and MCP 2026-07-28 server/discover,
+ * sharing the unified `McpRequestPipeline` (`readOnly`, scopes, error projection, Effect CoreRuntime).
  */
 export function createStdioRpcProcessor(params: {
   config: HttpServerConfig;
   principal: PrincipalContext;
-}) {
-  const { config, principal } = params;
+  coreRuntime?: CoreRuntime;
+}): StdioRpcProcessor {
+  const { config, principal, coreRuntime } = params;
   if (principal.issuer === RESERVED_LEGACY_ISSUER) {
     throw new Error("Reserved legacy issuer cannot be used for live stdio principals");
   }
-  const writeGuard = createWriteGuardService(config.core);
-  const approvalPage = createApprovalPageManager(config);
+  const pipeline = createMcpRequestPipeline({
+    config,
+    ...(coreRuntime !== undefined ? { coreRuntime } : {}),
+  });
 
-  return async function handleLine(line: string): Promise<string | null> {
+  const handleLine = async function handleLine(line: string): Promise<string | null> {
     const trimmed = line.trim();
     if (!trimmed) return null;
 
@@ -88,20 +71,35 @@ export function createStdioRpcProcessor(params: {
 
     const p = rpc.params ?? {};
 
-    // Enforce principal scopes identically to HTTP before resolving client or dispatching (AUTH-09)
-    const neededScope = requiredScopeForStdioRpc(rpc.method, p);
-    if (neededScope && !principal.scopes.includes(neededScope)) {
-      return JSON.stringify({
-        jsonrpc: "2.0",
-        id: rpc.id,
-        error: {
-          code: McpErrorCode.SEP_EVENTS_FORBIDDEN,
-          message: `Insufficient scope: requires ${neededScope}`,
-        },
-      });
-    }
-
     try {
+      // Enforce config.readOnly identically to HTTP before scope/client/dispatch ([R-0b14d8])
+      const readOnlyErr = pipeline.checkReadOnlyMutation(rpc.method, p);
+      if (readOnlyErr) {
+        return JSON.stringify({
+          jsonrpc: "2.0",
+          id: rpc.id,
+          error: {
+            code: readOnlyErr.code,
+            message: readOnlyErr.message,
+            ...(readOnlyErr.data !== undefined ? { data: readOnlyErr.data } : {}),
+          },
+        });
+      }
+
+      // Enforce principal scopes without abusing provisional SEP_EVENTS_FORBIDDEN (-32024) outside events/*
+      const scopeDecision = pipeline.checkScope(principal, rpc.method, p);
+      if (!scopeDecision.allowed) {
+        return JSON.stringify({
+          jsonrpc: "2.0",
+          id: rpc.id,
+          error: {
+            code: McpErrorCode.INVALID_PARAMS,
+            message: `Insufficient scope: requires ${scopeDecision.requiredScope}`,
+            data: { code: "insufficient_scope", requiredScope: scopeDecision.requiredScope },
+          },
+        });
+      }
+
       if (rpc.method === "initialize") {
         const requested =
           typeof p.protocolVersion === "string" ? p.protocolVersion : MCP_PROTOCOL_LEGACY;
@@ -147,7 +145,7 @@ export function createStdioRpcProcessor(params: {
         return JSON.stringify({
           jsonrpc: "2.0",
           id: rpc.id,
-          result: { tools: buildFullToolCatalog(config.headerRoutedParams) },
+          result: { tools: pipeline.listedTools },
         });
       }
 
@@ -155,25 +153,22 @@ export function createStdioRpcProcessor(params: {
         return JSON.stringify({
           jsonrpc: "2.0",
           id: rpc.id,
-          result: { resources: buildResourceCatalog() },
+          result: { resources: pipeline.resources },
         });
       }
 
       if (rpc.method === "resources/read") {
         const uri = typeof p.uri === "string" ? p.uri : "";
-        const outcome = await readMcpResource({
-          uri,
-          ctx: principal,
-          core: config.core,
-          ...(config.appHtmlOverridePath !== undefined
-            ? { appHtmlOverridePath: config.appHtmlOverridePath }
-            : {}),
-        });
+        const outcome = await pipeline.readResource(uri, principal);
         if (outcome.kind === "rpc_error") {
           return JSON.stringify({
             jsonrpc: "2.0",
             id: rpc.id,
-            error: { code: outcome.code, message: outcome.message },
+            error: {
+              code: outcome.code,
+              message: outcome.message,
+              ...(outcome.data !== undefined ? { data: outcome.data } : {}),
+            },
           });
         }
         return JSON.stringify({
@@ -189,28 +184,31 @@ export function createStdioRpcProcessor(params: {
           typeof p.arguments === "object" && p.arguments !== null
             ? (p.arguments as Record<string, unknown>)
             : {};
-        const client = await config.core.resolveClient(principal);
-        if (!client) {
-          return JSON.stringify({
-            jsonrpc: "2.0",
-            id: rpc.id,
-            error: { code: McpErrorCode.INVALID_PARAMS, message: "CredentialBindingRequired" },
-          });
-        }
-        const outcome = await dispatchToolCall({
+        const outcome = await pipeline.callTool({
           toolName,
           toolArgs,
           ctx: principal,
-          client,
-          core: config.core,
-          writeGuard,
-          approvalPage,
         });
         if (outcome.kind === "rpc_error") {
           return JSON.stringify({
             jsonrpc: "2.0",
             id: rpc.id,
-            error: { code: outcome.code, message: outcome.message },
+            error: {
+              code: outcome.code,
+              message: outcome.message,
+              ...(outcome.data !== undefined ? { data: outcome.data } : {}),
+            },
+          });
+        }
+        if (outcome.kind === "tool_error") {
+          return JSON.stringify({
+            jsonrpc: "2.0",
+            id: rpc.id,
+            result: {
+              isError: true,
+              content: outcome.content,
+              structuredContent: outcome.structuredContent,
+            },
           });
         }
         return JSON.stringify({
@@ -229,24 +227,22 @@ export function createStdioRpcProcessor(params: {
         error: { code: McpErrorCode.METHOD_NOT_FOUND, message: `Unknown method: ${rpc.method}` },
       });
     } catch (err) {
-      if (err instanceof McpDomainError) {
-        return JSON.stringify({
-          jsonrpc: "2.0",
-          id: rpc.id,
-          error: {
-            code: err.code,
-            message: err.message,
-            ...(err.data !== undefined ? { data: err.data } : {}),
-          },
-        });
-      }
+      const projected = projectTopLevelRpcError(err);
       return JSON.stringify({
         jsonrpc: "2.0",
         id: rpc.id,
-        error: { code: McpErrorCode.INTERNAL_ERROR, message: "Internal server error" },
+        error: {
+          code: projected.code,
+          message: projected.message,
+          ...(projected.data !== undefined ? { data: projected.data } : {}),
+        },
       });
     }
   };
+
+  return Object.assign(handleLine, {
+    dispose: () => pipeline.dispose(),
+  });
 }
 
 export async function runStdioServer(params: {
@@ -257,13 +253,35 @@ export async function runStdioServer(params: {
 }): Promise<void> {
   const input = params.input ?? process.stdin;
   const output = params.output ?? process.stdout;
-  const handleLine = createStdioRpcProcessor(params);
+  const coreRuntime = createCoreRuntime({
+    ...params.config.core,
+    eventsProfile: params.config.eventsProfile,
+    webhookEnabled: false,
+  });
+  const handleLine = createStdioRpcProcessor({
+    config: params.config,
+    principal: params.principal,
+    coreRuntime,
+  });
   const rl = createInterface({ input, crlfDelay: Infinity });
 
-  for await (const line of rl) {
-    const response = await handleLine(line);
-    if (response !== null) {
-      output.write(`${response}\n`);
+  const onSignal = () => {
+    rl.close();
+  };
+  process.once("SIGINT", onSignal);
+  process.once("SIGTERM", onSignal);
+
+  try {
+    for await (const line of rl) {
+      const response = await handleLine(line);
+      if (response !== null) {
+        output.write(`${response}\n`);
+      }
     }
+  } finally {
+    process.off("SIGINT", onSignal);
+    process.off("SIGTERM", onSignal);
+    rl.close();
+    await coreRuntime.dispose();
   }
 }

@@ -1,6 +1,24 @@
-import type { BugDossier, BugSummary, ProposalDiff } from "@bugzilla-mcp/contracts";
+import type {
+  BugDossier,
+  BugSummary,
+  DraftSaveResult,
+  ProposalDiff,
+  ProposalState,
+} from "@bugzilla-mcp/contracts";
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { normalizeBoardTenantKey, resolveBoardTenantKey } from "../tenant-key.js";
+import {
+  type AuthErrorKind,
+  createBoundedIdempotencyKey,
+  extractErrorMessage,
+  extractLatestSnapshotView,
+  extractWriteGuardOutcome,
+  formatUpstreamRejectedMessage,
+  isSafeHttpUrl,
+  type LatestBugSnapshotView,
+  normalizeSafeBugUrl,
+  unwrapToolResult,
+} from "../tool-result.js";
 import type { McpAppHostCapabilities, TriageAppController } from "../types.js";
 import type { RpcGate } from "./concurrency.js";
 
@@ -13,7 +31,7 @@ export interface UiProposalSummary {
   readonly baseVersion: string;
   readonly diff: ProposalDiff;
   readonly rationale: string;
-  readonly state: "pending" | "approved" | "rejected" | "applied" | "stale" | "indeterminate";
+  readonly state: ProposalState;
   readonly approvalUrl?: string;
 }
 
@@ -31,6 +49,8 @@ export interface TriageBoardPayload {
   readonly proposals: readonly UiProposalSummary[];
   readonly hasMore?: boolean;
   readonly unbound?: boolean;
+  readonly authErrorKind?: AuthErrorKind;
+  readonly authErrorMessage?: string;
   readonly bindingUrl?: string;
   readonly initialDossier?: BugDossier;
 }
@@ -39,6 +59,7 @@ export interface ConflictState {
   readonly proposal: UiProposalSummary;
   readonly expectedLastChangeTime: string;
   readonly actualLastChangeTime: string;
+  readonly latestSnapshot?: LatestBugSnapshotView;
   readonly latestSummary?: string;
 }
 
@@ -52,6 +73,7 @@ interface DraftEntry {
 
 export interface WorkbenchProps {
   readonly initialPayload: TriageBoardPayload | null;
+  readonly initialError?: string | null;
   readonly loading: boolean;
   readonly capabilities: McpAppHostCapabilities;
   readonly controller: TriageAppController;
@@ -59,6 +81,9 @@ export interface WorkbenchProps {
   readonly callServerTool: (name: string, args: Record<string, unknown>) => Promise<unknown>;
   readonly openExternalLink: (url: string) => Promise<void>;
 }
+
+const DEFAULT_RECONCILIATION_HINT =
+  "Write status is indeterminate. Refresh from Bugzilla and verify whether the update landed before taking further action.";
 
 function severityMarker(severity: string): { icon: string; tone: string } {
   const s = severity.toLowerCase();
@@ -71,13 +96,9 @@ function severityMarker(severity: string): { icon: string; tone: string } {
   return { icon: "●", tone: "badge-info" };
 }
 
-function normalizeBugUrl(instanceUrl: string, bugId: number): string {
-  const base = instanceUrl.replace(/\/+$/, "");
-  return `${base}/show_bug.cgi?id=${Math.trunc(bugId)}`;
-}
-
 export function TriageWorkbench({
   initialPayload,
+  initialError = null,
   loading,
   capabilities,
   controller,
@@ -108,19 +129,27 @@ export function TriageWorkbench({
   const [dossier, setDossier] = useState<BugDossier | null>(initialPayload?.initialDossier ?? null);
   const [dossierLoading, setDossierLoading] = useState(false);
   const [partialError, setPartialError] = useState<string | null>(null);
-  const [inlineError, setInlineError] = useState<string | null>(null);
+  const [inlineError, setInlineError] = useState<string | null>(initialError);
   const [toast, setToast] = useState<string | null>(null);
   const [conflict, setConflict] = useState<ConflictState | null>(null);
   const [confirmProposal, setConfirmProposal] = useState<UiProposalSummary | null>(null);
-  const [indeterminateProposals, setIndeterminateProposals] = useState<Set<string>>(
-    () => new Set(),
+  const [indeterminateHints, setIndeterminateHints] = useState<Map<string, string>>(
+    () => new Map(),
   );
+  const [staleProposals, setStaleProposals] = useState<Set<string>>(() => new Set());
+  const [inFlightProposals, setInFlightProposals] = useState<Set<string>>(() => new Set());
   const [drafts, setDrafts] = useState<Map<string, DraftEntry>>(() => new Map());
   const dialogRef = useRef<HTMLDialogElement | null>(null);
   const currentTenantKey = resolveBoardTenantKey(board);
   const lastTenantKeyRef = useRef<string>(currentTenantKey);
 
   const [isStaleBoard, setIsStaleBoard] = useState(false);
+
+  useEffect(() => {
+    if (initialError !== undefined) {
+      setInlineError(initialError);
+    }
+  }, [initialError]);
 
   const checkBoardStale = useCallback((fetchedAt?: string) => {
     if (!fetchedAt) return false;
@@ -141,11 +170,71 @@ export function TriageWorkbench({
       setToast(null);
       setConflict(null);
       setConfirmProposal(null);
-      setIndeterminateProposals(new Set());
+      setIndeterminateHints(new Map());
+      setStaleProposals(new Set());
+      setInFlightProposals(new Set());
       setInlineError(null);
       setPartialError(null);
     },
     [gate],
+  );
+
+  const activateAuthRequiredScreen = useCallback(
+    (kind: AuthErrorKind, message: string, bindUrl?: string) => {
+      gate.bumpGeneration();
+      boardSeqRef.current += 1;
+      setBoard((prev) => ({
+        tenantKey: prev?.tenantKey ?? `unbound-${++anonBoardSeqRef.current}`,
+        instanceUrl: prev?.instanceUrl ?? "",
+        instanceLabel: prev?.instanceLabel ?? "Bugzilla",
+        principalId: prev?.principalId ?? "",
+        deploymentMode: prev?.deploymentMode ?? "cloud-multi-user",
+        fetchedAt: new Date().toISOString(),
+        bugs: [],
+        proposals: [],
+        unbound: true,
+        authErrorKind: kind,
+        authErrorMessage: message,
+        ...(bindUrl && isSafeHttpUrl(bindUrl) ? { bindingUrl: bindUrl } : {}),
+      }));
+      setDossier(null);
+      setDossierLoading(false);
+      setActiveBugId(null);
+      setConflict(null);
+      setConfirmProposal(null);
+      setInlineError(null);
+      setPartialError(null);
+      setToast(null);
+    },
+    [gate],
+  );
+
+  const safeOpenExternalLink = useCallback(
+    async (
+      rawUrl: string | undefined,
+      label: string,
+      originTenantKey: string,
+      gen: number,
+    ): Promise<boolean> => {
+      if (!isSafeHttpUrl(rawUrl)) {
+        if (lastTenantKeyRef.current === originTenantKey && gate.currentGeneration() === gen) {
+          setInlineError(
+            `Blocked unsafe ${label} URL: only http:// and https:// links are allowed.`,
+          );
+        }
+        return false;
+      }
+      try {
+        await openExternalLink(rawUrl);
+        return true;
+      } catch (err) {
+        if (lastTenantKeyRef.current === originTenantKey && gate.currentGeneration() === gen) {
+          setInlineError(extractErrorMessage(err, `Failed to open ${label} link.`));
+        }
+        return false;
+      }
+    },
+    [gate, openExternalLink],
   );
 
   useEffect(() => {
@@ -195,16 +284,40 @@ export function TriageWorkbench({
     return Array.from(set).sort();
   }, [board?.bugs]);
 
-  const pendingProposalsByBug = useMemo(() => {
+  const indeterminateProposalsByBug = useMemo(() => {
     const map = new Map<number, UiProposalSummary[]>();
     for (const p of board?.proposals ?? []) {
-      if (p.state !== "pending") continue;
+      const key = `${p.proposalId}@${p.revision}`;
+      if (p.state !== "indeterminate" && !indeterminateHints.has(key)) continue;
       const list = map.get(p.bugId) ?? [];
       list.push(p);
       map.set(p.bugId, list);
     }
     return map;
-  }, [board?.proposals]);
+  }, [board?.proposals, indeterminateHints]);
+
+  const allIndeterminateProposals = useMemo(() => {
+    const out: UiProposalSummary[] = [];
+    for (const p of board?.proposals ?? []) {
+      const key = `${p.proposalId}@${p.revision}`;
+      if (p.state === "indeterminate" || indeterminateHints.has(key)) {
+        out.push(p);
+      }
+    }
+    return out;
+  }, [board?.proposals, indeterminateHints]);
+
+  const pendingProposalsByBug = useMemo(() => {
+    const map = new Map<number, UiProposalSummary[]>();
+    for (const p of board?.proposals ?? []) {
+      const key = `${p.proposalId}@${p.revision}`;
+      if (p.state !== "pending" || indeterminateHints.has(key)) continue;
+      const list = map.get(p.bugId) ?? [];
+      list.push(p);
+      map.set(p.bugId, list);
+    }
+    return map;
+  }, [board?.proposals, indeterminateHints]);
 
   const tabCounts = useMemo(() => {
     const bugs = board?.bugs ?? [];
@@ -277,27 +390,47 @@ export function TriageWorkbench({
       setConflict(null);
       setPartialError(null);
       setInlineError(null);
+      const originTenantKey = lastTenantKeyRef.current;
       const gen = gate.bumpGeneration();
       setDossierLoading(true);
       try {
         const res = await gate.runRead(gen, () =>
           callServerTool("app_get_bug_full", { bugId, maxComments: 20, maxHistory: 20 }),
         );
-        if (res.stale) return;
-        const payload = res.value as {
-          structuredContent?: {
-            dossier?: BugDossier;
-            draft?: { content: string; draftRevision: number } | null;
-          };
-        } | null;
-        if (
-          payload?.structuredContent?.dossier &&
-          payload.structuredContent.dossier.bug.id === bugId
-        ) {
-          setDossier(payload.structuredContent.dossier);
+        if (res.stale || lastTenantKeyRef.current !== originTenantKey) return;
+        const unwrapped = unwrapToolResult<{
+          dossier?: BugDossier;
+          draft?: { content: string; draftRevision: number } | null;
+          proposals?: readonly UiProposalSummary[];
+        }>(res.value);
+        if (!unwrapped.ok) {
+          if (
+            unwrapped.kind === "credential_binding_required" ||
+            unwrapped.kind === "credential_revoked"
+          ) {
+            activateAuthRequiredScreen(unwrapped.kind, unwrapped.message, unwrapped.bindUrl);
+            return;
+          }
+          setPartialError(unwrapped.message);
+          return;
         }
-        if (payload?.structuredContent && "draft" in payload.structuredContent) {
-          const d = payload.structuredContent.draft;
+        const payload = unwrapped.data;
+        if (payload.dossier && payload.dossier.bug.id === bugId) {
+          setDossier(payload.dossier);
+        }
+        if (Array.isArray(payload.proposals)) {
+          const bugProposals = payload.proposals;
+          setBoard((prev) =>
+            prev && resolveBoardTenantKey(prev) === originTenantKey
+              ? {
+                  ...prev,
+                  proposals: [...prev.proposals.filter((p) => p.bugId !== bugId), ...bugProposals],
+                }
+              : prev,
+          );
+        }
+        if ("draft" in payload) {
+          const d = payload.draft;
           setDrafts((prev) => {
             const key = draftKey(bugId);
             const existing = prev.get(key);
@@ -320,9 +453,14 @@ export function TriageWorkbench({
             return next;
           });
         }
-      } catch {
-        if (gate.currentGeneration() === gen) {
-          setPartialError("Failed to load full bug details. Core summary remains available.");
+      } catch (err) {
+        if (lastTenantKeyRef.current === originTenantKey && gate.currentGeneration() === gen) {
+          setPartialError(
+            extractErrorMessage(
+              err,
+              "Failed to load full bug details. Core summary remains available.",
+            ),
+          );
         }
       } finally {
         if (gate.currentGeneration() === gen) {
@@ -330,7 +468,7 @@ export function TriageWorkbench({
         }
       }
     },
-    [callServerTool, draftKey, gate],
+    [activateAuthRequiredScreen, callServerTool, draftKey, gate],
   );
 
   const refreshBoard = useCallback(async (): Promise<boolean> => {
@@ -345,9 +483,22 @@ export function TriageWorkbench({
         }),
       );
       if (res.stale) return false;
-      const payload = (res.value as { structuredContent?: TriageBoardPayload } | null)
-        ?.structuredContent;
-      if (payload) {
+      const unwrapped = unwrapToolResult<TriageBoardPayload>(res.value);
+      if (!unwrapped.ok) {
+        if (
+          unwrapped.kind === "credential_binding_required" ||
+          unwrapped.kind === "credential_revoked"
+        ) {
+          activateAuthRequiredScreen(unwrapped.kind, unwrapped.message, unwrapped.bindUrl);
+          return false;
+        }
+        if (lastTenantKeyRef.current === originTenantKey && gate.currentGeneration() === gen) {
+          setInlineError(unwrapped.message);
+        }
+        return false;
+      }
+      const payload = unwrapped.data;
+      if (payload && Array.isArray(payload.bugs)) {
         const normalized = normalizeIncomingBoard(payload);
         const nextTenantKey = normalized.tenantKey;
         boardSeqRef.current += 1;
@@ -356,18 +507,49 @@ export function TriageWorkbench({
           setActiveTab(normalized.activeTab ?? "pending_proposals");
           setActiveBugId(normalized.focusBugId ?? normalized.initialDossier?.bug.id ?? null);
           resetTenantScopedUiState(normalized.initialDossier ?? null);
+        } else {
+          // Prune local indeterminate/stale markers for proposals resolved on the server
+          const activeServerKeys = new Map<string, ProposalState>(
+            normalized.proposals.map((p) => [`${p.proposalId}@${p.revision}`, p.state]),
+          );
+          setIndeterminateHints((prev) => {
+            if (prev.size === 0) return prev;
+            const next = new Map<string, string>();
+            for (const [k, hint] of prev) {
+              const serverState = activeServerKeys.get(k);
+              if (serverState === "indeterminate") {
+                next.set(k, hint);
+              }
+            }
+            return next;
+          });
+          setStaleProposals((prev) => {
+            if (prev.size === 0) return prev;
+            const next = new Set<string>();
+            for (const k of prev) {
+              const serverState = activeServerKeys.get(k);
+              if (serverState === "stale" || serverState === "pending") {
+                next.add(k);
+              }
+            }
+            return next;
+          });
         }
         setBoard(normalized);
         return true;
       }
-      return false;
-    } catch {
       if (lastTenantKeyRef.current === originTenantKey && gate.currentGeneration() === gen) {
-        setInlineError("Could not refresh queue from Bugzilla.");
+        setInlineError("Server returned an unexpected triage board response.");
+      }
+      return false;
+    } catch (err) {
+      if (lastTenantKeyRef.current === originTenantKey && gate.currentGeneration() === gen) {
+        setInlineError(extractErrorMessage(err, "Could not refresh queue from Bugzilla."));
       }
       return false;
     }
   }, [
+    activateAuthRequiredScreen,
     activeTab,
     callServerTool,
     gate,
@@ -432,6 +614,16 @@ export function TriageWorkbench({
   const executeProposalDecision = useCallback(
     async (proposal: UiProposalSummary, decision: "approve" | "reject") => {
       if (!board) return;
+      const key = `${proposal.proposalId}@${proposal.revision}`;
+      if (
+        inFlightProposals.has(key) ||
+        proposal.state === "stale" ||
+        staleProposals.has(key) ||
+        proposal.state === "indeterminate" ||
+        indeterminateHints.has(key)
+      ) {
+        return;
+      }
       if (checkBoardStale(board.fetchedAt)) {
         setIsStaleBoard(true);
         setInlineError("Board data is older than 5 minutes. Refresh before writing to Bugzilla.");
@@ -443,19 +635,54 @@ export function TriageWorkbench({
       const gen = gate.currentGeneration();
       if (decision === "approve" && board.deploymentMode === "cloud-multi-user") {
         if (proposal.approvalUrl && capabilities.openLinks) {
-          await openExternalLink(proposal.approvalUrl);
-          if (lastTenantKeyRef.current === originTenantKey && gate.currentGeneration() === gen) {
-            setToast("Opened secure HTTPS approval page. Refresh after completing approval.");
+          const opened = await safeOpenExternalLink(
+            proposal.approvalUrl,
+            "approval",
+            originTenantKey,
+            gen,
+          );
+          if (
+            opened &&
+            lastTenantKeyRef.current === originTenantKey &&
+            gate.currentGeneration() === gen
+          ) {
+            setToast(
+              "Opened secure HTTPS approval page. Submitting approval in your browser completes the write server-side — click Refresh to load the updated status.",
+            );
           }
         } else {
           setInlineError("Cloud approval requires an authenticated HTTPS approval link.");
         }
         return;
       }
-      const key = `${proposal.proposalId}@${proposal.revision}`;
       const previousState = proposal.state;
+      const rollbackOptimisticReject = () => {
+        if (decision !== "reject") return;
+        if (
+          lastTenantKeyRef.current !== originTenantKey ||
+          boardSeqRef.current !== originBoardSeq ||
+          gate.currentGeneration() !== gen
+        ) {
+          return;
+        }
+        setBoard((prev) =>
+          prev && resolveBoardTenantKey(prev) === originTenantKey
+            ? {
+                ...prev,
+                proposals: prev.proposals.map((p) =>
+                  p.proposalId === proposal.proposalId && p.revision === proposal.revision
+                    ? { ...p, state: previousState }
+                    : p,
+                ),
+              }
+            : prev,
+        );
+      };
 
-      // Optimistic update for reject (with board-seq & tenant-guarded per-proposal rollback on error: ISO-04-A)
+      setInFlightProposals((prev) => new Set(prev).add(key));
+      setInlineError(null);
+
+      // Optimistic update for reject (with board-seq & tenant-guarded rollback on ANY non-success: ISO-04-A)
       if (decision === "reject") {
         setBoard((prev) =>
           prev
@@ -472,12 +699,17 @@ export function TriageWorkbench({
       }
 
       try {
+        const idempotencyKey = createBoundedIdempotencyKey(
+          decision,
+          proposal.proposalId,
+          proposal.revision,
+        );
         const res = await gate.runWrite(gen, () =>
           callServerTool("app_resolve_proposal", {
             proposalId: proposal.proposalId,
             revision: proposal.revision,
             decision,
-            idempotencyKey: `ui-${decision}-${proposal.proposalId}-r${proposal.revision}`,
+            idempotencyKey,
             ...(decision === "approve" && board.deploymentMode === "local-trusted-ide"
               ? {
                   approval: {
@@ -489,35 +721,130 @@ export function TriageWorkbench({
           }),
         );
         if (res.stale || lastTenantKeyRef.current !== originTenantKey) return;
-        const outcome = (res.value as { structuredContent?: Record<string, unknown> } | null)
-          ?.structuredContent;
-        if (!outcome) return;
 
-        if (outcome.outcome === "StaleBugConflict") {
-          setConflict({
-            proposal,
-            expectedLastChangeTime: String(outcome.expectedLastChangeTime ?? proposal.baseVersion),
-            actualLastChangeTime: String(outcome.actualLastChangeTime ?? ""),
-            ...(dossier?.bug.summary !== undefined ? { latestSummary: dossier.bug.summary } : {}),
-          });
-        } else if (outcome.outcome === "OperationIndeterminate") {
-          setIndeterminateProposals((prev) => new Set(prev).add(key));
-          setInlineError(
-            "Write status is indeterminate. Reconcile by refreshing Bugzilla before taking further action.",
-          );
-        } else if (outcome.outcome === "Applied" || outcome.outcome === "ProposalRejected") {
+        const unwrapped = unwrapToolResult<Record<string, unknown>>(res.value);
+        if (
+          !unwrapped.ok &&
+          (unwrapped.kind === "credential_binding_required" ||
+            unwrapped.kind === "credential_revoked")
+        ) {
+          activateAuthRequiredScreen(unwrapped.kind, unwrapped.message, unwrapped.bindUrl);
+          return;
+        }
+
+        const outcome = extractWriteGuardOutcome(unwrapped);
+
+        if (outcome?.outcome === "ProposalRejected") {
+          setToast(`Rejected proposal for Bug #${proposal.bugId}.`);
+          const refreshed = await refreshBoard();
+          if (!refreshed || lastTenantKeyRef.current !== originTenantKey) return;
+          await openBugDetail(proposal.bugId);
+          return;
+        }
+
+        if (outcome?.outcome === "Applied") {
+          const isLegacyReject =
+            decision === "reject" || String(outcome.artifactId ?? "").startsWith("rejected:");
           setToast(
-            outcome.outcome === "Applied"
-              ? `Applied proposal to Bug #${proposal.bugId}.`
-              : `Rejected proposal for Bug #${proposal.bugId}.`,
+            isLegacyReject
+              ? `Rejected proposal for Bug #${proposal.bugId}.`
+              : `Applied proposal to Bug #${proposal.bugId}.`,
           );
           const refreshed = await refreshBoard();
           if (!refreshed || lastTenantKeyRef.current !== originTenantKey) return;
           await openBugDetail(proposal.bugId);
-        } else {
-          setInlineError(`Proposal action returned: ${String(outcome.outcome)}`);
+          return;
         }
-      } catch {
+
+        if (outcome?.outcome === "DuplicateNoOp") {
+          setToast(`Proposal action was already completed for Bug #${proposal.bugId}.`);
+          const refreshed = await refreshBoard();
+          if (!refreshed || lastTenantKeyRef.current !== originTenantKey) return;
+          await openBugDetail(proposal.bugId);
+          return;
+        }
+
+        // ANY non-applied / non-rejected outcome or isError response MUST roll back optimistic reject
+        rollbackOptimisticReject();
+
+        if (outcome?.outcome === "StaleBugConflict") {
+          const expectedLastChangeTime = String(
+            outcome.expectedLastChangeTime ?? proposal.baseVersion,
+          );
+          const actualLastChangeTime = String(outcome.actualLastChangeTime ?? "");
+          const latestSnapshot = extractLatestSnapshotView(
+            outcome.latestAuthorizedSnapshot,
+            actualLastChangeTime,
+          );
+          setStaleProposals((prev) => new Set(prev).add(key));
+          setConflict({
+            proposal,
+            expectedLastChangeTime,
+            actualLastChangeTime,
+            ...(latestSnapshot !== undefined
+              ? { latestSnapshot, latestSummary: latestSnapshot.summary }
+              : {}),
+          });
+          setInlineError(
+            `Bug #${proposal.bugId} changed externally since this proposal was drafted. Review the latest snapshot and re-draft before approving.`,
+          );
+          return;
+        }
+
+        if (outcome?.outcome === "OperationIndeterminate") {
+          const hint =
+            typeof outcome.reconciliationHint === "string" &&
+            outcome.reconciliationHint.trim().length > 0
+              ? outcome.reconciliationHint.trim()
+              : DEFAULT_RECONCILIATION_HINT;
+          setIndeterminateHints((prev) => {
+            const next = new Map(prev);
+            next.set(key, hint);
+            return next;
+          });
+          setInlineError(hint);
+          return;
+        }
+
+        if (outcome?.outcome === "UpstreamRejected") {
+          setInlineError(formatUpstreamRejectedMessage(outcome));
+          return;
+        }
+
+        if (outcome?.outcome === "OperationPending") {
+          setInlineError(
+            "Another write attempt for this proposal is currently in progress. Wait a moment and refresh.",
+          );
+          return;
+        }
+
+        if (outcome?.outcome === "IdempotencyConflict") {
+          setInlineError(
+            "Idempotency conflict on proposal action. Refresh the board and try again.",
+          );
+          return;
+        }
+
+        if (outcome?.outcome === "CausalBudgetExhausted") {
+          const retrySecs = Math.max(1, Math.ceil((outcome.retryAfterMs ?? 1000) / 1000));
+          setInlineError(
+            `Causal write budget exhausted for Bug #${proposal.bugId}. Retry in ${retrySecs}s.`,
+          );
+          return;
+        }
+
+        if (!unwrapped.ok) {
+          setInlineError(unwrapped.message);
+          if (decision === "reject") {
+            setToast("Reject failed; restored proposal to pending.");
+          }
+          return;
+        }
+
+        setInlineError(
+          `Proposal action returned unexpected status: ${outcome ? String(outcome.outcome) : "empty response"}.`,
+        );
+      } catch (err) {
         // Ignore stale rejections after a tenant switch, board replacement, or generation bump (ISO-04-A)
         if (
           lastTenantKeyRef.current !== originTenantKey ||
@@ -526,35 +853,34 @@ export function TriageWorkbench({
         ) {
           return;
         }
+        rollbackOptimisticReject();
+        const errMsg = extractErrorMessage(err, "Failed to execute proposal write.");
+        setInlineError(errMsg);
         if (decision === "reject") {
-          setBoard((prev) =>
-            prev && resolveBoardTenantKey(prev) === originTenantKey
-              ? {
-                  ...prev,
-                  proposals: prev.proposals.map((p) =>
-                    p.proposalId === proposal.proposalId && p.revision === proposal.revision
-                      ? { ...p, state: previousState }
-                      : p,
-                  ),
-                }
-              : prev,
-          );
           setToast("Reject failed; restored proposal to pending.");
-        } else {
-          setInlineError("Failed to execute proposal write.");
         }
+      } finally {
+        setInFlightProposals((prev) => {
+          if (!prev.has(key)) return prev;
+          const next = new Set(prev);
+          next.delete(key);
+          return next;
+        });
       }
     },
     [
+      activateAuthRequiredScreen,
       board,
       callServerTool,
       capabilities.openLinks,
       checkBoardStale,
-      dossier?.bug.summary,
       gate,
+      inFlightProposals,
+      indeterminateHints,
       openBugDetail,
-      openExternalLink,
       refreshBoard,
+      safeOpenExternalLink,
+      staleProposals,
     ],
   );
 
@@ -567,14 +893,15 @@ export function TriageWorkbench({
       }
       const k = draftKey(bugId);
       const current = drafts.get(k);
-      const nextRev = (current?.revision ?? 0) + 1;
+      const previousRev = current?.revision ?? 0;
+      const nextRev = previousRev + 1;
       const submittedSeq = current?.editSeq ?? 0;
       setDrafts((prev) => {
         const copy = new Map(prev);
         const latest = prev.get(k);
         copy.set(k, {
           content: latest?.content ?? nextContent,
-          revision: nextRev,
+          revision: previousRev,
           editSeq: latest?.editSeq ?? submittedSeq,
           status: "saving",
         });
@@ -592,45 +919,92 @@ export function TriageWorkbench({
           }),
         );
         if (res.stale || lastTenantKeyRef.current !== originTenantKey) return;
-        const result = (
-          res.value as { structuredContent?: { status: string; draftRevision?: number } } | null
-        )?.structuredContent;
+        const unwrapped = unwrapToolResult<DraftSaveResult>(res.value);
+        if (!unwrapped.ok) {
+          if (
+            unwrapped.kind === "credential_binding_required" ||
+            unwrapped.kind === "credential_revoked"
+          ) {
+            activateAuthRequiredScreen(unwrapped.kind, unwrapped.message, unwrapped.bindUrl);
+            return;
+          }
+          setDrafts((prev) => {
+            const copy = new Map(prev);
+            const latest = prev.get(k);
+            copy.set(k, {
+              content: latest?.content ?? nextContent,
+              revision: previousRev,
+              editSeq: latest?.editSeq ?? submittedSeq,
+              status: latest && latest.editSeq !== submittedSeq ? "dirty" : "save_failed",
+              error: unwrapped.message,
+            });
+            return copy;
+          });
+          return;
+        }
+        const result = unwrapped.data;
         setDrafts((prev) => {
           const copy = new Map(prev);
           const latest = prev.get(k);
-          const ackRev = result?.draftRevision ?? nextRev;
-          // Preserve newer user edits made while save was in flight (UI-02)
-          if (latest && latest.editSeq !== submittedSeq) {
-            copy.set(k, { ...latest, revision: ackRev, status: "dirty" });
-          } else {
+          const hasNewerEdits = Boolean(latest && latest.editSeq !== submittedSeq);
+          if (result.status === "acknowledged") {
+            const ackRev =
+              typeof result.draftRevision === "number" ? result.draftRevision : nextRev;
             copy.set(k, {
               content: latest?.content ?? nextContent,
               revision: ackRev,
-              editSeq: submittedSeq,
-              status: result?.status === "acknowledged" ? "saved" : "save_failed",
+              editSeq: latest?.editSeq ?? submittedSeq,
+              status: hasNewerEdits ? "dirty" : "saved",
+            });
+          } else if (result.status === "stale_revision") {
+            const serverRev =
+              typeof result.currentRevision === "number" ? result.currentRevision : previousRev;
+            copy.set(k, {
+              content: latest?.content ?? nextContent,
+              revision: serverRev,
+              editSeq: latest?.editSeq ?? submittedSeq,
+              status: hasNewerEdits ? "dirty" : "save_failed",
+              error: `Draft was updated elsewhere (server revision ${serverRev}). Click Save Draft again to save your changes.`,
+            });
+          } else {
+            copy.set(k, {
+              content: latest?.content ?? nextContent,
+              revision: previousRev,
+              editSeq: latest?.editSeq ?? submittedSeq,
+              status: hasNewerEdits ? "dirty" : "save_failed",
+              error: "Unexpected draft save response from server.",
             });
           }
           return copy;
         });
-      } catch {
+      } catch (err) {
         if (lastTenantKeyRef.current !== originTenantKey || gate.currentGeneration() !== gen) {
           return;
         }
+        const errMsg = extractErrorMessage(err, "Failed to save draft.");
         setDrafts((prev) => {
           const copy = new Map(prev);
           const latest = prev.get(k);
           copy.set(k, {
             content: latest?.content ?? nextContent,
-            revision: nextRev,
+            revision: previousRev,
             editSeq: latest?.editSeq ?? submittedSeq,
             status: latest && latest.editSeq !== submittedSeq ? "dirty" : "save_failed",
-            error: "Save failed",
+            error: errMsg,
           });
           return copy;
         });
       }
     },
-    [board?.fetchedAt, callServerTool, checkBoardStale, draftKey, drafts, gate],
+    [
+      activateAuthRequiredScreen,
+      board?.fetchedAt,
+      callServerTool,
+      checkBoardStale,
+      draftKey,
+      drafts,
+      gate,
+    ],
   );
 
   const activeBug = useMemo(() => {
@@ -644,37 +1018,74 @@ export function TriageWorkbench({
     return pendingProposalsByBug.get(activeBugId) ?? [];
   }, [activeBugId, pendingProposalsByBug]);
 
-  // UI State #8: Unbound / Permission Denied
+  const activeBugIndeterminateProposals = useMemo(() => {
+    if (activeBugId === null) return [];
+    return indeterminateProposalsByBug.get(activeBugId) ?? [];
+  }, [activeBugId, indeterminateProposalsByBug]);
+
+  // UI State #8: Unbound / Rebind Required
   if (board?.unbound) {
+    const isRevoked = board.authErrorKind === "credential_revoked";
+    const safeBindUrl = isSafeHttpUrl(board.bindingUrl) ? board.bindingUrl : null;
     return (
       <main className="workbench-shell">
         <header className="topbar">
           <div className="topbar-title-group">
             <h1>Bugzilla Triage</h1>
-            <span className="instance-pill">Unbound</span>
+            <span className={`instance-pill ${isRevoked ? "stale" : ""}`}>
+              {isRevoked ? "Rebind Required" : "Unbound"}
+            </span>
           </div>
+          <button type="button" className="btn" onClick={() => void refreshBoard()}>
+            Refresh
+          </button>
         </header>
-        <section className="empty-state">
-          <h2>Bind your self-hosted Bugzilla API Key</h2>
-          <p>
-            API keys are never collected inside chat or this panel. Complete one-time HTTPS binding
-            to load your authorized queue.
-          </p>
-          {capabilities.openLinks && board.bindingUrl ? (
-            <button
-              type="button"
-              className="btn btn-primary"
-              onClick={() => void openExternalLink(board.bindingUrl!)}
-            >
-              Open Secure Binding Page
+        {inlineError ? (
+          <div className="inline-alert top-alert" role="alert">
+            <span>{inlineError}</span>
+            <button type="button" className="btn btn-ghost" onClick={() => setInlineError(null)}>
+              Dismiss
             </button>
-          ) : null}
+          </div>
+        ) : null}
+        <section className="empty-state">
+          <h2>
+            {isRevoked
+              ? "Your Bugzilla API Key Was Revoked or Rejected"
+              : "Bind your self-hosted Bugzilla API Key"}
+          </h2>
+          {board.authErrorMessage ? <p>{board.authErrorMessage}</p> : null}
+          <p>
+            API keys are never collected inside chat or this panel. Complete{" "}
+            {isRevoked ? "re-binding" : "one-time HTTPS binding"} in your browser, then click
+            Refresh to load your authorized queue.
+          </p>
+          <div className="action-row" style={{ justifyContent: "center" }}>
+            {capabilities.openLinks && safeBindUrl ? (
+              <button
+                type="button"
+                className="btn btn-primary"
+                onClick={() => {
+                  const originTenantKey = lastTenantKeyRef.current;
+                  const gen = gate.currentGeneration();
+                  void safeOpenExternalLink(safeBindUrl, "binding", originTenantKey, gen);
+                }}
+              >
+                {isRevoked ? "Re-bind Bugzilla API Key" : "Open Secure Binding Page"}
+              </button>
+            ) : null}
+            <button type="button" className="btn" onClick={() => void refreshBoard()}>
+              Refresh
+            </button>
+          </div>
         </section>
       </main>
     );
   }
 
   const currentDraft = activeBugId !== null ? drafts.get(draftKey(activeBugId)) : undefined;
+  const safeActiveBugUrl =
+    activeBug && board?.instanceUrl ? normalizeSafeBugUrl(board.instanceUrl, activeBug.id) : null;
 
   return (
     <main className="workbench-shell">
@@ -691,6 +1102,15 @@ export function TriageWorkbench({
         </button>
       </header>
 
+      {inlineError ? (
+        <div className="inline-alert top-alert" role="alert">
+          <span>{inlineError}</span>
+          <button type="button" className="btn btn-ghost" onClick={() => setInlineError(null)}>
+            Dismiss
+          </button>
+        </div>
+      ) : null}
+
       {toast ? (
         <div className="selection-bar" role="status">
           <span>{toast}</span>
@@ -698,6 +1118,42 @@ export function TriageWorkbench({
             Dismiss
           </button>
         </div>
+      ) : null}
+
+      {allIndeterminateProposals.length > 0 ? (
+        <section
+          className="reconciliation-card reconciliation-banner"
+          aria-label="Proposals requiring reconciliation"
+        >
+          <div className="bug-row-top" style={{ justifyContent: "space-between" }}>
+            <strong>
+              Reconciliation Required ({allIndeterminateProposals.length} indeterminate proposal
+              {allIndeterminateProposals.length > 1 ? "s" : ""})
+            </strong>
+            <button type="button" className="btn" onClick={() => void refreshBoard()}>
+              Refresh from Bugzilla
+            </button>
+          </div>
+          <p style={{ margin: "6px 0" }}>
+            The following proposal write(s) have uncertain upstream status. Approve and Reject
+            actions are disabled until reconciled against Bugzilla.
+          </p>
+          <div className="action-row">
+            {allIndeterminateProposals.map((p) => {
+              const pKey = `${p.proposalId}@${p.revision}`;
+              return (
+                <button
+                  key={pKey}
+                  type="button"
+                  className="btn"
+                  onClick={() => void openBugDetail(p.bugId)}
+                >
+                  Inspect Bug #{p.bugId} ({p.proposalId} rev {p.revision})
+                </button>
+              );
+            })}
+          </div>
+        </section>
       ) : null}
 
       <nav className="tabs" role="tablist" aria-label="Triage queues">
@@ -806,6 +1262,7 @@ export function TriageWorkbench({
               {visibleBugs.map((bug, idx) => {
                 const sev = severityMarker(bug.severity);
                 const pendingCount = pendingProposalsByBug.get(bug.id)?.length ?? 0;
+                const indeterminateCount = indeterminateProposalsByBug.get(bug.id)?.length ?? 0;
                 const checked = selectedIds.has(bug.id);
                 return (
                   <li
@@ -842,6 +1299,9 @@ export function TriageWorkbench({
                             {pendingCount} proposal{pendingCount > 1 ? "s" : ""}
                           </span>
                         ) : null}
+                        {indeterminateCount > 0 ? (
+                          <span className="badge badge-warn">Needs reconciliation</span>
+                        ) : null}
                       </div>
                       <p className="bug-summary">{bug.summary}</p>
                       <div className="bug-meta">
@@ -875,14 +1335,26 @@ export function TriageWorkbench({
                         const selected = (board?.bugs ?? [])
                           .filter((b) => selectedIds.has(b.id))
                           .map((b) => ({ bugId: b.id, title: b.summary }));
-                        void controller.attachSelectionToModelContext(selected).then(() => {
-                          if (
-                            lastTenantKeyRef.current === originTenantKey &&
-                            gate.currentGeneration() === gen
-                          ) {
-                            setToast(`Attached ${selected.length} bug link(s) to next turn.`);
-                          }
-                        });
+                        void controller
+                          .attachSelectionToModelContext(selected)
+                          .then(() => {
+                            if (
+                              lastTenantKeyRef.current === originTenantKey &&
+                              gate.currentGeneration() === gen
+                            ) {
+                              setToast(`Attached ${selected.length} bug link(s) to next turn.`);
+                            }
+                          })
+                          .catch((err) => {
+                            if (
+                              lastTenantKeyRef.current === originTenantKey &&
+                              gate.currentGeneration() === gen
+                            ) {
+                              setInlineError(
+                                extractErrorMessage(err, "Failed to attach selection to context."),
+                              );
+                            }
+                          });
                       }}
                     >
                       Attach to Context
@@ -893,14 +1365,26 @@ export function TriageWorkbench({
                       onClick={() => {
                         const originTenantKey = lastTenantKeyRef.current;
                         const gen = gate.currentGeneration();
-                        void controller.clearModelContext().then(() => {
-                          if (
-                            lastTenantKeyRef.current === originTenantKey &&
-                            gate.currentGeneration() === gen
-                          ) {
-                            setToast("Cleared context.");
-                          }
-                        });
+                        void controller
+                          .clearModelContext()
+                          .then(() => {
+                            if (
+                              lastTenantKeyRef.current === originTenantKey &&
+                              gate.currentGeneration() === gen
+                            ) {
+                              setToast("Cleared context.");
+                            }
+                          })
+                          .catch((err) => {
+                            if (
+                              lastTenantKeyRef.current === originTenantKey &&
+                              gate.currentGeneration() === gen
+                            ) {
+                              setInlineError(
+                                extractErrorMessage(err, "Failed to clear model context."),
+                              );
+                            }
+                          });
                       }}
                     >
                       Clear
@@ -912,10 +1396,21 @@ export function TriageWorkbench({
                     type="button"
                     className="btn btn-primary"
                     onClick={() => {
+                      const originTenantKey = lastTenantKeyRef.current;
+                      const gen = gate.currentGeneration();
                       const selected = (board?.bugs ?? [])
                         .filter((b) => selectedIds.has(b.id))
                         .map((b) => ({ bugId: b.id, title: b.summary }));
-                      void controller.triggerInvestigate(selected);
+                      void controller.triggerInvestigate(selected).catch((err) => {
+                        if (
+                          lastTenantKeyRef.current === originTenantKey &&
+                          gate.currentGeneration() === gen
+                        ) {
+                          setInlineError(
+                            extractErrorMessage(err, "Failed to send investigation request."),
+                          );
+                        }
+                      });
                     }}
                   >
                     Ask Agent to Investigate
@@ -945,13 +1440,15 @@ export function TriageWorkbench({
                   <span className="bug-id">#{activeBug.id}</span>
                   <span className="badge badge-info">{activeBug.status}</span>
                 </div>
-                {capabilities.openLinks && board?.instanceUrl ? (
+                {capabilities.openLinks && safeActiveBugUrl ? (
                   <button
                     type="button"
                     className="btn"
-                    onClick={() =>
-                      void openExternalLink(normalizeBugUrl(board.instanceUrl, activeBug.id))
-                    }
+                    onClick={() => {
+                      const originTenantKey = lastTenantKeyRef.current;
+                      const gen = gate.currentGeneration();
+                      void safeOpenExternalLink(safeActiveBugUrl, "Bugzilla", originTenantKey, gen);
+                    }}
                   >
                     Open in Bugzilla ↗
                   </button>
@@ -963,12 +1460,6 @@ export function TriageWorkbench({
                 {activeBug.product} / {activeBug.component} · Priority {activeBug.priority} ·
                 Assigned to {activeBug.assignedTo}
               </div>
-
-              {inlineError ? (
-                <div className="inline-alert" role="alert">
-                  {inlineError}
-                </div>
-              ) : null}
 
               {partialError ? (
                 <div className="inline-alert" role="alert">
@@ -983,7 +1474,7 @@ export function TriageWorkbench({
                 </div>
               ) : null}
 
-              {/* Place 3: StaleBugConflict 3-column recovery view */}
+              {/* Place 3: StaleBugConflict 3-column recovery view (inert text per [R-3d5465]) */}
               {conflict && conflict.proposal.bugId === activeBug.id ? (
                 <div className="conflict-card" role="alert">
                   <h2>Stale Bug Conflict — Proposal Outdated</h2>
@@ -1002,22 +1493,48 @@ export function TriageWorkbench({
                     <tbody>
                       <tr>
                         <td>{conflict.expectedLastChangeTime}</td>
-                        <td>{conflict.actualLastChangeTime}</td>
+                        <td>
+                          {conflict.latestSnapshot?.lastChangeTime ?? conflict.actualLastChangeTime}
+                        </td>
                         <td>{JSON.stringify(conflict.proposal.diff)}</td>
                       </tr>
                     </tbody>
                   </table>
+                  {conflict.latestSnapshot ? (
+                    <div className="bug-meta" style={{ marginTop: 8 }}>
+                      <div>
+                        <strong>Latest Snapshot Summary:</strong> {conflict.latestSnapshot.summary}
+                      </div>
+                      <div>
+                        <strong>Latest Status:</strong> {conflict.latestSnapshot.status} ·{" "}
+                        <strong>Last Changed:</strong> {conflict.latestSnapshot.lastChangeTime}
+                      </div>
+                    </div>
+                  ) : null}
                   <div className="action-row">
                     {capabilities.message ? (
                       <button
                         type="button"
                         className="btn btn-primary"
-                        onClick={() =>
-                          void controller.triggerReEvaluateAfterConflict({
-                            bugId: activeBug.id,
-                            title: activeBug.summary,
-                          })
-                        }
+                        onClick={() => {
+                          const originTenantKey = lastTenantKeyRef.current;
+                          const gen = gate.currentGeneration();
+                          void controller
+                            .triggerReEvaluateAfterConflict({
+                              bugId: activeBug.id,
+                              title: activeBug.summary,
+                            })
+                            .catch((err) => {
+                              if (
+                                lastTenantKeyRef.current === originTenantKey &&
+                                gate.currentGeneration() === gen
+                              ) {
+                                setInlineError(
+                                  extractErrorMessage(err, "Failed to send re-draft request."),
+                                );
+                              }
+                            });
+                        }}
                       >
                         Ask Agent to Re-draft
                       </button>
@@ -1029,10 +1546,46 @@ export function TriageWorkbench({
                 </div>
               ) : null}
 
+              {/* Dedicated Reconciliation section for indeterminate proposals (persisted or in-session) */}
+              {activeBugIndeterminateProposals.length > 0 ? (
+                <section className="section-block" aria-label="Proposals pending reconciliation">
+                  <h2>Reconciliation Required</h2>
+                  {activeBugIndeterminateProposals.map((proposal) => {
+                    const key = `${proposal.proposalId}@${proposal.revision}`;
+                    const hint = indeterminateHints.get(key) ?? DEFAULT_RECONCILIATION_HINT;
+                    return (
+                      <div key={key} className="reconciliation-card" role="alert">
+                        <div className="bug-row-top">
+                          <strong>
+                            Proposal {proposal.proposalId} (rev {proposal.revision})
+                          </strong>
+                          <span className="badge badge-warn">Indeterminate</span>
+                        </div>
+                        <p style={{ margin: "6px 0" }}>{hint}</p>
+                        <div className="bug-meta">Diff: {JSON.stringify(proposal.diff)}</div>
+                        <div className="action-row">
+                          <button type="button" className="btn btn-primary" disabled>
+                            Pending Reconciliation
+                          </button>
+                          <button type="button" className="btn" disabled>
+                            Reject
+                          </button>
+                          <button type="button" className="btn" onClick={() => void refreshBoard()}>
+                            Refresh from Bugzilla
+                          </button>
+                        </div>
+                      </div>
+                    );
+                  })}
+                </section>
+              ) : null}
+
               {/* Pending AI Proposals */}
               {activeBugProposals.map((proposal) => {
                 const key = `${proposal.proposalId}@${proposal.revision}`;
-                const isIndeterminate = indeterminateProposals.has(key);
+                const isStaleProposal = proposal.state === "stale" || staleProposals.has(key);
+                const isInFlight = inFlightProposals.has(key);
+                const disabled = isStaleBoard || isStaleProposal || isInFlight;
                 return (
                   <div key={key} className="proposal-banner">
                     <div className="bug-row-top">
@@ -1044,6 +1597,7 @@ export function TriageWorkbench({
                       ) : (
                         <span className="badge badge-info">Field Update</span>
                       )}
+                      {isStaleProposal ? <span className="badge badge-danger">Stale</span> : null}
                     </div>
                     <p style={{ margin: "6px 0" }}>{proposal.rationale}</p>
                     <div className="bug-meta">Diff: {JSON.stringify(proposal.diff)}</div>
@@ -1051,15 +1605,19 @@ export function TriageWorkbench({
                       <button
                         type="button"
                         className="btn btn-primary"
-                        disabled={isStaleBoard || isIndeterminate}
+                        disabled={disabled}
                         onClick={() => setConfirmProposal(proposal)}
                       >
-                        {isIndeterminate ? "Pending Reconciliation" : "Review & Approve"}
+                        {isStaleProposal
+                          ? "Stale — Re-draft Required"
+                          : isInFlight
+                            ? "Submitting..."
+                            : "Review & Approve"}
                       </button>
                       <button
                         type="button"
                         className="btn"
-                        disabled={isStaleBoard || isIndeterminate}
+                        disabled={disabled}
                         onClick={() => void executeProposalDecision(proposal, "reject")}
                       >
                         Reject
@@ -1153,12 +1711,17 @@ export function TriageWorkbench({
                   <button
                     type="button"
                     className="btn"
-                    disabled={isStaleBoard}
+                    disabled={isStaleBoard || currentDraft?.status === "saving"}
                     onClick={() => void handleSaveDraft(activeBug.id, currentDraft?.content ?? "")}
                   >
                     Save Draft
                   </button>
                 </div>
+                {currentDraft?.error ? (
+                  <div className="inline-alert draft-error" role="alert">
+                    {currentDraft.error}
+                  </div>
+                ) : null}
               </div>
             </>
           )}
