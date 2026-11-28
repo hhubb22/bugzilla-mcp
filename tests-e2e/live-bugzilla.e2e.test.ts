@@ -4,7 +4,10 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { PassThrough } from "node:stream";
 import { createRpcGate } from "../packages/app-ui/src/web/concurrency.js";
-import { createBugzillaClient } from "../packages/bugzilla-client/src/index.js";
+import {
+  BugzillaValidationError,
+  createBugzillaClient,
+} from "../packages/bugzilla-client/src/index.js";
 import { MCP_PROTOCOL_MODERN, type PrincipalContext } from "../packages/contracts/src/index.js";
 import {
   createCloudApprovalTokenService,
@@ -405,6 +408,70 @@ describe("Live OrbStack Bugzilla 5.2 Zero-Mock E2E", () => {
     expect(badCreateRpc.result.structuredContent).toMatchObject({
       outcome: "UpstreamRejected",
       effectCertainty: "none",
+    });
+
+    // Nonexistent keyword MUST return UpstreamRejected (NOT "Resource not found or inaccessible")
+    // via metadata preflight and still allow reusing the exact same idempotencyKey
+    const badKeywordRes = await rpcCall(
+      "tok-admin",
+      "tools/call",
+      {
+        name: "bugzilla_create_bug",
+        arguments: {
+          idempotencyKey: createKey,
+          product: "PICOS",
+          component: "Routing",
+          version: "1.0",
+          summary: "Invalid keyword 404/preflight test",
+          description: "Bugzilla 5.2 rejects unknown keywords with HTTP 404 code 51",
+          keywords: ["NonExistentKeywordXYZ"],
+        },
+      },
+      "bugzilla_create_bug",
+    );
+    expect(badKeywordRes.status).toBe(200);
+    const badKeywordRpc = JSON.parse(badKeywordRes.text) as {
+      result: {
+        isError: boolean;
+        content: Array<{ text: string }>;
+        structuredContent: {
+          outcome: string;
+          effectCertainty: string;
+          missingFields?: string[];
+          reason?: string;
+        };
+      };
+    };
+    expect(badKeywordRpc.result.isError).toBe(true);
+    expect(badKeywordRpc.result.structuredContent).toMatchObject({
+      outcome: "UpstreamRejected",
+      effectCertainty: "none",
+      missingFields: ["keywords"],
+    });
+    expect(badKeywordRpc.result.content[0]?.text).not.toContain(
+      "Resource not found or inaccessible",
+    );
+
+    // Direct REST client bypass confirms Bugzilla 5.2 HTTP 404 code 51 classifies as BugzillaValidationError
+    let directKeywordError: unknown;
+    try {
+      await adminClient.createBug({
+        product: "PICOS",
+        component: "Routing",
+        version: "1.0",
+        summary: "Direct REST unknown keyword test",
+        description: "Verifies classify.ts maps Bugzilla 5.2 HTTP 404 code 51 to validation error",
+        keywords: ["NonExistentKeywordXYZ"],
+      });
+    } catch (err) {
+      directKeywordError = err;
+    }
+    expect(directKeywordError).toBeInstanceOf(BugzillaValidationError);
+    expect(directKeywordError).toMatchObject({
+      _tag: "BugzillaValidationError",
+      httpStatus: 404,
+      bzErrorCode: 51,
+      missingFields: ["keywords"],
     });
 
     const createArgs = {

@@ -1,4 +1,4 @@
-import { Effect } from "effect";
+import { Cause, Effect, Exit } from "effect";
 import {
   BugzillaAccessDeniedError,
   type BugzillaClientError,
@@ -23,6 +23,7 @@ export interface RawHttpResponse<T> {
 
 const CREDENTIAL_REVOKED_CODES: ReadonlySet<number> = new Set([300, 306, 410]);
 const ACCESS_DENIED_CODES: ReadonlySet<number> = new Set([101, 102, 110, 111, 505]);
+const ROUTE_NOT_FOUND_CODES: ReadonlySet<number> = new Set([32614]);
 export const PRIVATE_COMMENT_DENIED_CODE = 113;
 
 export function parseRetryAfterMs(
@@ -55,6 +56,27 @@ const MISSING_FIELD_PATTERNS: readonly RegExp[] = [
   /there is no\s+(product|component|version)\s+named/gi,
 ];
 
+const MAPPED_FIELD_ERROR_PATTERNS: readonly {
+  readonly pattern: RegExp;
+  readonly field: string;
+}[] = [
+  {
+    pattern:
+      /(?:there is no\s+keyword\s+(?:named|with the id)\b|\bkeyword\b[^.\n]*\bdoes not exist\b|\bunknown\s+keyword\b)/i,
+    field: "keywords",
+  },
+  {
+    pattern:
+      /(?:there is no\s+(?:target\s+)?milestone\s+(?:named|with the id)\b|\b(?:target_milestone|milestone)\b[^.\n]*\bdoes not exist\b|\bunknown\s+(?:target\s+)?milestone\b)/i,
+    field: "target_milestone",
+  },
+  {
+    pattern:
+      /(?:there is no\s+user\s+(?:named|with the id)\b|\buser\b[^.\n]*\bdoes not exist\b|\bnot a valid username\b)/i,
+    field: "user",
+  },
+];
+
 const MISSING_FIELD_LIST_PATTERN = /missing required field(?:s)?\s*[:=]\s*([a-z0-9_,\s]+)/i;
 
 export function extractMissingFields(bzMessage: string | undefined): readonly string[] | undefined {
@@ -74,6 +96,12 @@ export function extractMissingFields(bzMessage: string | undefined): readonly st
     let match: RegExpExecArray | null;
     while ((match = pattern.exec(bzMessage)) !== null) {
       if (match[1]) add(match[1]);
+    }
+  }
+
+  for (const { pattern, field } of MAPPED_FIELD_ERROR_PATTERNS) {
+    if (pattern.test(bzMessage)) {
+      add(field);
     }
   }
 
@@ -172,9 +200,12 @@ export function classifyResponse<T>(
   }
 
   // Access denied by Bugzilla error code (101, 102, 110, 111, 505, 113)
+  // or route not found (32614, e.g. stock Bugzilla 5.0/5.2 /rest/whoami)
   if (
     resp.bzErrorCode !== undefined &&
-    (ACCESS_DENIED_CODES.has(resp.bzErrorCode) || resp.bzErrorCode === PRIVATE_COMMENT_DENIED_CODE)
+    (ACCESS_DENIED_CODES.has(resp.bzErrorCode) ||
+      resp.bzErrorCode === PRIVATE_COMMENT_DENIED_CODE ||
+      ROUTE_NOT_FOUND_CODES.has(resp.bzErrorCode))
   ) {
     return Effect.fail(
       new BugzillaAccessDeniedError({
@@ -185,10 +216,17 @@ export function classifyResponse<T>(
     );
   }
 
-  // Deterministic validation rejection: 400 / 422 OR HTTP 200 { error: true, ... }
+  // Write requests (POST/PUT) receiving HTTP 404 with a structured Bugzilla JSON error
+  // (non-ACL, non-32614 code — e.g. code 51 object_does_not_exist for unknown keyword/user/milestone)
+  // are deterministic validation rejections, not [R-32f1fc] resource access denials.
+  const isWriteStructured404 =
+    isWrite && resp.status === 404 && resp.bzError && resp.bzErrorCode !== undefined;
+
+  // Deterministic validation rejection: 400 / 422, structured write 404, OR HTTP 200 { error: true, ... }
   if (
     resp.status === 400 ||
     resp.status === 422 ||
+    isWriteStructured404 ||
     (resp.bzError && resp.status < 500 && resp.status !== 403 && resp.status !== 404)
   ) {
     const bzMessage = redactedMsg ?? `Bugzilla rejected request (HTTP ${resp.status})`;
@@ -246,4 +284,18 @@ export function classifyResponse<T>(
   }
 
   return Effect.succeed(resp.data);
+}
+
+export function classifyResponseOutcome<T>(
+  method: BugzillaHttpMethod,
+  resp: RawHttpResponse<T>,
+  secrets: readonly string[] = [],
+):
+  | { readonly ok: true; readonly value: T }
+  | { readonly ok: false; readonly error: BugzillaClientError } {
+  const exit = Effect.runSyncExit(classifyResponse(method, resp, secrets));
+  if (Exit.isSuccess(exit)) {
+    return { ok: true, value: exit.value };
+  }
+  return { ok: false, error: Cause.squash(exit.cause) as BugzillaClientError };
 }

@@ -359,6 +359,32 @@ export function createMetadataCacheEffect(config: MetadataCacheConfig = {}): Met
           }
         }
 
+        // Validate keywords against /rest/field/bug (Bugzilla 5.2 always includes `values: []`
+        // for `keywords` when none are configured; skip validation only if `values` is absent).
+        if (input.keywords && input.keywords.length > 0) {
+          const keywordsField = byName.get("keywords");
+          if (keywordsField && keywordsField.values !== undefined) {
+            const legalKeywords = activeFieldValueNames(keywordsField);
+            const legalKeywordsLower = new Set(legalKeywords.map((k) => k.trim().toLowerCase()));
+            const invalidKeywords = input.keywords.filter(
+              (kw) => !legalKeywordsLower.has(kw.trim().toLowerCase()),
+            );
+            if (invalidKeywords.length > 0) {
+              missingFields.push("keywords");
+              if (legalKeywords.length > 0) {
+                fieldHints.keywords = capHints(legalKeywords, maxHintItems);
+                reasons.push(
+                  `Invalid keyword(s): ${invalidKeywords.join(", ")} (not configured on this Bugzilla instance)`,
+                );
+              } else {
+                reasons.push(
+                  `Invalid keyword(s): ${invalidKeywords.join(", ")}. No keywords are configured on this Bugzilla instance.`,
+                );
+              }
+            }
+          }
+        }
+
         // Check mandatory custom fields required on bug entry.
         for (const field of fields) {
           if (!field.isCustom || !field.isMandatory || !field.isOnBugEntry) continue;
@@ -380,12 +406,22 @@ export function createMetadataCacheEffect(config: MetadataCacheConfig = {}): Met
       }
 
       if (missingFields.length > 0) {
+        const hasAnyHints = Object.values(fieldHints).some((vals) => vals.length > 0);
+        const keywordsRejectedWithoutOptions =
+          missingFields.includes("keywords") &&
+          (!fieldHints.keywords || fieldHints.keywords.length === 0);
+        const remediationHint =
+          missingFields.length === 1 && keywordsRejectedWithoutOptions
+            ? "Omit keywords (none are configured on this Bugzilla instance) or configure keywords in Bugzilla administration."
+            : hasAnyHints
+              ? `Provide valid values for: ${missingFields.join(", ")}. See fieldHints for allowed options.${keywordsRejectedWithoutOptions ? " Omit keywords (none are configured on this Bugzilla instance)." : ""}`
+              : `Provide valid values for: ${missingFields.join(", ")}.`;
         return {
           ok: false,
           missingFields,
           fieldHints,
           reason: reasons.join("; "),
-          remediationHint: `Provide valid values for: ${missingFields.join(", ")}. See fieldHints for allowed options.`,
+          remediationHint,
         };
       }
 

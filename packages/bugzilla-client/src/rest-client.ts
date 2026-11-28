@@ -1257,6 +1257,7 @@ export function createRestBugzillaClientEffect(config: BugzillaClientConfig): Bu
 
 export {
   classifyResponse,
+  classifyResponseOutcome,
   extractMissingFields,
   isPrivateCommentRejection,
   parseRetryAfterMs,

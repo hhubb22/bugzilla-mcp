@@ -7,11 +7,14 @@ import {
   unwrapToolResult,
 } from "../packages/app-ui/src/index.js";
 import {
+  BugzillaAccessDeniedError,
   BugzillaCredentialRevokedError,
   BugzillaRateLimitError,
   BugzillaTransientError,
   BugzillaValidationError,
+  classifyResponseOutcome,
   createRestBugzillaClient,
+  extractMissingFields,
 } from "../packages/bugzilla-client/src/index.js";
 import {
   MCP_PROTOCOL_LEGACY,
@@ -1657,5 +1660,533 @@ describe("Track A postmortem & red-team regressions", () => {
     expect(isSafeHttpUrl("https://bugzilla.example/show_bug.cgi?id=41")).toBe(true);
     expect(isSafeHttpUrl("javascript:alert(1)")).toBe(false);
     expect(isSafeHttpUrl("data:text/html,<script>alert(1)</script>")).toBe(false);
+  });
+
+  test("classifyResponse maps structured POST/PUT HTTP 404 input errors to BugzillaValidationError while preserving [R-32f1fc] for ACL/32614/codeless/GET 404", () => {
+    const runFail = (
+      method: "GET" | "POST" | "PUT",
+      resp: Parameters<typeof classifyResponseOutcome>[1],
+      secrets: readonly string[] = [],
+    ) => {
+      const outcome = classifyResponseOutcome(method, resp, secrets);
+      expect(outcome.ok).toBe(false);
+      if (outcome.ok) throw new Error("Expected failure outcome");
+      return outcome.error;
+    };
+
+    // 1. POST & PUT HTTP 404 with structured Bugzilla code 51 (unknown keyword) -> BugzillaValidationError
+    for (const method of ["POST", "PUT"] as const) {
+      const err = runFail(
+        method,
+        {
+          status: 404,
+          data: null,
+          parseOk: true,
+          bzError: true,
+          bzErrorCode: 51,
+          bzMessage:
+            "There is no keyword named 'nonexistent' (https://bz.example/rest/bug?api_key=super-secret-key).",
+        },
+        ["super-secret-key"],
+      );
+      expect(err).toBeInstanceOf(BugzillaValidationError);
+      if (!(err instanceof BugzillaValidationError)) throw new Error("Expected validation error");
+      expect(err.effectCertainty).toBe("none");
+      expect(err.httpStatus).toBe(404);
+      expect(err.bzErrorCode).toBe(51);
+      expect(err.bzMessage).toContain("There is no keyword named 'nonexistent'");
+      expect(err.bzMessage).not.toContain("super-secret-key");
+      expect(err.missingFields).toEqual(["keywords"]);
+    }
+
+    // Also verify field extraction for keyword/milestone/user lookup variants
+    expect(extractMissingFields("Keyword 'foo' does not exist.")).toEqual(["keywords"]);
+    expect(extractMissingFields("Unknown keyword 'bar'.")).toEqual(["keywords"]);
+    expect(extractMissingFields("There is no milestone named 'v9.9'.")).toEqual([
+      "target_milestone",
+    ]);
+    expect(extractMissingFields("There is no user named 'ghost@example.test'.")).toEqual(["user"]);
+
+    // 2. [R-32f1fc] strictly preserved for ACL codes (101, 102, 110, 111, 505, 113) & route-not-found (32614)
+    for (const code of [101, 102, 110, 111, 505, 113, 32614]) {
+      for (const method of ["GET", "POST", "PUT"] as const) {
+        const err = runFail(method, {
+          status: 404,
+          data: null,
+          parseOk: true,
+          bzError: true,
+          bzErrorCode: code,
+          bzMessage: `Access denied or route missing (code ${code})`,
+        });
+        expect(err, `${method} code ${code}`).toBeInstanceOf(BugzillaAccessDeniedError);
+      }
+    }
+
+    // 3. Codeless 404, non-bzError JSON 404, non-JSON 404, HTTP 403, and GET 404 (even code 51) -> BugzillaAccessDeniedError
+    for (const [label, method, resp] of [
+      [
+        "POST codeless 404",
+        "POST",
+        { status: 404, data: null, parseOk: true, bzError: true, bzMessage: "Not found" },
+      ],
+      [
+        "PUT non-bzError 404",
+        "PUT",
+        { status: 404, data: { detail: "missing" }, parseOk: true, bzError: false },
+      ],
+      ["POST non-JSON 404", "POST", { status: 404, data: null, parseOk: false, bzError: false }],
+      [
+        "POST HTTP 403 code 51",
+        "POST",
+        {
+          status: 403,
+          data: null,
+          parseOk: true,
+          bzError: true,
+          bzErrorCode: 51,
+          bzMessage: "Forbidden",
+        },
+      ],
+      [
+        "GET HTTP 404 code 51",
+        "GET",
+        {
+          status: 404,
+          data: null,
+          parseOk: true,
+          bzError: true,
+          bzErrorCode: 51,
+          bzMessage: "There is no keyword named 'bogus'.",
+        },
+      ],
+    ] as const) {
+      const err = runFail(method, resp);
+      expect(err, label).toBeInstanceOf(BugzillaAccessDeniedError);
+    }
+  });
+
+  test("bugzilla_create_bug nonexistent keywords: preflight (populated & empty values) and fallback HTTP 404 all return UpstreamRejected without key poisoning", async () => {
+    const makeHandler = (
+      client: Parameters<typeof dependencies>[0],
+      storage: ReturnType<typeof createSqliteStorage>,
+    ) =>
+      createDualEraHttpHandler({
+        mode: "cloud-multi-user",
+        allowedOrigins: [origin],
+        allowAbsentOrigin: true,
+        eventsProfile: "sep-3415",
+        publicBaseUrl: serviceUrl,
+        core: dependencies(client, { storage }),
+        authenticateBearerToken: async (tok) => (tok === bearer ? principal : null),
+      });
+
+    // (a) Preflight with non-empty keywords.values -> UpstreamRejected with fieldHints.keywords, 0 writes, 0 receipts
+    {
+      const storage = createSqliteStorage(":memory:");
+      const upstream = bugzilla({
+        async getBugFields() {
+          return [
+            {
+              id: 10,
+              name: "keywords",
+              displayName: "Keywords",
+              type: 8,
+              isCustom: false,
+              isMandatory: false,
+              isOnBugEntry: true,
+              values: [{ name: "regression" }, { name: "perf" }],
+            },
+          ];
+        },
+      });
+      const handler = makeHandler(upstream.client, storage);
+      const key = "create-kw-preflight-populated-001";
+      const res = await handler.handleHttp(
+        modernRequest("tools/call", {
+          name: "bugzilla_create_bug",
+          arguments: {
+            idempotencyKey: key,
+            product: "Browser",
+            component: "Layout",
+            version: "1.0",
+            summary: "Unknown keyword test",
+            description: "Should fail preflight before upstream write",
+            keywords: ["regression", "bogus-kw"],
+          },
+        }),
+      );
+      expect(res.status).toBe(200);
+      const rpc = parseRpc(res) as {
+        result: {
+          isError: boolean;
+          content: Array<{ text: string }>;
+          structuredContent: {
+            outcome: string;
+            effectCertainty: string;
+            missingFields: string[];
+            fieldHints: Record<string, string[]>;
+            reason: string;
+          };
+        };
+      };
+      expect(rpc.result.isError).toBe(true);
+      expect(rpc.result.structuredContent).toMatchObject({
+        outcome: "UpstreamRejected",
+        effectCertainty: "none",
+        missingFields: ["keywords"],
+        fieldHints: { keywords: ["regression", "perf"] },
+      });
+      expect(rpc.result.structuredContent.reason).toContain("bogus-kw");
+      expect(rpc.result.content[0]?.text).not.toContain("Resource not found or inaccessible");
+      expect(upstream.mutations).toEqual([]);
+      expect(
+        await storage.getReceipt({
+          issuer: principal.issuer,
+          principalId: principal.principalId,
+          instanceUrl: principal.instanceUrl,
+          operation: "bugzilla_create_bug",
+          key,
+        }),
+      ).toBeNull();
+
+      // Case-insensitive valid keyword matches Bugzilla 5.2 sql_istrcmp behavior -> Applied
+      const okRes = await handler.handleHttp(
+        modernRequest("tools/call", {
+          name: "bugzilla_create_bug",
+          arguments: {
+            idempotencyKey: key,
+            product: "Browser",
+            component: "Layout",
+            version: "1.0",
+            summary: "Valid case-insensitive keyword",
+            description: "Should pass preflight and create bug",
+            keywords: ["Regression"],
+          },
+        }),
+      );
+      const okRpc = parseRpc(okRes) as {
+        result: { isError?: boolean; structuredContent: { outcome: string; bugId: number } };
+      };
+      expect(okRpc.result.isError).not.toBe(true);
+      expect(okRpc.result.structuredContent).toMatchObject({ outcome: "Applied", bugId: 200 });
+      expect(upstream.mutations).toHaveLength(1);
+    }
+
+    // (b) Preflight with empty keywords.values: [] -> UpstreamRejected stating no keywords configured, 0 writes, 0 receipts
+    {
+      const storage = createSqliteStorage(":memory:");
+      const upstream = bugzilla({
+        async getBugFields() {
+          return [
+            {
+              id: 10,
+              name: "keywords",
+              displayName: "Keywords",
+              type: 8,
+              isCustom: false,
+              isMandatory: false,
+              isOnBugEntry: true,
+              values: [],
+            },
+          ];
+        },
+      });
+      const handler = makeHandler(upstream.client, storage);
+      const key = "create-kw-preflight-empty-001";
+      const res = await handler.handleHttp(
+        modernRequest("tools/call", {
+          name: "bugzilla_create_bug",
+          arguments: {
+            idempotencyKey: key,
+            product: "Browser",
+            component: "Layout",
+            version: "1.0",
+            summary: "Empty keywords instance test",
+            description: "Bugzilla 5.2 returns values: [] when no keywords exist",
+            keywords: ["nonexistent"],
+          },
+        }),
+      );
+      expect(res.status).toBe(200);
+      const rpc = parseRpc(res) as {
+        result: {
+          isError: boolean;
+          structuredContent: {
+            outcome: string;
+            effectCertainty: string;
+            missingFields: string[];
+            reason: string;
+            remediationHint: string;
+          };
+        };
+      };
+      expect(rpc.result.isError).toBe(true);
+      expect(rpc.result.structuredContent).toMatchObject({
+        outcome: "UpstreamRejected",
+        effectCertainty: "none",
+        missingFields: ["keywords"],
+      });
+      expect(rpc.result.structuredContent.reason).toContain(
+        "No keywords are configured on this Bugzilla instance",
+      );
+      expect(rpc.result.structuredContent.remediationHint).toContain("Omit keywords");
+      expect(upstream.mutations).toEqual([]);
+      expect(
+        await storage.getReceipt({
+          issuer: principal.issuer,
+          principalId: principal.principalId,
+          instanceUrl: principal.instanceUrl,
+          operation: "bugzilla_create_bug",
+          key,
+        }),
+      ).toBeNull();
+    }
+
+    // (c) Fallback upstream HTTP 404 path (when /rest/field/bug omits keywords.values) ->
+    // real REST client classifies 404 code 51 as BugzillaValidationError -> UpstreamRejected,
+    // receipt marked failed, same idempotencyKey reusable after fixing -> Applied
+    {
+      const storage = createSqliteStorage(":memory:");
+      let postCount = 0;
+      const restClient = createRestBugzillaClient({
+        baseUrl: "https://bz.example",
+        apiKey: "test-api-key-secret",
+        maxGetRetries: 0,
+        fetchImpl: (async (input: string | URL | Request, init?: RequestInit) => {
+          const url = typeof input === "string" ? input : input.toString();
+          const method = init?.method ?? "GET";
+          if (method === "GET" && url.includes("/rest/product/")) {
+            return new Response(
+              JSON.stringify({
+                products: [
+                  {
+                    id: 1,
+                    name: "Browser",
+                    is_active: true,
+                    components: [{ id: 1, name: "Layout", is_active: true }],
+                    versions: [{ id: 1, name: "1.0", is_active: true }],
+                  },
+                ],
+              }),
+              { status: 200, headers: { "content-type": "application/json" } },
+            );
+          }
+          if (method === "GET" && url.includes("/rest/field/bug")) {
+            // Omit `values` on keywords so preflight gracefully degrades to Layer 1 classify.ts
+            return new Response(
+              JSON.stringify({
+                fields: [{ id: 10, name: "keywords", display_name: "Keywords", type: 8 }],
+              }),
+              { status: 200, headers: { "content-type": "application/json" } },
+            );
+          }
+          if (method === "POST" && url.endsWith("/rest/bug")) {
+            postCount += 1;
+            const body = JSON.parse(String(init?.body ?? "{}")) as { keywords?: string[] };
+            if (body.keywords?.includes("bogus-404")) {
+              return new Response(
+                JSON.stringify({
+                  error: true,
+                  code: 51,
+                  message: "There is no keyword named 'bogus-404'.",
+                }),
+                { status: 404, headers: { "content-type": "application/json" } },
+              );
+            }
+            return new Response(JSON.stringify({ id: 777 }), {
+              status: 200,
+              headers: { "content-type": "application/json" },
+            });
+          }
+          return new Response(JSON.stringify({}), {
+            status: 200,
+            headers: { "content-type": "application/json" },
+          });
+        }) as unknown as typeof fetch,
+      });
+
+      const handler = makeHandler(restClient, storage);
+      const key = "create-kw-fallback-404-001";
+      const firstRes = await handler.handleHttp(
+        modernRequest("tools/call", {
+          name: "bugzilla_create_bug",
+          arguments: {
+            idempotencyKey: key,
+            product: "Browser",
+            component: "Layout",
+            version: "1.0",
+            summary: "Fallback 404 keyword test",
+            description: "First call triggers Bugzilla 5.2 HTTP 404 code 51",
+            keywords: ["bogus-404"],
+          },
+        }),
+      );
+      expect(firstRes.status).toBe(200);
+      const firstRpc = parseRpc(firstRes) as {
+        result: {
+          isError: boolean;
+          content: Array<{ text: string }>;
+          structuredContent: {
+            outcome: string;
+            effectCertainty: string;
+            bzErrorCode: number;
+            reason: string;
+            missingFields: string[];
+          };
+        };
+      };
+      expect(firstRpc.result.isError).toBe(true);
+      expect(firstRpc.result.structuredContent).toMatchObject({
+        outcome: "UpstreamRejected",
+        effectCertainty: "none",
+        bzErrorCode: 51,
+        reason: "There is no keyword named 'bogus-404'.",
+        missingFields: ["keywords"],
+      });
+      expect(firstRpc.result.content[0]?.text).toContain("There is no keyword named 'bogus-404'.");
+      expect(firstRpc.result.content[0]?.text).not.toContain("Resource not found or inaccessible");
+
+      const receiptAfter404 = await storage.getReceipt({
+        issuer: principal.issuer,
+        principalId: principal.principalId,
+        instanceUrl: principal.instanceUrl,
+        operation: "bugzilla_create_bug",
+        key,
+      });
+      expect(receiptAfter404?.status).toBe("failed");
+
+      // Reusing the exact same idempotencyKey after removing the bad keyword succeeds -> Applied
+      const secondRes = await handler.handleHttp(
+        modernRequest("tools/call", {
+          name: "bugzilla_create_bug",
+          arguments: {
+            idempotencyKey: key,
+            product: "Browser",
+            component: "Layout",
+            version: "1.0",
+            summary: "Fallback 404 keyword test",
+            description: "Second call omits invalid keyword and reuses idempotencyKey",
+          },
+        }),
+      );
+      const secondRpc = parseRpc(secondRes) as {
+        result: { isError?: boolean; structuredContent: { outcome: string; artifactId: string } };
+      };
+      expect(secondRpc.result.isError).not.toBe(true);
+      expect(secondRpc.result.structuredContent).toMatchObject({
+        outcome: "Applied",
+        artifactId: "bug:777",
+      });
+      expect(postCount).toBe(2);
+    }
+  });
+
+  test("applyBugUpdate / resolveProposal on upstream HTTP 404 invalid user (code 51) returns UpstreamRejected and reverts proposal executing -> pending", async () => {
+    const storage = createSqliteStorage(":memory:");
+    const approvalService = createCloudApprovalTokenService(signingSecret, storage);
+    const restClient = createRestBugzillaClient({
+      baseUrl: "https://bz.example",
+      apiKey: "test-api-key-secret",
+      maxGetRetries: 0,
+      fetchImpl: (async (input: string | URL | Request, init?: RequestInit) => {
+        const url = typeof input === "string" ? input : input.toString();
+        const method = init?.method ?? "GET";
+        if (method === "GET" && url.includes("/rest/bug/41")) {
+          return new Response(
+            JSON.stringify({
+              bugs: [
+                {
+                  id: 41,
+                  summary: "Visible regression",
+                  product: "Browser",
+                  component: "Layout",
+                  status: "NEW",
+                  resolution: "",
+                  priority: "P2",
+                  severity: "normal",
+                  assigned_to: "alice@example.test",
+                  last_change_time: iso(epoch),
+                },
+              ],
+            }),
+            { status: 200, headers: { "content-type": "application/json" } },
+          );
+        }
+        if (method === "PUT" && url.endsWith("/rest/bug/41")) {
+          return new Response(
+            JSON.stringify({
+              error: true,
+              code: 51,
+              message: "There is no user named 'ghost@example.test'.",
+            }),
+            { status: 404, headers: { "content-type": "application/json" } },
+          );
+        }
+        return new Response(JSON.stringify({}), {
+          status: 200,
+          headers: { "content-type": "application/json" },
+        });
+      }) as unknown as typeof fetch,
+    });
+
+    const writeGuard = createWriteGuardService(
+      dependencies(restClient, { storage, cloudApprovalService: approvalService }),
+    );
+    const proposed = await writeGuard.proposeUpdate(principal, {
+      bugId: 41,
+      idempotencyKey: "prop-404-user-001",
+      expectedLastChangeTime: iso(epoch),
+      diff: { assignedTo: "ghost@example.test" },
+      rationale: "Reassign to nonexistent user",
+    });
+    expect(proposed.outcome).toBe("ProposalPending");
+    if (proposed.outcome !== "ProposalPending") throw new Error("Expected ProposalPending");
+
+    const token = await approvalService.issue({
+      approverIssuer: principal.issuer,
+      approverPrincipalId: principal.principalId,
+      instanceUrl: principal.instanceUrl,
+      proposalId: proposed.proposalId,
+      revision: proposed.revision,
+      bugId: 41,
+      baseVersion: iso(epoch),
+      diff: { assignedTo: "ghost@example.test" },
+      visibility: "public",
+      ttlMs: 60_000,
+      nowMs: epoch,
+    });
+
+    const resolved = await writeGuard.resolveProposal(principal, {
+      proposalId: proposed.proposalId,
+      revision: proposed.revision,
+      decision: "approve",
+      idempotencyKey: "resolve-404-user-001",
+      approval: { kind: "cloud_signed_token", token: token.token },
+    });
+    expect(resolved).toMatchObject({
+      outcome: "UpstreamRejected",
+      effectCertainty: "none",
+      bzErrorCode: 51,
+      reason: "There is no user named 'ghost@example.test'.",
+      missingFields: ["user"],
+    });
+
+    const storedProposal = await storage.getProposal(
+      principal.issuer,
+      principal.principalId,
+      principal.instanceUrl,
+      proposed.proposalId,
+      proposed.revision,
+    );
+    expect(storedProposal?.state).toBe("pending");
+
+    const storedReceipt = await storage.getReceipt({
+      issuer: principal.issuer,
+      principalId: principal.principalId,
+      instanceUrl: principal.instanceUrl,
+      operation: "app_resolve_proposal",
+      key: "resolve-404-user-001",
+    });
+    expect(storedReceipt?.status).toBe("failed");
   });
 });

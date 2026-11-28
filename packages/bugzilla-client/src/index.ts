@@ -20,6 +20,7 @@ import type {
 
 export {
   classifyResponse,
+  classifyResponseOutcome,
   createRestBugzillaClientEffect,
   extractMissingFields,
   isPrivateCommentRejection,
