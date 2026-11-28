@@ -13,6 +13,7 @@
     "typecheck": "tsc --noEmit"
   },
   "dependencies": {
-    "@bugzilla-mcp/contracts": "workspace:*"
+    "@bugzilla-mcp/contracts": "workspace:*",
+    "effect": "^4.1.7"
   }
 }

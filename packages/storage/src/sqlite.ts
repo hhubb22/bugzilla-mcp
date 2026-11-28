@@ -1,3 +1,4 @@
+import { randomUUID } from "node:crypto";
 import { DatabaseSync } from "node:sqlite";
 import {
   RESERVED_LEGACY_ISSUER,
@@ -7,21 +8,29 @@ import {
   type EventFilterArgs,
   type EventName,
   type InternalNote,
+  type PrincipalContext,
+  type PrincipalScope,
   type ProposalDiff,
+  type ProposalState,
 } from "@bugzilla-mcp/contracts";
-import type {
-  IdempotencyScope,
-  SelfWriteProvenance,
-  StoragePorts,
-  StoredApprovalTicket,
-  StoredBindingTicket,
-  StoredBoundCredential,
-  StoredDraft,
-  StoredProposal,
-  StoredReceipt,
-  StoredWebhookRetryItem,
-  StoredWebhookSubscription,
-  WriteAuditEntry,
+import {
+  DEFAULT_RECEIPT_LEASE_MS,
+  isValidProposalTransition,
+  type IdempotencyScope,
+  type SelfWriteProvenance,
+  type StoragePorts,
+  type StoredApprovalTicket,
+  type StoredBindingTicket,
+  type StoredBoundCredential,
+  type StoredDraft,
+  type StoredProposal,
+  type StoredReceipt,
+  type StoredReceiptApplied,
+  type StoredReceiptIndeterminate,
+  type StoredReceiptPending,
+  type StoredWebhookRetryItem,
+  type StoredWebhookSubscription,
+  type WriteAuditEntry,
 } from "./index.js";
 
 const LEGACY_MIGRATED_ISSUER = RESERVED_LEGACY_ISSUER;
@@ -70,6 +79,8 @@ const SCHEMA_SQL = `
 
   CREATE TABLE IF NOT EXISTS causal_budget (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
+    issuer TEXT NOT NULL,
+    principal_id TEXT NOT NULL,
     instance_url TEXT NOT NULL,
     bug_id INTEGER NOT NULL,
     at_ms INTEGER NOT NULL
@@ -120,8 +131,6 @@ const SCHEMA_SQL = `
 
   CREATE INDEX IF NOT EXISTS idx_self_writes_lookup
     ON self_writes (instance_url, bug_id, comment_id, diff_key);
-  CREATE INDEX IF NOT EXISTS idx_causal_budget_lookup
-    ON causal_budget (instance_url, bug_id, at_ms);
 
   CREATE TABLE IF NOT EXISTS consumed_jtis (
     jti TEXT PRIMARY KEY,
@@ -176,7 +185,185 @@ const POST_MIGRATION_INDEX_SQL = `
     ON write_audits (issuer, principal_id, instance_url, bug_id);
   CREATE INDEX IF NOT EXISTS idx_internal_notes_lookup
     ON internal_notes (issuer, principal_id, instance_url, bug_id);
+  CREATE INDEX IF NOT EXISTS idx_causal_budget_lookup
+    ON causal_budget (issuer, principal_id, instance_url, bug_id, at_ms);
 `;
+
+export function withTransaction<T>(db: DatabaseSync, fn: () => T): T {
+  db.exec("BEGIN IMMEDIATE");
+  try {
+    const result = fn();
+    if (db.isTransaction) {
+      db.exec("COMMIT");
+    }
+    return result;
+  } catch (error) {
+    if (db.isTransaction) {
+      try {
+        db.exec("ROLLBACK");
+      } catch {
+        // Preserve original error if rollback fails after an automatic SQLite rollback.
+      }
+    }
+    throw error;
+  }
+}
+
+const VALID_PROPOSAL_STATES = new Set<ProposalState>([
+  "pending",
+  "executing",
+  "approved",
+  "rejected",
+  "applied",
+  "stale",
+  "indeterminate",
+]);
+
+function safeParseJsonObject(raw: string, context: string): Record<string, unknown> | null {
+  let parsed: unknown;
+  try {
+    parsed = JSON.parse(raw);
+  } catch (error) {
+    console.error(
+      `[bugzilla-mcp/storage] Quarantining corrupt JSON in ${context}: ${
+        error instanceof Error ? error.message : String(error)
+      }`,
+    );
+    return null;
+  }
+  if (parsed === null || typeof parsed !== "object" || Array.isArray(parsed)) {
+    console.error(`[bugzilla-mcp/storage] Quarantining non-object JSON payload in ${context}`);
+    return null;
+  }
+  return parsed as Record<string, unknown>;
+}
+
+function parseStoredReceipt(rawJson: string, context: string): StoredReceipt | null {
+  const obj = safeParseJsonObject(rawJson, context);
+  if (!obj) return null;
+  const status = obj.status;
+  const intentHash = obj.intentHash;
+  if (typeof status !== "string" || typeof intentHash !== "string") {
+    console.error(`[bugzilla-mcp/storage] Quarantining malformed receipt in ${context}`);
+    return null;
+  }
+  switch (status) {
+    case "pending": {
+      if (typeof obj.createdAt !== "string") {
+        console.error(
+          `[bugzilla-mcp/storage] Quarantining malformed pending receipt in ${context}`,
+        );
+        return null;
+      }
+      // Fail-closed normalization for pre-lease legacy pending rows: mark dispatchAttempted=true
+      // so expired legacy pending rows transition to indeterminate instead of double-dispatching.
+      const hasLeaseFields =
+        typeof obj.leaseToken === "string" &&
+        typeof obj.leaseExpiresAtMs === "number" &&
+        Number.isFinite(obj.leaseExpiresAtMs) &&
+        typeof obj.dispatchAttempted === "boolean";
+      return hasLeaseFields
+        ? {
+            status: "pending",
+            intentHash,
+            createdAt: obj.createdAt,
+            leaseToken: obj.leaseToken as string,
+            leaseExpiresAtMs: obj.leaseExpiresAtMs as number,
+            dispatchAttempted: obj.dispatchAttempted as boolean,
+          }
+        : {
+            status: "pending",
+            intentHash,
+            createdAt: obj.createdAt,
+            leaseToken: "",
+            leaseExpiresAtMs: 0,
+            dispatchAttempted: true,
+          };
+    }
+    case "applied": {
+      if (typeof obj.artifactId !== "string") {
+        console.error(
+          `[bugzilla-mcp/storage] Quarantining malformed applied receipt in ${context}`,
+        );
+        return null;
+      }
+      return { status: "applied", intentHash, artifactId: obj.artifactId };
+    }
+    case "failed": {
+      if (typeof obj.errorCode !== "string") {
+        console.error(`[bugzilla-mcp/storage] Quarantining malformed failed receipt in ${context}`);
+        return null;
+      }
+      return { status: "failed", intentHash, errorCode: obj.errorCode };
+    }
+    case "indeterminate": {
+      if (typeof obj.recordedAt !== "string") {
+        console.error(
+          `[bugzilla-mcp/storage] Quarantining malformed indeterminate receipt in ${context}`,
+        );
+        return null;
+      }
+      return { status: "indeterminate", intentHash, recordedAt: obj.recordedAt };
+    }
+    default:
+      console.error(`[bugzilla-mcp/storage] Quarantining unknown receipt status in ${context}`);
+      return null;
+  }
+}
+
+function parseStoredProposal(rawJson: string, context: string): StoredProposal | null {
+  const obj = safeParseJsonObject(rawJson, context);
+  if (!obj) return null;
+  if (
+    typeof obj.proposalId !== "string" ||
+    typeof obj.revision !== "number" ||
+    typeof obj.issuer !== "string" ||
+    typeof obj.principalId !== "string" ||
+    typeof obj.instanceUrl !== "string" ||
+    typeof obj.bugId !== "number" ||
+    typeof obj.baseVersion !== "string" ||
+    typeof obj.rationale !== "string" ||
+    typeof obj.state !== "string" ||
+    !VALID_PROPOSAL_STATES.has(obj.state as ProposalState) ||
+    obj.diff === null ||
+    typeof obj.diff !== "object" ||
+    Array.isArray(obj.diff)
+  ) {
+    console.error(`[bugzilla-mcp/storage] Quarantining malformed proposal in ${context}`);
+    return null;
+  }
+  return obj as unknown as StoredProposal & { diff: ProposalDiff };
+}
+
+function parseStoredApprovalTicket(rawJson: string, context: string): StoredApprovalTicket | null {
+  const obj = safeParseJsonObject(rawJson, context);
+  if (!obj) return null;
+  if (
+    typeof obj.ticketId !== "string" ||
+    typeof obj.csrfToken !== "string" ||
+    typeof obj.issuer !== "string" ||
+    typeof obj.approverPrincipalId !== "string" ||
+    typeof obj.instanceUrl !== "string" ||
+    typeof obj.proposalId !== "string" ||
+    typeof obj.revision !== "number" ||
+    typeof obj.bugId !== "number" ||
+    typeof obj.baseVersion !== "string" ||
+    (obj.visibility !== "public" && obj.visibility !== "private") ||
+    typeof obj.expiresAtMs !== "number" ||
+    typeof obj.consumed !== "boolean"
+  ) {
+    console.error(`[bugzilla-mcp/storage] Quarantining malformed approval ticket in ${context}`);
+    return null;
+  }
+  // Fail-closed: legacy tickets without persisted scopes default to empty scopes.
+  const scopes: readonly PrincipalScope[] = Array.isArray(obj.scopes)
+    ? (obj.scopes.filter((s): s is PrincipalScope => typeof s === "string") as PrincipalScope[])
+    : [];
+  return {
+    ...(obj as unknown as StoredApprovalTicket),
+    scopes,
+  };
+}
 
 function tableHasColumn(db: DatabaseSync, table: string, column: string): boolean {
   const cols = db.prepare(`PRAGMA table_info(${table})`).all() as Array<{ name: string }>;
@@ -254,6 +441,9 @@ function migrateLegacyTenantTables(db: DatabaseSync): void {
   const webhooksNeedsRebuild =
     !tableHasColumn(db, "webhook_subscriptions", "issuer") ||
     !tableHasColumn(db, "webhook_subscriptions", "instance_url");
+  const causalBudgetNeedsRebuild =
+    !tableHasColumn(db, "causal_budget", "issuer") ||
+    !tableHasColumn(db, "causal_budget", "principal_id");
 
   const needsMigration =
     !tableHasColumn(db, "receipts", "issuer") ||
@@ -261,11 +451,11 @@ function migrateLegacyTenantTables(db: DatabaseSync): void {
     !tableHasColumn(db, "internal_notes", "issuer") ||
     !tableHasColumn(db, "proposals", "issuer") ||
     !tableHasColumn(db, "drafts", "issuer") ||
-    webhooksNeedsRebuild;
+    webhooksNeedsRebuild ||
+    causalBudgetNeedsRebuild;
   if (!needsMigration) return;
 
-  db.exec("BEGIN IMMEDIATE");
-  try {
+  withTransaction(db, () => {
     if (!tableHasColumn(db, "receipts", "issuer")) {
       db.exec(`
         CREATE TABLE receipts_v3 (
@@ -531,13 +721,44 @@ function migrateLegacyTenantTables(db: DatabaseSync): void {
         ALTER TABLE webhook_subscriptions_v3 RENAME TO webhook_subscriptions;
       `);
     }
+    if (causalBudgetNeedsRebuild) {
+      const prevSeq = readSqliteSequenceBigInt(db, "causal_budget");
+      const maxRow = db
+        .prepare(`SELECT CAST(COALESCE(MAX(id), 0) AS TEXT) AS max_id_text FROM causal_budget`)
+        .get() as { max_id_text: string };
+      const maxId = BigInt(maxRow.max_id_text);
+      const highWaterMark = prevSeq > maxId ? prevSeq : maxId;
+      db.exec(`
+        CREATE TABLE causal_budget_v4 (
+          id INTEGER PRIMARY KEY AUTOINCREMENT,
+          issuer TEXT NOT NULL,
+          principal_id TEXT NOT NULL,
+          instance_url TEXT NOT NULL,
+          bug_id INTEGER NOT NULL,
+          at_ms INTEGER NOT NULL
+        );
+        INSERT INTO causal_budget_v4 (id, issuer, principal_id, instance_url, bug_id, at_ms)
+        SELECT id, '${LEGACY_MIGRATED_ISSUER}', '', instance_url, bug_id, at_ms FROM causal_budget;
+        DROP TABLE causal_budget;
+        ALTER TABLE causal_budget_v4 RENAME TO causal_budget;
+      `);
+      if (highWaterMark > 0n) {
+        const highWaterStr = highWaterMark.toString();
+        const updated = db
+          .prepare(
+            `UPDATE sqlite_sequence SET seq = CAST(? AS INTEGER) WHERE name = 'causal_budget'`,
+          )
+          .run(highWaterStr);
+        if (Number(updated.changes) === 0) {
+          db.prepare(
+            `INSERT INTO sqlite_sequence (name, seq) VALUES ('causal_budget', CAST(? AS INTEGER))`,
+          ).run(highWaterStr);
+        }
+      }
+    }
     // Create lookup indexes atomically inside the migration transaction (ISO-11)
     db.exec(POST_MIGRATION_INDEX_SQL);
-    db.exec("COMMIT");
-  } catch (error) {
-    db.exec("ROLLBACK");
-    throw error;
-  }
+  });
 }
 
 export function openSqliteStorage(dbPath: string): StoragePorts {
@@ -563,21 +784,88 @@ export function openSqliteStorage(dbPath: string): StoragePorts {
       | { receipt_json: string }
       | undefined;
     if (!row) return { exists: false };
-    try {
-      const parsed = JSON.parse(row.receipt_json) as unknown;
-      if (
-        parsed !== null &&
-        typeof parsed === "object" &&
-        !Array.isArray(parsed) &&
-        typeof (parsed as Record<string, unknown>).status === "string" &&
-        VALID_RECEIPT_STATUSES.has((parsed as Record<string, unknown>).status as string)
-      ) {
-        return { exists: true, receipt: parsed as StoredReceipt };
+    return {
+      exists: true,
+      receipt: parseStoredReceipt(row.receipt_json, `receipts(${scope.operation}:${scope.key})`),
+    };
+  }
+
+  function insertSelfWriteRows(entry: SelfWriteProvenance): void {
+    // Legacy instance-only rows cannot establish tenant ownership.
+    if (!entry.issuer || !entry.principalId) return;
+    const insert = db.prepare(
+      `INSERT INTO tenant_self_writes (issuer, principal_id, instance_url, bug_id, artifact_key)
+       VALUES (?, ?, ?, ?, ?)`,
+    );
+    for (const key of [
+      entry.commentId === undefined ? undefined : `comment:${entry.commentId}`,
+      entry.diffKey,
+    ]) {
+      if (key !== undefined) {
+        insert.run(entry.issuer, entry.principalId, entry.instanceUrl, entry.bugId, key);
       }
-      return { exists: true, receipt: null };
-    } catch {
-      return { exists: true, receipt: null };
     }
+  }
+
+  function insertWriteAuditRow(entry: WriteAuditEntry): void {
+    db.prepare(
+      `INSERT OR IGNORE INTO write_audits (audit_id, issuer, principal_id, instance_url, bug_id, entry_json)
+       VALUES (?, ?, ?, ?, ?, ?)`,
+    ).run(
+      entry.auditId,
+      entry.issuer,
+      entry.principalId,
+      entry.instanceUrl,
+      entry.bugId,
+      JSON.stringify(entry),
+    );
+  }
+
+  function transitionProposalCasSync(params: {
+    readonly issuer: string;
+    readonly principalId: string;
+    readonly instanceUrl: string;
+    readonly proposalId: string;
+    readonly revision: number;
+    readonly fromStates: readonly ProposalState[];
+    readonly toState: ProposalState;
+  }): boolean {
+    if (params.fromStates.length === 0) return false;
+    return withTransaction(db, () => {
+      const row = db
+        .prepare(
+          `SELECT proposal_json FROM proposals
+           WHERE issuer = ? AND principal_id = ? AND instance_url = ? AND proposal_id = ? AND revision = ?`,
+        )
+        .get(
+          params.issuer,
+          params.principalId,
+          params.instanceUrl,
+          params.proposalId,
+          params.revision,
+        ) as { proposal_json: string } | undefined;
+      if (!row) return false;
+      const proposal = parseStoredProposal(
+        row.proposal_json,
+        `proposals(${params.proposalId}@${params.revision})`,
+      );
+      if (!proposal) return false;
+      if (!params.fromStates.includes(proposal.state)) return false;
+      if (!isValidProposalTransition(proposal.state, params.toState)) return false;
+      const nextProposal: StoredProposal = { ...proposal, state: params.toState };
+      db.prepare(
+        `UPDATE proposals SET proposal_json = ?
+         WHERE issuer = ? AND principal_id = ? AND instance_url = ? AND proposal_id = ? AND revision = ?`,
+      ).run(
+        JSON.stringify(nextProposal),
+        params.issuer,
+        params.principalId,
+        params.instanceUrl,
+        params.proposalId,
+        params.revision,
+      );
+      return true;
+    });
   }
 
   return {
@@ -586,36 +874,93 @@ export function openSqliteStorage(dbPath: string): StoragePorts {
       const rows = db.prepare("SELECT sub_json FROM webhook_subscriptions").all() as {
         sub_json: string;
       }[];
-      const tenants = new Map<string, NonNullable<StoredWebhookSubscription["grant"]>>();
+      const grants: PrincipalContext[] = [];
+      const seen = new Set<string>();
       for (const row of rows) {
-        const sub = JSON.parse(row.sub_json) as StoredWebhookSubscription;
+        const parsed = safeParseJsonObject(row.sub_json, "webhook_subscriptions.listWebhookGrants");
+        if (!parsed) continue;
+        const sub = parsed as unknown as StoredWebhookSubscription;
         if (!sub.verified || sub.revoked || !sub.grant) continue;
-        const key = JSON.stringify([sub.issuer, sub.principalId, sub.instanceUrl]);
-        tenants.set(key, sub.grant);
+        const grant = sub.grant;
+        if (
+          typeof grant.issuer !== "string" ||
+          typeof grant.principalId !== "string" ||
+          typeof grant.instanceUrl !== "string" ||
+          typeof grant.clientId !== "string" ||
+          typeof grant.credentialGeneration !== "number" ||
+          !Array.isArray(grant.scopes)
+        ) {
+          console.error(
+            `[bugzilla-mcp/storage] Quarantining malformed webhook grant for subscription ${String(sub.id ?? "unknown")}`,
+          );
+          continue;
+        }
+        const key = JSON.stringify([
+          grant.issuer,
+          grant.principalId,
+          grant.instanceUrl,
+          grant.clientId,
+          grant.credentialGeneration,
+          grant.deploymentMode,
+          [...grant.scopes].sort(),
+        ]);
+        if (!seen.has(key)) {
+          seen.add(key);
+          grants.push(grant);
+        }
       }
-      return [...tenants.values()];
+      return grants;
     },
+
     async getReceipt(scope) {
       const lookup = readRawReceiptRow(scope);
       return lookup.exists ? lookup.receipt : null;
     },
 
-    async reservePending(scope, intentHash) {
-      db.exec("BEGIN IMMEDIATE");
-      try {
+    async reservePending(scope, intentHash, opts) {
+      const nowMs = opts?.nowMs ?? Date.now();
+      const leaseMs = opts?.leaseMs ?? DEFAULT_RECEIPT_LEASE_MS;
+      return withTransaction(db, () => {
         const existingLookup = readRawReceiptRow(scope);
         if (existingLookup.exists) {
           if (existingLookup.receipt === null) {
-            db.exec("COMMIT");
             return {
-              status: "indeterminate",
-              intentHash,
-              recordedAt: new Date().toISOString(),
+              kind: "existing" as const,
+              receipt: {
+                status: "indeterminate" as const,
+                intentHash,
+                recordedAt: new Date(nowMs).toISOString(),
+              },
             };
           }
-          if (existingLookup.receipt.status !== "failed") {
-            db.exec("COMMIT");
-            return existingLookup.receipt;
+          const existing = existingLookup.receipt;
+          if (existing.status === "pending") {
+            if (nowMs >= existing.leaseExpiresAtMs) {
+              if (existing.dispatchAttempted) {
+                const indeterminateReceipt: StoredReceiptIndeterminate = {
+                  status: "indeterminate",
+                  intentHash: existing.intentHash,
+                  recordedAt: new Date(nowMs).toISOString(),
+                };
+                db.prepare(
+                  `UPDATE receipts SET receipt_json = ?
+                   WHERE issuer = ? AND principal_id = ? AND instance_url = ? AND operation = ? AND idem_key = ?`,
+                ).run(
+                  JSON.stringify(indeterminateReceipt),
+                  scope.issuer,
+                  scope.principalId,
+                  scope.instanceUrl,
+                  scope.operation,
+                  scope.key,
+                );
+                return { kind: "existing" as const, receipt: indeterminateReceipt };
+              }
+              // Expired pre-dispatch lease (dispatchAttempted === false): fall through to reclaim with fresh leaseToken.
+            } else {
+              return { kind: "existing" as const, receipt: existing };
+            }
+          } else if (existing.status !== "failed") {
+            return { kind: "existing" as const, receipt: existing };
           }
         }
         // Block duplicate upstream dispatch when an ambiguous or unreadable pre-v3 receipt exists
@@ -629,18 +974,24 @@ export function openSqliteStorage(dbPath: string): StoragePorts {
             legacyLookup.exists &&
             (legacyLookup.receipt === null || legacyLookup.receipt.status !== "failed")
           ) {
-            db.exec("COMMIT");
             return {
-              status: "indeterminate",
-              intentHash,
-              recordedAt: new Date().toISOString(),
+              kind: "existing" as const,
+              receipt: {
+                status: "indeterminate" as const,
+                intentHash,
+                recordedAt: new Date(nowMs).toISOString(),
+              },
             };
           }
         }
-        const pending: StoredReceipt = {
+        const leaseToken = randomUUID();
+        const pending: StoredReceiptPending = {
           status: "pending",
           intentHash,
-          createdAt: new Date().toISOString(),
+          createdAt: new Date(nowMs).toISOString(),
+          leaseToken,
+          leaseExpiresAtMs: nowMs + leaseMs,
+          dispatchAttempted: false,
         };
         db.prepare(
           `INSERT INTO receipts (issuer, principal_id, instance_url, operation, idem_key, receipt_json)
@@ -655,44 +1006,222 @@ export function openSqliteStorage(dbPath: string): StoragePorts {
           scope.key,
           JSON.stringify(pending),
         );
-        db.exec("COMMIT");
-        return "reserved";
-      } catch (error) {
-        db.exec("ROLLBACK");
-        throw error;
-      }
+        return { kind: "reserved" as const, leaseToken };
+      });
     },
 
-    async finalizeReceipt(scope, receipt) {
-      db.prepare(
-        `INSERT INTO receipts (issuer, principal_id, instance_url, operation, idem_key, receipt_json)
-         VALUES (?, ?, ?, ?, ?, ?)
-         ON CONFLICT (issuer, principal_id, instance_url, operation, idem_key)
-         DO UPDATE SET receipt_json = excluded.receipt_json`,
-      ).run(
-        scope.issuer,
-        scope.principalId,
-        scope.instanceUrl,
-        scope.operation,
-        scope.key,
-        JSON.stringify(receipt),
-      );
+    async markDispatchStarted(scope, leaseToken, opts) {
+      return withTransaction(db, () => {
+        const lookup = readRawReceiptRow(scope);
+        if (!lookup.exists || lookup.receipt === null || lookup.receipt.status !== "pending") {
+          return false;
+        }
+        const existing = lookup.receipt;
+        if (existing.leaseToken !== leaseToken || existing.dispatchAttempted) {
+          return false;
+        }
+        if (opts?.nowMs !== undefined && opts.nowMs >= existing.leaseExpiresAtMs) {
+          return false;
+        }
+        const updated: StoredReceiptPending = {
+          ...existing,
+          dispatchAttempted: true,
+        };
+        const result = db
+          .prepare(
+            `UPDATE receipts SET receipt_json = ?
+             WHERE issuer = ? AND principal_id = ? AND instance_url = ? AND operation = ? AND idem_key = ?
+               AND json_extract(receipt_json, '$.status') = 'pending'
+               AND json_extract(receipt_json, '$.leaseToken') = ?`,
+          )
+          .run(
+            JSON.stringify(updated),
+            scope.issuer,
+            scope.principalId,
+            scope.instanceUrl,
+            scope.operation,
+            scope.key,
+            leaseToken,
+          );
+        return Number(result.changes) === 1;
+      });
+    },
+
+    async finalizeReceipt(scope, receipt, opts) {
+      return withTransaction(db, () => {
+        const lookup = readRawReceiptRow(scope);
+        // Never allow applied -> non-applied regression (noAppliedRegression invariant).
+        if (lookup.exists && lookup.receipt?.status === "applied" && receipt.status !== "applied") {
+          return false;
+        }
+        if (opts?.expectedLeaseToken !== undefined) {
+          if (
+            !lookup.exists ||
+            lookup.receipt === null ||
+            lookup.receipt.status !== "pending" ||
+            lookup.receipt.leaseToken !== opts.expectedLeaseToken
+          ) {
+            return false;
+          }
+          const result = db
+            .prepare(
+              `UPDATE receipts SET receipt_json = ?
+               WHERE issuer = ? AND principal_id = ? AND instance_url = ? AND operation = ? AND idem_key = ?
+                 AND json_extract(receipt_json, '$.status') = 'pending'
+                 AND json_extract(receipt_json, '$.leaseToken') = ?`,
+            )
+            .run(
+              JSON.stringify(receipt),
+              scope.issuer,
+              scope.principalId,
+              scope.instanceUrl,
+              scope.operation,
+              scope.key,
+              opts.expectedLeaseToken,
+            );
+          return Number(result.changes) === 1;
+        }
+        // Unfenced finalize also refuses indeterminate -> pending/failed regression.
+        if (
+          lookup.exists &&
+          lookup.receipt?.status === "indeterminate" &&
+          (receipt.status === "pending" || receipt.status === "failed")
+        ) {
+          return false;
+        }
+        db.prepare(
+          `INSERT INTO receipts (issuer, principal_id, instance_url, operation, idem_key, receipt_json)
+           VALUES (?, ?, ?, ?, ?, ?)
+           ON CONFLICT (issuer, principal_id, instance_url, operation, idem_key)
+           DO UPDATE SET receipt_json = excluded.receipt_json`,
+        ).run(
+          scope.issuer,
+          scope.principalId,
+          scope.instanceUrl,
+          scope.operation,
+          scope.key,
+          JSON.stringify(receipt),
+        );
+        return true;
+      });
+    },
+
+    async commitAppliedMutation(params) {
+      return withTransaction(db, () => {
+        const lookup = readRawReceiptRow(params.scope);
+        if (
+          !lookup.exists ||
+          lookup.receipt === null ||
+          lookup.receipt.status !== "pending" ||
+          lookup.receipt.leaseToken !== params.leaseToken
+        ) {
+          return { committed: false as const, reason: "lease_fenced" as const };
+        }
+
+        let nextProposalToPersist: {
+          readonly issuer: string;
+          readonly principalId: string;
+          readonly instanceUrl: string;
+          readonly proposalId: string;
+          readonly revision: number;
+          readonly json: string;
+        } | null = null;
+
+        if (params.proposal) {
+          const pIssuer = params.proposal.issuer ?? params.scope.issuer;
+          const pPrincipalId = params.proposal.principalId ?? params.scope.principalId;
+          const pInstanceUrl = params.proposal.instanceUrl ?? params.scope.instanceUrl;
+          const row = db
+            .prepare(
+              `SELECT proposal_json FROM proposals
+               WHERE issuer = ? AND principal_id = ? AND instance_url = ? AND proposal_id = ? AND revision = ?`,
+            )
+            .get(
+              pIssuer,
+              pPrincipalId,
+              pInstanceUrl,
+              params.proposal.proposalId,
+              params.proposal.revision,
+            ) as { proposal_json: string } | undefined;
+          if (!row) {
+            return { committed: false as const, reason: "proposal_conflict" as const };
+          }
+          const proposal = parseStoredProposal(
+            row.proposal_json,
+            `proposals(${params.proposal.proposalId}@${params.proposal.revision})`,
+          );
+          const allowedFrom = params.proposal.fromStates ?? ["executing"];
+          if (
+            !proposal ||
+            !allowedFrom.includes(proposal.state) ||
+            !isValidProposalTransition(proposal.state, "applied")
+          ) {
+            return { committed: false as const, reason: "proposal_conflict" as const };
+          }
+          const appliedProposal: StoredProposal = { ...proposal, state: "applied" };
+          nextProposalToPersist = {
+            issuer: pIssuer,
+            principalId: pPrincipalId,
+            instanceUrl: pInstanceUrl,
+            proposalId: params.proposal.proposalId,
+            revision: params.proposal.revision,
+            json: JSON.stringify(appliedProposal),
+          };
+        }
+
+        const appliedReceipt: StoredReceiptApplied = {
+          status: "applied",
+          intentHash: params.intentHash,
+          artifactId: params.artifactId,
+        };
+        const updatedReceipt = db
+          .prepare(
+            `UPDATE receipts SET receipt_json = ?
+             WHERE issuer = ? AND principal_id = ? AND instance_url = ? AND operation = ? AND idem_key = ?
+               AND json_extract(receipt_json, '$.status') = 'pending'
+               AND json_extract(receipt_json, '$.leaseToken') = ?`,
+          )
+          .run(
+            JSON.stringify(appliedReceipt),
+            params.scope.issuer,
+            params.scope.principalId,
+            params.scope.instanceUrl,
+            params.scope.operation,
+            params.scope.key,
+            params.leaseToken,
+          );
+        if (Number(updatedReceipt.changes) !== 1) {
+          return { committed: false as const, reason: "lease_fenced" as const };
+        }
+
+        if (nextProposalToPersist) {
+          db.prepare(
+            `UPDATE proposals SET proposal_json = ?
+             WHERE issuer = ? AND principal_id = ? AND instance_url = ? AND proposal_id = ? AND revision = ?`,
+          ).run(
+            nextProposalToPersist.json,
+            nextProposalToPersist.issuer,
+            nextProposalToPersist.principalId,
+            nextProposalToPersist.instanceUrl,
+            nextProposalToPersist.proposalId,
+            nextProposalToPersist.revision,
+          );
+        }
+
+        if (params.writeAudit) {
+          insertWriteAuditRow(params.writeAudit);
+        }
+
+        if (params.selfWrite) {
+          insertSelfWriteRows(params.selfWrite);
+        }
+
+        return { committed: true as const };
+      });
     },
 
     async recordSelfWrite(entry: SelfWriteProvenance) {
-      // Legacy instance-only rows cannot establish tenant ownership.
-      if (!entry.issuer || !entry.principalId) return;
-      const insert = db.prepare(
-        `INSERT INTO tenant_self_writes (issuer, principal_id, instance_url, bug_id, artifact_key)
-         VALUES (?, ?, ?, ?, ?)`,
-      );
-      for (const key of [
-        entry.commentId === undefined ? undefined : `comment:${entry.commentId}`,
-        entry.diffKey,
-      ]) {
-        if (key !== undefined)
-          insert.run(entry.issuer, entry.principalId, entry.instanceUrl, entry.bugId, key);
-      }
+      insertSelfWriteRows(entry);
     },
 
     async hasSelfWrite(entry: SelfWriteProvenance) {
@@ -709,17 +1238,7 @@ export function openSqliteStorage(dbPath: string): StoragePorts {
     },
 
     async recordWriteAudit(entry: WriteAuditEntry) {
-      db.prepare(
-        `INSERT OR IGNORE INTO write_audits (audit_id, issuer, principal_id, instance_url, bug_id, entry_json)
-         VALUES (?, ?, ?, ?, ?, ?)`,
-      ).run(
-        entry.auditId,
-        entry.issuer,
-        entry.principalId,
-        entry.instanceUrl,
-        entry.bugId,
-        JSON.stringify(entry),
-      );
+      insertWriteAuditRow(entry);
     },
 
     async listWriteAudits(issuer, principalId, instanceUrl, bugId) {
@@ -729,43 +1248,67 @@ export function openSqliteStorage(dbPath: string): StoragePorts {
            WHERE issuer = ? AND principal_id = ? AND instance_url = ? AND bug_id = ?`,
         )
         .all(issuer, principalId, instanceUrl, bugId) as Array<{ entry_json: string }>;
-      return rows.map((row) => JSON.parse(row.entry_json) as WriteAuditEntry);
+      const entries: WriteAuditEntry[] = [];
+      for (const row of rows) {
+        const parsed = safeParseJsonObject(row.entry_json, `write_audits(bug:${bugId})`);
+        if (parsed) {
+          entries.push(parsed as unknown as WriteAuditEntry);
+        }
+      }
+      return entries;
     },
 
-    async consumeCausalBudget({ instanceUrl, bugId, maxWrites, windowMs, nowMs }) {
+    async consumeCausalBudget({
+      issuer,
+      principalId,
+      instanceUrl,
+      bugId,
+      maxWrites,
+      windowMs,
+      nowMs,
+    }) {
       if (maxWrites <= 0) {
         return { allowed: false, retryAfterMs: windowMs };
       }
       const cutoff = nowMs - windowMs;
-      db.exec("BEGIN IMMEDIATE");
-      try {
+      return withTransaction(db, () => {
         db.prepare(
-          `DELETE FROM causal_budget WHERE instance_url = ? AND bug_id = ? AND at_ms <= ?`,
-        ).run(instanceUrl, bugId, cutoff);
+          `DELETE FROM causal_budget
+           WHERE issuer = ? AND principal_id = ? AND instance_url = ? AND bug_id = ? AND at_ms <= ?`,
+        ).run(issuer, principalId, instanceUrl, bugId, cutoff);
         const rows = db
           .prepare(
-            `SELECT at_ms FROM causal_budget WHERE instance_url = ? AND bug_id = ? ORDER BY at_ms ASC`,
+            `SELECT at_ms FROM causal_budget
+             WHERE issuer = ? AND principal_id = ? AND instance_url = ? AND bug_id = ?
+             ORDER BY at_ms ASC`,
           )
-          .all(instanceUrl, bugId) as Array<{ at_ms: number }>;
+          .all(issuer, principalId, instanceUrl, bugId) as Array<{ at_ms: number }>;
         if (rows.length >= maxWrites) {
           const oldest = rows[0];
-          db.exec("COMMIT");
           return {
             allowed: false,
-            retryAfterMs: oldest !== undefined ? oldest.at_ms + windowMs - nowMs : windowMs,
+            retryAfterMs: Math.max(
+              1,
+              oldest !== undefined ? oldest.at_ms + windowMs - nowMs : windowMs,
+            ),
           };
         }
-        db.prepare(`INSERT INTO causal_budget (instance_url, bug_id, at_ms) VALUES (?, ?, ?)`).run(
-          instanceUrl,
-          bugId,
-          nowMs,
-        );
-        db.exec("COMMIT");
-        return { allowed: true };
-      } catch (error) {
-        db.exec("ROLLBACK");
-        throw error;
-      }
+        const inserted = db
+          .prepare(
+            `INSERT INTO causal_budget (issuer, principal_id, instance_url, bug_id, at_ms)
+             VALUES (?, ?, ?, ?, ?)
+             RETURNING id`,
+          )
+          .get(issuer, principalId, instanceUrl, bugId, nowMs) as { id: number | bigint };
+        return { allowed: true, tokenId: Number(inserted.id) };
+      });
+    },
+
+    async refundCausalBudget({ issuer, principalId, instanceUrl, bugId, tokenId }) {
+      db.prepare(
+        `DELETE FROM causal_budget
+         WHERE id = ? AND issuer = ? AND principal_id = ? AND instance_url = ? AND bug_id = ?`,
+      ).run(tokenId, issuer, principalId, instanceUrl, bugId);
     },
 
     async saveInternalNote(issuer, principalId, instanceUrl, bugId, text) {
@@ -807,19 +1350,49 @@ export function openSqliteStorage(dbPath: string): StoragePorts {
     },
 
     async saveProposal(proposal: StoredProposal) {
-      db.prepare(
-        `INSERT INTO proposals (issuer, principal_id, instance_url, proposal_id, revision, proposal_json)
-         VALUES (?, ?, ?, ?, ?, ?)
-         ON CONFLICT (issuer, principal_id, instance_url, proposal_id, revision)
-         DO UPDATE SET proposal_json = excluded.proposal_json`,
-      ).run(
-        proposal.issuer,
-        proposal.principalId,
-        proposal.instanceUrl,
-        proposal.proposalId,
-        proposal.revision,
-        JSON.stringify(proposal),
-      );
+      withTransaction(db, () => {
+        const existingRow = db
+          .prepare(
+            `SELECT proposal_json FROM proposals
+             WHERE issuer = ? AND principal_id = ? AND instance_url = ? AND proposal_id = ? AND revision = ?`,
+          )
+          .get(
+            proposal.issuer,
+            proposal.principalId,
+            proposal.instanceUrl,
+            proposal.proposalId,
+            proposal.revision,
+          ) as { proposal_json: string } | undefined;
+        if (existingRow) {
+          const existing = parseStoredProposal(
+            existingRow.proposal_json,
+            `proposals(${proposal.proposalId}@${proposal.revision})`,
+          );
+          if (
+            existing &&
+            existing.state !== proposal.state &&
+            !isValidProposalTransition(existing.state, proposal.state)
+          ) {
+            console.error(
+              `[bugzilla-mcp/storage] Refusing invalid proposal state regression ${existing.state} -> ${proposal.state} for ${proposal.proposalId}@${proposal.revision}`,
+            );
+            return;
+          }
+        }
+        db.prepare(
+          `INSERT INTO proposals (issuer, principal_id, instance_url, proposal_id, revision, proposal_json)
+           VALUES (?, ?, ?, ?, ?, ?)
+           ON CONFLICT (issuer, principal_id, instance_url, proposal_id, revision)
+           DO UPDATE SET proposal_json = excluded.proposal_json`,
+        ).run(
+          proposal.issuer,
+          proposal.principalId,
+          proposal.instanceUrl,
+          proposal.proposalId,
+          proposal.revision,
+          JSON.stringify(proposal),
+        );
+      });
     },
 
     async getProposal(issuer, principalId, instanceUrl, proposalId, revision) {
@@ -832,13 +1405,12 @@ export function openSqliteStorage(dbPath: string): StoragePorts {
         | { proposal_json: string }
         | undefined;
       return row
-        ? (JSON.parse(row.proposal_json) as StoredProposal & { diff: ProposalDiff })
+        ? parseStoredProposal(row.proposal_json, `proposals(${proposalId}@${revision})`)
         : null;
     },
 
     async saveDraft(params): Promise<DraftSaveResult> {
-      db.exec("BEGIN IMMEDIATE");
-      try {
+      return withTransaction(db, () => {
         const existing = db
           .prepare(
             `SELECT draft_revision FROM drafts
@@ -852,8 +1424,7 @@ export function openSqliteStorage(dbPath: string): StoragePorts {
             params.draftKind,
           ) as { draft_revision: number } | undefined;
         if (existing && existing.draft_revision >= params.draftRevision) {
-          db.exec("COMMIT");
-          return { status: "stale_revision", currentRevision: existing.draft_revision };
+          return { status: "stale_revision" as const, currentRevision: existing.draft_revision };
         }
         const savedAt = new Date().toISOString();
         db.prepare(
@@ -873,12 +1444,8 @@ export function openSqliteStorage(dbPath: string): StoragePorts {
           params.content,
           savedAt,
         );
-        db.exec("COMMIT");
-        return { status: "acknowledged", draftRevision: params.draftRevision, savedAt };
-      } catch (error) {
-        db.exec("ROLLBACK");
-        throw error;
-      }
+        return { status: "acknowledged" as const, draftRevision: params.draftRevision, savedAt };
+      });
     },
 
     async getDraft(params): Promise<StoredDraft | null> {
@@ -943,8 +1510,13 @@ export function openSqliteStorage(dbPath: string): StoragePorts {
           params.name,
           params.canonicalArgsJson,
         ) as { sub_json: string } | undefined;
-      return row
-        ? (JSON.parse(row.sub_json) as StoredWebhookSubscription & {
+      if (!row) return null;
+      const parsed = safeParseJsonObject(
+        row.sub_json,
+        `webhook_subscriptions(${params.name}:${params.url})`,
+      );
+      return parsed
+        ? (parsed as unknown as StoredWebhookSubscription & {
             name: EventName;
             args: EventFilterArgs;
           })
@@ -958,7 +1530,14 @@ export function openSqliteStorage(dbPath: string): StoragePorts {
            WHERE issuer = ? AND principal_id = ? AND instance_url = ?`,
         )
         .all(scope.issuer, scope.principalId, scope.instanceUrl) as Array<{ sub_json: string }>;
-      return rows.map((row) => JSON.parse(row.sub_json) as StoredWebhookSubscription);
+      const subs: StoredWebhookSubscription[] = [];
+      for (const row of rows) {
+        const parsed = safeParseJsonObject(row.sub_json, "webhook_subscriptions.list");
+        if (parsed) {
+          subs.push(parsed as unknown as StoredWebhookSubscription);
+        }
+      }
+      return subs;
     },
 
     async deleteWebhookSubscription(params) {
@@ -985,12 +1564,20 @@ export function openSqliteStorage(dbPath: string): StoragePorts {
            WHERE issuer = ? AND principal_id = ? AND instance_url = ?`,
         )
         .all(issuer, principalId, instanceUrl) as Array<{ proposal_json: string }>;
-      const all = rows.map((row) => JSON.parse(row.proposal_json) as StoredProposal);
+      const all: StoredProposal[] = [];
+      for (const row of rows) {
+        const parsed = parseStoredProposal(row.proposal_json, "proposals.list");
+        if (parsed) all.push(parsed);
+      }
       return all.filter((p) => {
         if (filter?.bugId !== undefined && p.bugId !== filter.bugId) return false;
         if (filter?.state !== undefined && p.state !== filter.state) return false;
         return true;
       });
+    },
+
+    async transitionProposalCas(params) {
+      return transitionProposalCasSync(params);
     },
 
     async claimProposalTransition({
@@ -1002,58 +1589,31 @@ export function openSqliteStorage(dbPath: string): StoragePorts {
       fromState,
       toState,
     }) {
-      db.exec("BEGIN IMMEDIATE");
-      try {
-        const row = db
-          .prepare(
-            `SELECT proposal_json FROM proposals
-             WHERE issuer = ? AND principal_id = ? AND instance_url = ? AND proposal_id = ? AND revision = ?`,
-          )
-          .get(issuer, principalId, instanceUrl, proposalId, revision) as
-          | { proposal_json: string }
-          | undefined;
-        if (!row) {
-          db.exec("COMMIT");
-          return false;
-        }
-        const proposal = JSON.parse(row.proposal_json) as StoredProposal;
-        if (proposal.state !== fromState) {
-          db.exec("COMMIT");
-          return false;
-        }
-        const nextProposal: StoredProposal = { ...proposal, state: toState };
-        db.prepare(
-          `UPDATE proposals SET proposal_json = ?
-           WHERE issuer = ? AND principal_id = ? AND instance_url = ? AND proposal_id = ? AND revision = ?`,
-        ).run(JSON.stringify(nextProposal), issuer, principalId, instanceUrl, proposalId, revision);
-        db.exec("COMMIT");
-        return true;
-      } catch (error) {
-        db.exec("ROLLBACK");
-        throw error;
-      }
+      return transitionProposalCasSync({
+        issuer,
+        principalId,
+        instanceUrl,
+        proposalId,
+        revision,
+        fromStates: [fromState],
+        toState,
+      });
     },
 
     async consumeApprovalJti(jti, expiresAtMs, nowMs = Date.now()) {
       if (nowMs >= expiresAtMs) return false;
-      db.exec("BEGIN IMMEDIATE");
-      try {
+      return withTransaction(db, () => {
         db.prepare(`DELETE FROM consumed_jtis WHERE expires_at_ms < ?`).run(nowMs);
         const existing = db.prepare(`SELECT 1 FROM consumed_jtis WHERE jti = ?`).get(jti);
         if (existing) {
-          db.exec("COMMIT");
           return false;
         }
         db.prepare(`INSERT INTO consumed_jtis (jti, expires_at_ms) VALUES (?, ?)`).run(
           jti,
           expiresAtMs,
         );
-        db.exec("COMMIT");
         return true;
-      } catch (error) {
-        db.exec("ROLLBACK");
-        throw error;
-      }
+      });
     },
 
     async saveBindingTicket(ticket: StoredBindingTicket) {
@@ -1069,22 +1629,21 @@ export function openSqliteStorage(dbPath: string): StoragePorts {
       const row = db
         .prepare(`SELECT ticket_json FROM binding_tickets WHERE ticket_id = ?`)
         .get(ticketId) as { ticket_json: string } | undefined;
-      return row ? (JSON.parse(row.ticket_json) as StoredBindingTicket) : null;
+      if (!row) return null;
+      const parsed = safeParseJsonObject(row.ticket_json, `binding_tickets(${ticketId})`);
+      return parsed ? (parsed as unknown as StoredBindingTicket) : null;
     },
 
     async markBindingTicketCompleted(ticketId, credentialGeneration, nowMs = Date.now()) {
-      db.exec("BEGIN IMMEDIATE");
-      try {
+      return withTransaction(db, () => {
         const row = db
           .prepare(`SELECT ticket_json FROM binding_tickets WHERE ticket_id = ?`)
           .get(ticketId) as { ticket_json: string } | undefined;
-        if (!row) {
-          db.exec("COMMIT");
-          return false;
-        }
-        const ticket = JSON.parse(row.ticket_json) as StoredBindingTicket;
+        if (!row) return false;
+        const parsed = safeParseJsonObject(row.ticket_json, `binding_tickets(${ticketId})`);
+        if (!parsed) return false;
+        const ticket = parsed as unknown as StoredBindingTicket;
         if (ticket.completed || nowMs >= ticket.expiresAtMs) {
-          db.exec("COMMIT");
           return false;
         }
         const updated: StoredBindingTicket = {
@@ -1096,35 +1655,23 @@ export function openSqliteStorage(dbPath: string): StoragePorts {
           JSON.stringify(updated),
           ticketId,
         );
-        db.exec("COMMIT");
         return true;
-      } catch (error) {
-        db.exec("ROLLBACK");
-        throw error;
-      }
+      });
     },
 
     async consumeRetryState(stateHash, expiresAtMs, nowMs = Date.now()) {
       if (nowMs >= expiresAtMs) return false;
-      db.exec("BEGIN IMMEDIATE");
-      try {
+      return withTransaction(db, () => {
         db.prepare(`DELETE FROM consumed_retry_states WHERE expires_at_ms < ?`).run(nowMs);
         const existing = db
           .prepare(`SELECT 1 FROM consumed_retry_states WHERE state_hash = ?`)
           .get(stateHash);
-        if (existing) {
-          db.exec("COMMIT");
-          return false;
-        }
+        if (existing) return false;
         db.prepare(
           `INSERT INTO consumed_retry_states (state_hash, expires_at_ms) VALUES (?, ?)`,
         ).run(stateHash, expiresAtMs);
-        db.exec("COMMIT");
         return true;
-      } catch (error) {
-        db.exec("ROLLBACK");
-        throw error;
-      }
+      });
     },
 
     async saveApprovalTicket(ticket: StoredApprovalTicket) {
@@ -1140,22 +1687,19 @@ export function openSqliteStorage(dbPath: string): StoragePorts {
       const row = db
         .prepare(`SELECT ticket_json FROM approval_tickets WHERE ticket_id = ?`)
         .get(ticketId) as { ticket_json: string } | undefined;
-      return row ? (JSON.parse(row.ticket_json) as StoredApprovalTicket) : null;
+      return row
+        ? parseStoredApprovalTicket(row.ticket_json, `approval_tickets(${ticketId})`)
+        : null;
     },
 
     async consumeApprovalTicket(ticketId, nowMs) {
-      db.exec("BEGIN IMMEDIATE");
-      try {
+      return withTransaction(db, () => {
         const row = db
           .prepare(`SELECT ticket_json FROM approval_tickets WHERE ticket_id = ?`)
           .get(ticketId) as { ticket_json: string } | undefined;
-        if (!row) {
-          db.exec("COMMIT");
-          return false;
-        }
-        const ticket = JSON.parse(row.ticket_json) as StoredApprovalTicket;
-        if (ticket.consumed || nowMs >= ticket.expiresAtMs) {
-          db.exec("COMMIT");
+        if (!row) return false;
+        const ticket = parseStoredApprovalTicket(row.ticket_json, `approval_tickets(${ticketId})`);
+        if (!ticket || ticket.consumed || nowMs >= ticket.expiresAtMs) {
           return false;
         }
         const updated: StoredApprovalTicket = { ...ticket, consumed: true };
@@ -1163,17 +1707,12 @@ export function openSqliteStorage(dbPath: string): StoragePorts {
           JSON.stringify(updated),
           ticketId,
         );
-        db.exec("COMMIT");
         return true;
-      } catch (error) {
-        db.exec("ROLLBACK");
-        throw error;
-      }
+      });
     },
 
     async saveBoundCredential(entry) {
-      db.exec("BEGIN IMMEDIATE");
-      try {
+      return withTransaction(db, () => {
         const existing = db
           .prepare(
             `SELECT credential_generation FROM bound_credentials
@@ -1205,12 +1744,8 @@ export function openSqliteStorage(dbPath: string): StoragePorts {
           nextGen,
           updatedAt,
         );
-        db.exec("COMMIT");
         return { credentialGeneration: nextGen };
-      } catch (error) {
-        db.exec("ROLLBACK");
-        throw error;
-      }
+      });
     },
 
     async getBoundCredential(issuer, principalId, instanceUrl) {
@@ -1246,8 +1781,7 @@ export function openSqliteStorage(dbPath: string): StoragePorts {
     },
 
     async revokeBoundCredential(issuer, principalId, instanceUrl) {
-      db.exec("BEGIN IMMEDIATE");
-      try {
+      return withTransaction(db, () => {
         // Retain monotonic credential_generation tombstone so rebind never reuses prior generation (AUTH-02)
         const result = db
           .prepare(
@@ -1258,12 +1792,8 @@ export function openSqliteStorage(dbPath: string): StoragePorts {
              WHERE issuer = ? AND principal_id = ? AND instance_url = ? AND revoked = 0`,
           )
           .run(new Date().toISOString(), issuer, principalId, instanceUrl);
-        db.exec("COMMIT");
         return Number(result.changes) > 0;
-      } catch (error) {
-        db.exec("ROLLBACK");
-        throw error;
-      }
+      });
     },
 
     async upsertWebhookRetryItem(item: StoredWebhookRetryItem) {
