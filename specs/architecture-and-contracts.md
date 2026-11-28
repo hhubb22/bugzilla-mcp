@@ -60,18 +60,18 @@ bugzilla-mcp/
 
 ## 3. 对外原语与 Wire Schema（Tools / Resources / Events / MCP App）
 
-### 3.1 面向模型的 Tools（7 个，均声明 `inputSchema` + `outputSchema` + 标准 `ToolAnnotations`）
+### 3.1 面向模型的 Tools（7 个，均声明单源生成的 JSON Schema 2020-12 `inputSchema` + `outputSchema` + 标准 `ToolAnnotations`）
 
-> `ToolAnnotations` 严格使用 MCP `2026-07-28` Schema 字段名（`readOnlyHint`、`destructiveHint`、`idempotentHint`、`openWorldHint`）。为避免租户/私有缺陷信息通过 `Mcp-Param-*` 暴露给中间代理，**默认不把 `bugId` 或敏感 `product` 标为 `x-mcp-header`**（仅在部署策略显式声明为公开非敏感键时启用）。
+> `ToolAnnotations` 严格使用 MCP `2026-07-28` Schema 字段名（`readOnlyHint`、`destructiveHint`、`idempotentHint`、`openWorldHint`）。全部 11 个工具（7 个模型工具 + 4 个 App-only 工具）的 `inputSchema` 与 `outputSchema` 均由 `packages/contracts` 单一注册表编译生成，杜绝手写漂移；`outputSchema` 仅约束非错误成功响应，工具执行期的可恢复错误通过 `CallToolResult { isError: true }` 返回（同时在 `content[0].text` 与 `structuredContent` 提供完整可操作信息，见第 4.2 节）。为避免租户/私有缺陷信息通过 `Mcp-Param-*` 暴露给中间代理，**默认不把 `bugId` 或敏感 `product` 标为 `x-mcp-header`**（仅在部署策略显式声明为公开非敏感键时启用）。
 
 | Tool Name | `ToolAnnotations` | UI 表面绑定 | 核心入参 / 出参契约 |
 | :--- | :--- | :--- | :--- |
 | `bugzilla_search` | `readOnlyHint: true`, `idempotentHint: true` | 无 | 入参：`product?`, `component?`, `status[]?`, `assignedTo?`, `updatedSince?`, `query?`, `limit(<=50)`, `offset`<br>出参：`{ items: BugSummary[], nextOffset?, totalHint? }`（严格字段投影，无正文/附件） |
 | `bugzilla_get_dossier` | `readOnlyHint: true`, `idempotentHint: true` | **仅 Inline**（`ui://bugzilla/dossier-card.html`，不声明 `aux_pane`） | 入参：`bugId`, `maxComments(default 15)`, `maxHistory(default 30)`<br>出参：`BugDossier`（核心字段 + 精简流转 + 近期评论 + 附件元数据 + 服务端内部笔记，剥离 Base64 `data`，完整序列化 `<= 128 KiB`） |
 | `bugzilla_triage_board` | `readOnlyHint: true`, `idempotentHint: true` | **`aux_pane` + `global`**（`ui://bugzilla/triage-app.html`，带类型化 entrypoint 对象；无 UI 宿主回退文本摘要） | 入参全可选（空 `{}` 返回当前用户“待审提案 / Needinfo / 我负责”默认队列，完整序列化 `<= 128 KiB`） |
-| `bugzilla_post_analysis` | `readOnlyHint: false`, `destructiveHint: false`, `idempotentHint: false` *(上游无原生幂等键，由网关状态机保障)* | 无 | **Safe-Auto（私有不可降级）**：`isPrivate` 恒为 `true`（拒绝公评入参）；用户有 `insidergroup` 权限则写 Bugzilla 私有评论，无权限或拒绝则 **Fail-Closed 落为服务端内部笔记（零公写）**；必填 `idempotencyKey`；返回 `applied \| saved_as_internal_note \| duplicate_noop \| indeterminate` |
-| `bugzilla_propose_update` | `readOnlyHint: false`, `destructiveHint: true`, `idempotentHint: false` | 无 | **Guarded-Write**：变更 `status`/`resolution`/`assignedTo`/`priority`/`flags`/公开评论；必填 `idempotencyKey` 与 `expectedLastChangeTime`；默认创建不可变 `ProposalPending(proposalId, revision)`；仅在具备有效策略放行或独立审批凭证时执行“执行前乐观检查 + 写后差异审计” |
-| `bugzilla_create_bug` | `readOnlyHint: false`, `destructiveHint: false`, `idempotentHint: false` | 无 | 必填 `idempotencyKey` 与发布策略级别；缺失实例必填字段时，若现代请求声明 `elicitation.form` 返回 `input_required` 动态表单，否则返回结构化缺参提示 |
+| `bugzilla_post_analysis` | `readOnlyHint: false`, `destructiveHint: false`, `idempotentHint: false` *(上游无原生幂等键，由网关状态机保障)* | 无 | **Safe-Auto（私有不可降级）**：`isPrivate` 恒为 `true`（拒绝公评入参）；用户有 `insidergroup` 权限则写 Bugzilla 私有评论，无权限或 Bugzilla 私有评论权限拒写则 **Fail-Closed 落为服务端内部笔记（零公写，仍计入因果预算）**；确定性 4xx/401/403/429 非写拒绝返回 `upstream_rejected`（不锁死幂等键）；必填 `idempotencyKey`；返回 `applied \| saved_as_internal_note \| duplicate_noop \| upstream_rejected \| indeterminate` |
+| `bugzilla_propose_update` | `readOnlyHint: false`, `destructiveHint: true`, `idempotentHint: false` | 无 | **Guarded-Write**：变更 `status`/`resolution`/`dupeOf`/`assignedTo`/`priority`/`flags`（支持 `id`/`typeId`/`new`）/公开评论；`ProposalDiff` 采用严格模式（`additionalProperties: false` 拒绝未知/snake_case 键、`minProperties: 1` 拒绝空 `{}`、`status: "RESOLVED"` 必带 `resolution`、`resolution: "DUPLICATE"` 必带 `dupeOf`）；必填 `idempotencyKey` 与 `expectedLastChangeTime`；默认创建不可变 `ProposalPending(proposalId, revision)`；仅在具备有效策略放行或独立审批凭证时执行“执行前乐观检查 + 写后差异审计”。仅含评论的 Guarded 更新路由至 `POST /bug/{id}/comment` 以获取确定性 `commentId` 写入 `[R-5d5271]` 自写溯源；字段与评论混合更新保持单次 `PUT /bug/{id}` 原子性 |
+| `bugzilla_create_bug` | `readOnlyHint: false`, `destructiveHint: false`, `idempotentHint: false` | 无 | 必填 `idempotencyKey`、`summary`、`product`、`component`、`version` 与发布策略级别（同时暴露可选 `opSys`、`platform`、`assignedTo`、`targetMilestone`、`cc`、`groups`、`keywords` 及键名严格匹配 `/^cf_[a-z0-9_]+$/` 的 `customFields`）。**预检（Preflight）+ 惰性元数据**：在预留幂等记录与调用 `POST /rest/bug` 之前，基于按 `(issuer, principalId, instanceUrl, credentialGeneration)` 私有缓存的惰性实例元数据（优先仅拉取可录入产品名或按 `product` 惰性查询 `/rest/product/{name}`，避免大型实例多 MiB 膨胀，并按实例合法枚举解析 `op_sys`/`platform` 默认值）校验必填项；缺失必填字段或实例约束不满足时，若现代请求声明 `elicitation.form` 且启用表单续传则返回 `InputRequiredResult` 动态表单，否则返回 `isError: true` 的 `UpstreamRejected`（附 `missingFields` 与有界候选提示，零幂等键/预算消耗） |
 | `bugzilla_get_attachment_excerpt` | `readOnlyHint: true`, `idempotentHint: true` | 无 | 入参：`attachmentId`, `byteOffset(default 0)`, `maxBytes(<=65536)`；拒绝二进制非文本 MIME，仅按范围截断返回文本 |
 
 ### 3.2 App-Only Tools（`visibility: ["app"]`，仅供 UI 交互辅助，**不作为审批鉴权边界**）
@@ -140,19 +140,29 @@ bugzilla-mcp/
 
 ### 4.2 分级写入门禁、幂等状态机与防循环（Parnas 决策表）
 
-**前置校验顺序**（严格互斥）：① 当前 `principal` 鉴权与输入校验（含 `idempotencyKey` 非空及因果写入预算未耗尽）→ ② 查询按 `(principal, instance, operation)` 隔离的幂等记录状态 → ③ 分级门禁与审批核验 → ④ 执行前乐观检查与上游提交。
+**前置校验顺序**（严格互斥）：① 当前 `principal` 鉴权与输入校验（含 `idempotencyKey` 非空、因果写入预算检查及 `bugzilla_create_bug` 惰性元数据预检——均在预留幂等记录前完成，零持久副作用）→ ② 查询并按 `leaseToken` CAS 预留 `(principal, instance, operation)` 隔离的幂等记录（仅允许在 `absent`、`failed` 或**已过期且 `dispatchAttempted === false`** 的 `pending` 记录上分配全新 `leaseToken` 抢占，消除 Stage 2 崩溃导致的永久 `OperationPending` 悬挂）→ ③ 分级门禁、审批核验（Stage 1/2 仅验签不消费 JTI）与执行前 `last_change_time` 乐观检查 → ④ Stage 3 提交阈值围栏（CAS 校验 `status = 'pending' AND lease_token = ?` 后持久化 `markDispatchStarted`、消费单次 JTI、扣减因果预算，然后执行单次不可中断的上游写请求）→ ⑤ Stage 4 写后原子本地提交（独立于 `indeterminate` 异常捕获；上游已 2xx 确认后即使本地审计/后置读失败也绝不从 `Applied` 回退到 `Pending`/`Indeterminate`）。
+
+> **租约围栏与路由细节**：
+> - 一旦 `markDispatchStarted` 将 `dispatchAttempted` 置为 `true`，租约过期只允许转为 `indeterminate` 而严禁被其他工作协程回收重发；过期/被抢占的旧协程携带旧 `leaseToken` 执行任意状态推进时均被 CAS 围栏拦截（零上游写）。
+> - 仅含评论（comment-only）的 `Guarded` 更新路由至 `POST /bug/{id}/comment` 以获取确定性 `commentId` 记录 `[R-5d5271]` 自写溯源；字段与评论混合更新保持单次 `PUT /bug/{id}` 原子性。
 
 | 幂等记录状态 (`scope=(principal,instance,op)`) | 规范意图哈希匹配? | 写入级别 (`tier`) | `Safe-Auto` 私有写能力或 `Guarded` 有效授权/审批? | 执行前 `last_change_time` 匹配? | 上游写结果 | 可观测结果 (`Outcome`) | 上游副作用 |
 | :--- | :--- | :--- | :--- | :--- | :--- | :--- | :--- |
-| `pending` / `indeterminate` | Yes | Any | - | - | - | `OperationPending` / `OperationIndeterminate`（禁止自动重发） | 0 |
+| `pending`（未过期或 `dispatchAttempted=true`） / `indeterminate` | Yes | Any | - | - | - | `OperationPending` / `OperationIndeterminate`（禁止自动重发） | 0 |
 | `applied` | Yes | Any | 当前仍有目标权限 | - | - | `DuplicateNoOp`（返回原 `artifactId`） | 0 |
-| `applied` / `pending` / `indeterminate` | No | Any | - | - | - | `IdempotencyConflict` | 0 |
-| `absent` / `failed` | - | `Safe-Auto` | 具备 `insidergroup` 私有写权限且 `isPrivate=true` | - | 成功 | `Applied`（记录写溯源 `commentId`） | 1 次私有写 |
-| `absent` / `failed` | - | `Safe-Auto` | 缺 `insidergroup` 或被拒（绝不降级公评） | - | - | `SavedAsInternalNote`（仅写服务端内部笔记） | 0 公写 |
-| `absent` / `failed` | - | `Guarded` | 无策略直通且无有效单次审批凭证 | - | - | `ProposalPending(proposalId, revision)` | 0 |
-| `absent` / `failed` | - | `Guarded` | 有策略放行或有效单次审批（云端须服务端签名凭证；本地可信 IDE 宿主确认） | No | - | `StaleBugConflict`（附当前已授权最新快照，需建新提案版本） | 0 |
-| `absent` / `failed` | - | `Guarded` | 同上 | Yes | 成功 | `Applied` + 写后差异审计记录（明示原生 REST 极小 TOCTOU 窗口） | 1 次写 |
-| `absent` / `failed` | - | Any | 同上 | Yes / N/A | 响应超时/连接中断 | `OperationIndeterminate`（锁定该键待对账，禁止自动重试） | 0 或 1（未知） |
+| `applied` / `pending`（未过期或已派发） / `indeterminate` | No | Any | - | - | - | `IdempotencyConflict` | 0 |
+| `absent` / `failed` / `pending`（已过期且 `dispatchAttempted=false`，新 `leaseToken` CAS 抢占） | - | `Safe-Auto` | 具备 `insidergroup` 私有写权限且 `isPrivate=true` | - | 成功 | `Applied`（记录写溯源 `commentId`） | 1 次私有写 |
+| `absent` / `failed` / 可回收 `pending` | - | `Safe-Auto` | 缺 `insidergroup` 或 Bugzilla 私有评论权限拒写（绝不降级公评） | - | - | `SavedAsInternalNote`（仅写服务端内部笔记，仍计入因果预算） | 0 公写 |
+| `absent` / `failed` / 可回收 `pending` | - | `Guarded` | 无策略直通且无有效单次审批凭证 | - | - | `ProposalPending(proposalId, revision)` | 0 |
+| `absent` / `failed` / 可回收 `pending` | - | `Guarded` | 人工通过 `app_resolve_proposal(decision: "reject")` 驳回提案 | - | - | `ProposalRejected(proposalId, revision, rejectedAt)`（独立于 `Applied`） | 0 |
+| `absent` / `failed` / 可回收 `pending` | - | `Guarded` | 有策略放行或有效单次审批（云端须服务端签名凭证；本地可信 IDE 宿主确认） | No | - | `StaleBugConflict`（收据回写 `failed`，附当前已授权最新快照，需建新提案版本） | 0 |
+| `absent` / `failed` / 可回收 `pending` | - | Any | 同上（或预检/校验阶段） | Yes / N/A | 确定未写入（4xx 校验拒绝 / `401` / `403` / `429`，`effectCertainty: "none"`） | `UpstreamRejected`（`leaseToken` CAS 回写收据 `failed`，提案 `executing -> pending`，退回本次因果预算，附 `bzErrorCode`/`missingFields`/`remediationHint`，不锁死幂等键） | 0 |
+| `absent` / `failed` / 可回收 `pending` | - | `Guarded` | 同上 | Yes | 成功 | `Applied` + 写后差异审计记录（仅评论更新走 `POST /bug/{id}/comment`；混合更新走 `PUT /bug/{id}` 并明示原生 REST 极小 TOCTOU 窗口；写后本地错误不回退 `Applied`） | 1 次写 |
+| `absent` / `failed` / 可回收 `pending` | - | Any | 同上 | Yes / N/A | 响应超时 / 连接中断 / 5xx / 派发后租约过期（`effectCertainty: "uncertain"`） | `OperationIndeterminate`（锁定该键待对账，提案置为 `indeterminate`，禁止自动重试） | 0 或 1（未知） |
+
+**`tools/call` 错误通道边界（`CallToolResult { isError: true }` vs JSON-RPC Error）**：
+- **工具执行期可恢复错误 → `CallToolResult { isError: true, content, structuredContent }`**（必须在 `content[0].text` 输出完整可读细节以兼容忽略 `structuredContent` 的客户端，且不受成功态 `outputSchema` 排斥）：`InvalidToolInput`（附结构化 `issues`）、`UpstreamRejected`、`StaleBugConflict`、`IdempotencyConflict`、`OperationPending`、`OperationIndeterminate`、`CausalBudgetExhausted`、`CredentialRevoked`、`CredentialBindingRequired`（无 MRTR `elicitation.url` 时的回退）、`UnsupportedAttachment`。
+- **协议 / 路由 / 安全硬边界错误 → JSON-RPC Error**（并保留 `error.data`）：未知工具或 `config.readOnly: true` 拒绝写入工具（`-32602`，`[R-0b14d8]`）、受保护资源不可区分拒绝（`-32602`，`[R-32f1fc]`）、现代请求镜像头/协议版本错误（`-32020`/`-32022`）、以及仅限于 `events/*` 域的 SEP/Events 错误码（`-32024..-32027`，严禁复用于写入工具或 `stdio` 鉴权错误）。
 
 - [R-d31426] WHEN any mutating tool (`bugzilla_post_analysis`, `bugzilla_propose_update`, `bugzilla_create_bug`, `app_resolve_proposal`) executes, the server SHALL scope idempotency to `(principal, instance, operation)` and enforce the exact outcome and upstream mutation bounds of the Section 4.2 Parnas table.
 - [R-68841d] WHEN an authorized caller replays an identical canonical intent whose receipt is `applied`, the server SHALL re-verify target access and return `DuplicateNoOp` with the original artifact ID; IF the receipt is `pending` or `indeterminate`, THEN the server SHALL return its stable pending/indeterminate receipt and perform zero additional upstream mutations.
